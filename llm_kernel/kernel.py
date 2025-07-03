@@ -100,6 +100,9 @@ class LLMKernel(IPythonKernel):
             level=getattr(logging, log_level, logging.INFO),
             format='[LLM Kernel] %(levelname)s: %(message)s'
         )
+        # Ensure self.log is available even when not running in full Jupyter context
+        if not hasattr(self, 'log') or self.log is None:
+            self.log = logging.getLogger(__name__)
 
     def load_environment(self):
         """Load environment variables from .env files."""
