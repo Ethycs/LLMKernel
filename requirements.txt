@@ -1,0 +1,20 @@
+# Core dependencies
+ipykernel>=6.0.0
+ipython>=7.0.0
+ipywidgets>=7.0.0
+litellm>=1.0.0
+python-dotenv>=0.19.0
+requests>=2.25.0
+
+# Optional dependencies for enhanced features
+# Install with: pip install -r requirements.txt -r requirements-optional.txt
+
+# For semantic similarity (optional)
+# sentence-transformers>=2.0.0
+# scikit-learn>=1.0.0
+# numpy>=1.20.0
+
+# For visualization (optional)
+# matplotlib>=3.3.0
+# networkx>=2.5.0
+# plotly>=5.0.0

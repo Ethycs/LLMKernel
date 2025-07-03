@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "python",
+    "-m",
+    "llm_kernel",
+    "-f",
+    "{connection_file}"
+  ],
+  "display_name": "LLM Kernel",
+  "language": "python",
+  "metadata": {
+    "debugger": true
+  }
+}
