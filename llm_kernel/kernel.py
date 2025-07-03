@@ -311,15 +311,26 @@ class LLMKernelMagics(Magics):
                 model = arg.split('=', 1)[1]
         
         # Query the model
+        # Handle async properly in Jupyter environments
+        import nest_asyncio
+        nest_asyncio.apply()
+        
         try:
             loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in Jupyter, use the existing loop
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, self.kernel.query_llm_async(cell, model))
+                    result = future.result()
+            else:
+                # Normal execution
+                result = loop.run_until_complete(
+                    self.kernel.query_llm_async(cell, model)
+                )
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-        result = loop.run_until_complete(
-            self.kernel.query_llm_async(cell, model)
-        )
+            # Fallback: create new event loop
+            result = asyncio.run(self.kernel.query_llm_async(cell, model))
         
         print(result)
         return result

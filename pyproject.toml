@@ -11,6 +11,7 @@ dependencies = [
     "ipywidgets>=7.0.0",
     "python-dotenv>=0.19.0",
     "requests>=2.25.0",
+    "nest-asyncio>=1.5.0",
 ]
 requires-python = ">=3.8"
 readme = "README.md"
@@ -116,8 +117,33 @@ default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 semantic = { features = ["semantic"], solve-group = "default" }
 visualization = { features = ["visualization"], solve-group = "default" }
+notebook = { features = ["notebook"], solve-group = "notebook" }
+
+[tool.pixi.feature.notebook.dependencies]
+jupyter = "*"
+jupyterlab = "*"
+ipykernel = ">=6.29.5,<7"
+IPython = ">=7.0.0"
+ipywidgets = ">=7.0.0"
+python-dotenv = ">=0.19.0"
+requests = ">=2.25.0"
+nest-asyncio = "*"
+
+[tool.pixi.feature.notebook.pypi-dependencies]
+llm-kernel = { path = ".", editable = true }
+litellm = ">=1.0.0"
 
 [tool.pixi.tasks]
+install-kernel = { cmd = "python -m llm_kernel.install install", depends-on = ["install-editable"] }
+install-editable = "pip install -e ."
+notebook = "jupyter notebook"
+lab = "jupyter lab"
+test = "pytest test_kernel.py -v"
+
+[tool.pixi.feature.notebook.tasks]
+bootstrap = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Starting Jupyter Lab...' && jupyter lab", depends-on = ["install-editable"] }
+bootstrap-vscode = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Open VS Code and select LLM Kernel from the kernel picker.'", depends-on = ["install-editable"] }
+vscode = { cmd = "python -m llm_kernel.install install && code . && echo 'VS Code opened. Select LLM Kernel in any .ipynb file.'", depends-on = ["install-editable"] }
 
 [tool.pixi.dependencies]
 pytest = ">=8.4.1,<9"

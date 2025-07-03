@@ -1,0 +1,8 @@
+{
+  "default_model": "claude-3-sonnet",
+  "context_strategy": "dependency",
+  "max_context_tokens": 6000,
+  "pruning_strategy": "hybrid",
+  "track_dependencies": true,
+  "project_specific_setting": "example_value"
+}

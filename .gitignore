@@ -3,3 +3,5 @@
 .pixi
 *.egg-info
 __pycache__/
+.env
+.pyest

@@ -4,6 +4,18 @@ Get up and running with the LLM Kernel in 5 minutes!
 
 ## 🚀 Installation
 
+### Quick Start for VS Code Users
+
+```bash
+# One-line setup
+pixi run -e notebook vscode
+```
+
+This will:
+1. Install the LLM Kernel
+2. Open VS Code in the project directory
+3. The kernel will be available in any `.ipynb` file
+
 ### Option 1: Pixi (Recommended)
 
 ```bash

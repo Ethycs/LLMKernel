@@ -1,0 +1,19 @@
+{
+  "python.defaultInterpreterPath": ".pixi/envs/notebook/bin/python",
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    ".pytest_cache": true,
+    "*.egg-info": true
+  },
+  "editor.formatOnSave": true,
+  "python.formatting.provider": "black",
+  "python.linting.enabled": true,
+  "python.linting.flake8Enabled": true,
+  "[python]": {
+    "editor.rulers": [88]
+  },
+  "jupyter.interactiveWindow.creationMode": "perFile",
+  "jupyter.askForKernelRestart": false
+}

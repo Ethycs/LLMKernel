@@ -32,6 +32,9 @@ def get_kernel_spec():
 
 
 def install_kernel(user=True, prefix=None, kernel_name="llm_kernel"):
+    # If prefix is provided, don't use user flag
+    if prefix:
+        user = False
     """Install the LLM kernel."""
     print("Installing LLM Kernel...")
     
@@ -126,7 +129,13 @@ def check_dependencies():
     
     for package in required_packages:
         try:
-            __import__(package.replace('-', '_'))
+            # Handle special cases
+            if package.lower() == 'ipython':
+                __import__('IPython')
+            elif package == 'python-dotenv':
+                __import__('dotenv')
+            else:
+                __import__(package.replace('-', '_'))
             print(f"  ✅ {package}")
         except ImportError:
             print(f"  ❌ {package} (missing)")
