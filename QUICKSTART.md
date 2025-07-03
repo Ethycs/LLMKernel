@@ -4,7 +4,20 @@ Get up and running with the LLM Kernel in 5 minutes!
 
 ## 🚀 Installation
 
-### Step 1: Install the Package
+### Option 1: Pixi (Recommended)
+
+```bash
+# Clone and install with Pixi
+git clone https://github.com/your-org/llm-kernel.git
+cd llm-kernel
+pixi install
+pixi run install-kernel
+
+# Verify installation
+pixi run list-kernels
+```
+
+### Option 2: Pip
 
 ```bash
 # Install from PyPI (when published)
@@ -14,11 +27,7 @@ pip install llm-kernel
 git clone https://github.com/your-org/llm-kernel.git
 cd llm-kernel
 pip install -e .
-```
 
-### Step 2: Install the Kernel
-
-```bash
 # Install the kernel for Jupyter
 llm-kernel-install install
 

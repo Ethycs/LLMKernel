@@ -31,20 +31,38 @@ A Jupyter kernel with LiteLLM integration and intelligent context management for
 
 ## Installation
 
-### Quick Install
+### Quick Install (Pip)
 
 ```bash
 pip install llm-kernel
 llm-kernel-install install
 ```
 
-### Development Install
+### Quick Install (Pixi - Recommended)
+
+```bash
+git clone https://github.com/your-org/llm-kernel.git
+cd llm-kernel
+pixi install
+pixi run install-kernel
+```
+
+### Development Install (Pip)
 
 ```bash
 git clone https://github.com/your-org/llm-kernel.git
 cd llm-kernel
 pip install -e .
 python -m llm_kernel.install install
+```
+
+### Development Install (Pixi - Recommended)
+
+```bash
+git clone https://github.com/your-org/llm-kernel.git
+cd llm-kernel
+pixi install --environment dev
+pixi run install-kernel
 ```
 
 ## Setup

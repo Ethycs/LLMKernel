@@ -357,7 +357,7 @@ class TestDependencies:
     
     @pytest.mark.parametrize("package", [
         'ipykernel',
-        'ipython',
+        'IPython',
         'ipywidgets',
         'dotenv',
         'requests'

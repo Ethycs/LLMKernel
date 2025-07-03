@@ -1,0 +1,128 @@
+[project]
+name = "llm-kernel"
+version = "0.1.0"
+description = "A Jupyter kernel with LiteLLM integration and intelligent context management"
+authors = [
+    {name = "LLM Kernel Team"}
+]
+dependencies = [
+    "ipykernel>=6.0.0",
+    "ipython>=7.0.0", 
+    "ipywidgets>=7.0.0",
+    "python-dotenv>=0.19.0",
+    "requests>=2.25.0",
+]
+requires-python = ">=3.8"
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["jupyter", "kernel", "llm", "ai", "context-management", "litellm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-asyncio>=0.18.0",
+    "pytest-mock>=3.6.0",
+    "black>=21.0.0",
+    "flake8>=3.8.0",
+    "mypy>=0.910",
+]
+semantic = [
+    "sentence-transformers>=2.0.0",
+    "scikit-learn>=1.0.0",
+    "numpy>=1.20.0",
+]
+visualization = [
+    "matplotlib>=3.3.0",
+    "networkx>=2.5.0",
+    "plotly>=5.0.0",
+]
+
+[project.scripts]
+llm-kernel-install = "llm_kernel.install:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_kernel*"]
+
+[tool.setuptools.package-data]
+llm_kernel = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--disable-warnings"
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests"
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning"
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.pypi-dependencies]
+llm-kernel = { path = ".", editable = true }
+litellm = ">=1.0.0"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+semantic = { features = ["semantic"], solve-group = "default" }
+visualization = { features = ["visualization"], solve-group = "default" }
+
+[tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+pytest = ">=8.4.1,<9"
+ipykernel = ">=6.29.5,<7"
+ipython = ">=7.0.0"
+ipywidgets = ">=7.0.0"
+python-dotenv = ">=0.19.0"
+requests = ">=2.25.0"
