@@ -373,6 +373,10 @@ class LLMKernel(IPythonKernel):
                 self.shell.register_magic_function(multimodal_magics.llm_media_clear, 'line', 'llm_media_clear')
                 self.shell.register_magic_function(multimodal_magics.llm_media_list, 'line', 'llm_media_list')
                 self.shell.register_magic_function(multimodal_magics.llm_vision, 'cell', 'llm_vision')
+                # Cache management commands
+                self.shell.register_magic_function(multimodal_magics.llm_cache_info, 'line', 'llm_cache_info')
+                self.shell.register_magic_function(multimodal_magics.llm_cache_list, 'line', 'llm_cache_list')
+                self.shell.register_magic_function(multimodal_magics.llm_cache_clear, 'line', 'llm_cache_clear')
                 self.log.info("Multimodal magic commands registered")
                 
                 # Native PDF commands (for direct PDF upload)
@@ -633,6 +637,13 @@ class LLMKernel(IPythonKernel):
                     loop.create_task(self.mcp_manager.disconnect_all_servers())
                 else:
                     loop.run_until_complete(self.mcp_manager.disconnect_all_servers())
+            except:
+                pass
+        
+        # Clean up OpenAI assistants
+        if hasattr(self, 'llm_integration') and hasattr(self.llm_integration, 'openai_assistant'):
+            try:
+                self.llm_integration.openai_assistant.cleanup()
             except:
                 pass
         

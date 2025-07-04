@@ -7,3 +7,6 @@ __pycache__/
 .pyest
 *.log
 llm_kernel.log
+
+# LLM Kernel file cache
+.llm_kernel_cache/

@@ -741,6 +741,9 @@ def filter_cells(messages):
 | `%llm_media_list` | List attached media |
 | `%llm_files_list` | List uploaded files |
 | `%llm_files_clear` | Clear uploaded files |
+| `%llm_cache_info` | Show cache statistics |
+| `%llm_cache_list` | List cached files |
+| `%llm_cache_clear` | Clear file cache |
 
 ---
 

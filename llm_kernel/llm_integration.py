@@ -16,6 +16,8 @@ try:
 except ImportError:
     litellm = None
 
+from .openai_assistant_integration import OpenAIAssistantIntegration
+
 
 class LLMIntegration:
     """Handles LLM queries and tool interactions."""
@@ -24,6 +26,50 @@ class LLMIntegration:
         self.kernel = kernel_instance
         self.logger = kernel_instance.log
         self.executor = ThreadPoolExecutor(max_workers=4)
+        
+        # Initialize OpenAI Assistant integration
+        self.openai_assistant = OpenAIAssistantIntegration(logger=self.logger)
+    
+    def _get_provider_clients(self) -> Dict[str, Any]:
+        """Get the underlying provider clients for file uploads."""
+        import os
+        clients = {}
+        
+        # Get OpenAI client
+        if hasattr(self.kernel, 'llm_clients'):
+            for model_name, client_info in self.kernel.llm_clients.items():
+                if 'gpt' in model_name.lower() and 'openai' not in clients:
+                    # Extract the OpenAI client from litellm
+                    try:
+                        import openai
+                        if os.getenv('OPENAI_API_KEY'):
+                            clients['openai'] = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+                    except Exception as e:
+                        self.logger.debug(f"Could not create OpenAI client: {e}")
+                        
+                elif 'claude' in model_name.lower() and 'anthropic' not in clients:
+                    try:
+                        import anthropic
+                        if os.getenv('ANTHROPIC_API_KEY'):
+                            clients['anthropic'] = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+                    except Exception as e:
+                        self.logger.debug(f"Could not create Anthropic client: {e}")
+        
+        return clients
+    
+    def _get_uploaded_file_ids(self, messages: List[Dict]) -> List[str]:
+        """Extract uploaded file IDs from messages."""
+        file_ids = []
+        
+        for msg in messages:
+            if isinstance(msg.get('content'), list):
+                for item in msg['content']:
+                    if item.get('type') == 'file' and 'file' in item:
+                        file_info = item['file']
+                        if 'file_id' in file_info:
+                            file_ids.append(file_info['file_id'])
+        
+        return file_ids
     
     async def query_llm_async(self, query: str, model: str = None, **kwargs) -> str:
         """Asynchronously query an LLM model.
@@ -50,6 +96,42 @@ class LLMIntegration:
             messages = self.kernel.get_notebook_cells_as_context()
             if query:  # Only add query if not empty
                 messages.append({"role": "user", "content": query})
+        
+        # Check if we have uploaded files for OpenAI models
+        if 'gpt' in model.lower():
+            file_ids = self._get_uploaded_file_ids(messages)
+            if file_ids:
+                # Use Assistants API for file-based queries
+                self.logger.info(f"Using OpenAI Assistants API with {len(file_ids)} files")
+                
+                # Extract text content from messages for context
+                context_text = ""
+                for msg in messages:
+                    if msg['role'] == 'user':
+                        if isinstance(msg['content'], str):
+                            context_text += msg['content'] + "\n\n"
+                        elif isinstance(msg['content'], list):
+                            for item in msg['content']:
+                                if item.get('type') == 'text':
+                                    context_text += item.get('text', '') + "\n\n"
+                
+                # Query using Assistant API
+                result = await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    lambda: self.openai_assistant.query_with_files(
+                        query=context_text.strip() or query,
+                        file_ids=file_ids,
+                        model=model_name.replace('gpt-', ''),  # Remove prefix
+                        conversation_id=getattr(self.kernel, '_current_cell_id', 'default')
+                    )
+                )
+                
+                if result:
+                    # Track the exchange
+                    self.kernel.track_exchange(model, query, result)
+                    return result
+                else:
+                    self.logger.warning("Assistant API query failed, falling back to regular completion")
         
         # Check if current cell has multimodal content
         if hasattr(self.kernel, 'multimodal') and self.kernel.multimodal:

@@ -64,30 +64,89 @@ class NativePDFMagics(Magics):
                 print(f"   Full path: {pdf_path.absolute()}")
                 return
             
-            # Create a file reference message for the conversation
-            # This follows the pattern from the OpenAI API examples
-            pdf_message = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "file",
-                        "file": {
-                            "filename": pdf_path.name,
-                            "file_data": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode('utf-8')}",
-                            "file_size": len(pdf_bytes)
-                        }
-                    },
-                    {
-                        "type": "text", 
-                        "text": f"[Uploaded PDF: {pdf_path.name}]"
+            # Check if we're using an OpenAI model
+            if hasattr(self.kernel, 'active_model') and 'gpt' in self.kernel.active_model.lower():
+                # Use file upload manager for OpenAI
+                if not hasattr(self.kernel, 'file_upload_manager'):
+                    from ..file_upload_manager import FileUploadManager
+                    self.kernel.file_upload_manager = FileUploadManager(logger=self.kernel.log)
+                    # Set the OpenAI client
+                    providers = self.kernel.llm_integration._get_provider_clients()
+                    for provider, client in providers.items():
+                        self.kernel.file_upload_manager.set_provider_client(provider, client)
+                
+                # Upload the file
+                upload_info = self.kernel.file_upload_manager.upload_file(
+                    str(pdf_path),
+                    purpose="assistants",
+                    provider="openai"
+                )
+                
+                if upload_info and 'file_id' in upload_info:
+                    # Create a message with the file_id reference
+                    pdf_message = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "file",
+                                "file": {
+                                    "file_id": upload_info['file_id'],
+                                    "filename": pdf_path.name
+                                }
+                            },
+                            {
+                                "type": "text", 
+                                "text": f"[Uploaded PDF: {pdf_path.name}]"
+                            }
+                        ]
                     }
-                ]
-            }
+                    print(f"✅ Uploaded PDF '{pdf_path.name}' to OpenAI (file_id: {upload_info['file_id']})")
+                else:
+                    # Fallback to base64 encoding
+                    pdf_message = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "file",
+                                "file": {
+                                    "filename": pdf_path.name,
+                                    "file_data": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode('utf-8')}",
+                                    "file_size": len(pdf_bytes)
+                                }
+                            },
+                            {
+                                "type": "text", 
+                                "text": f"[Uploaded PDF: {pdf_path.name}]"
+                            }
+                        ]
+                    }
+                    print(f"✅ Embedded PDF '{pdf_path.name}' ({file_size_mb:.2f} MB) in conversation")
+            else:
+                # For non-OpenAI models, use base64 encoding
+                pdf_message = {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": pdf_path.name,
+                                "file_data": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode('utf-8')}",
+                                "file_size": len(pdf_bytes)
+                            }
+                        },
+                        {
+                            "type": "text", 
+                            "text": f"[Uploaded PDF: {pdf_path.name}]"
+                        }
+                    ]
+                }
             
             # Add to conversation history
             self.kernel.conversation_history.append(pdf_message)
             
-            print(f"✅ Uploaded PDF '{pdf_path.name}' ({file_size_mb:.2f} MB) to conversation")
+            if 'gpt' not in self.kernel.active_model.lower():
+                print(f"✅ Embedded PDF '{pdf_path.name}' ({file_size_mb:.2f} MB) in conversation")
+            
             print("💡 You can now ask questions about this PDF in any cell")
             
             # Also store metadata for tracking

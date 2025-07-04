@@ -27,6 +27,21 @@ class MultimodalMagics(Magics):
         self.kernel = kernel_instance
         self.multimodal = MultimodalContent(kernel_instance) if HAS_MULTIMODAL else None
     
+    def _get_provider_for_model(self, model: str) -> str:
+        """Determine provider from model name."""
+        if not model:
+            return "openai"
+        
+        model_lower = model.lower()
+        if "claude" in model_lower:
+            return "anthropic"
+        elif "gemini" in model_lower:
+            return "google"
+        elif "gpt" in model_lower or "o1" in model_lower:
+            return "openai"
+        else:
+            return "openai"  # Default
+    
     @line_magic
     def llm_paste(self, line):
         """Paste and include clipboard content (image or text) in the next LLM query.
@@ -109,40 +124,91 @@ class MultimodalMagics(Magics):
             img_bytes = base64.b64decode(img_content['data'])
             display(IPImage(data=img_bytes, format='png', width=200))
         elif pdf_content:
-            # Add PDF to conversation history as a file message
-            pdf_message = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "file",
-                        "file": {
-                            "filename": pdf_content['filename'],
-                            "file_data": f"data:application/pdf;base64,{pdf_content['data']}",
-                            "file_size": pdf_content['size']
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": f"[Pasted PDF: {pdf_content['filename']}]"
+            # Upload PDF using the file upload manager
+            print(f"📄 Uploading PDF '{pdf_content['filename']}'...")
+            
+            try:
+                # Get or create file upload manager
+                if not hasattr(self.kernel, 'file_upload_manager'):
+                    from ..file_upload_manager import FileUploadManager
+                    self.kernel.file_upload_manager = FileUploadManager(self.kernel.log)
+                    
+                    # Initialize with LLM clients if available
+                    if hasattr(self.kernel, 'llm_integration'):
+                        for provider, client in self.kernel.llm_integration._get_provider_clients().items():
+                            self.kernel.file_upload_manager.set_provider_client(provider, client)
+                
+                # Determine provider based on active model
+                provider = self._get_provider_for_model(self.kernel.active_model)
+                
+                # Upload the file
+                upload_info = self.kernel.file_upload_manager.upload_file(
+                    pdf_content['path'],
+                    purpose="assistants",
+                    provider=provider
+                )
+                
+                if upload_info:
+                    # Add file reference to conversation
+                    file_ref = self.kernel.file_upload_manager.format_file_reference(upload_info, provider)
+                    
+                    # Add metadata for persistence
+                    file_ref['_llm_kernel_meta'] = {
+                        'file_hash': upload_info['file_hash'],
+                        'provider': provider,
+                        'cached_path': upload_info.get('cached_path'),
+                        'original_name': pdf_content['filename']
                     }
-                ]
-            }
-            self.kernel.conversation_history.append(pdf_message)
-            
-            # Track uploaded file
-            if not hasattr(self.kernel, '_uploaded_files'):
-                self.kernel._uploaded_files = []
-            
-            self.kernel._uploaded_files.append({
-                'filename': pdf_content['filename'],
-                'path': pdf_content['path'],
-                'size': pdf_content['size'],
-                'type': 'pdf',
-                'source': 'clipboard'
-            })
-            
-            print(f"✅ Pasted PDF '{pdf_content['filename']}' ({pdf_content['size'] / (1024*1024):.2f} MB) - added to conversation context")
-            print("💡 You can now ask questions about this PDF in any cell")
+                    
+                    pdf_message = {
+                        "role": "user",
+                        "content": [
+                            file_ref,
+                            {
+                                "type": "text",
+                                "text": f"[Uploaded PDF: {pdf_content['filename']}]"
+                            }
+                        ]
+                    }
+                    self.kernel.conversation_history.append(pdf_message)
+                    
+                    print(f"✅ Uploaded PDF '{pdf_content['filename']}' ({pdf_content['size'] / (1024*1024):.2f} MB)")
+                    print(f"📎 File ID: {upload_info.get('file_id', 'embedded')}")
+                    print("💡 You can now ask questions about this PDF in any cell")
+                    
+                    # Track uploaded file
+                    if not hasattr(self.kernel, '_uploaded_files'):
+                        self.kernel._uploaded_files = []
+                    
+                    self.kernel._uploaded_files.append({
+                        'filename': pdf_content['filename'],
+                        'path': pdf_content['path'],
+                        'size': pdf_content['size'],
+                        'type': 'pdf',
+                        'source': 'clipboard',
+                        'upload_info': upload_info
+                    })
+                
+            except Exception as e:
+                print(f"❌ Error uploading PDF: {e}")
+                print("💡 Falling back to image conversion...")
+                
+                # Fallback to image conversion
+                try:
+                    pdf_pages = self.multimodal.encode_pdf(pdf_content['path'], as_images=True)
+                    for page_img in pdf_pages:
+                        if page_img['type'] == 'image':
+                            image_message = {
+                                "role": "user",
+                                "content": [{
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{page_img['data']}"}
+                                }]
+                            }
+                            self.kernel.conversation_history.append(image_message)
+                    print(f"✅ Converted PDF to {len(pdf_pages)} images as fallback")
+                except Exception as e2:
+                    print(f"❌ Fallback also failed: {e2}")
         elif text_content:
             self.multimodal.add_to_cell(cell_id, {
                 'type': 'text',
@@ -477,3 +543,92 @@ class MultimodalMagics(Magics):
             print(f"❌ Error querying vision model: {e}")
             import traceback
             traceback.print_exc()
+    
+    @line_magic
+    def llm_cache_info(self, line):
+        """Show information about the file cache.
+        
+        Usage:
+            %llm_cache_info    # Show cache statistics
+        """
+        if hasattr(self.kernel, 'file_upload_manager'):
+            info = self.kernel.file_upload_manager.get_cache_info()
+            print("📁 LLM Kernel File Cache")
+            print(f"   Location: {info['cache_dir']}")
+            print(f"   Files: {info['num_files']}")
+            print(f"   Size: {info['total_size_mb']:.2f} MB")
+            print(f"   Types: {info['file_types']}")
+        else:
+            print("ℹ️  No file cache initialized")
+    
+    @line_magic
+    def llm_cache_list(self, line):
+        """List cached files.
+        
+        Usage:
+            %llm_cache_list         # List all cached files
+            %llm_cache_list pdf     # List only PDFs
+            %llm_cache_list image   # List only images
+        """
+        if not hasattr(self.kernel, 'file_upload_manager'):
+            print("ℹ️  No file cache initialized")
+            return
+        
+        file_type = line.strip() if line.strip() else None
+        files = self.kernel.file_upload_manager.list_cached_files()
+        
+        if file_type:
+            files = [f for f in files if f.get('file_type') == file_type]
+        
+        if not files:
+            print(f"ℹ️  No {'files' if not file_type else file_type + ' files'} in cache")
+            return
+        
+        print(f"📁 Cached {'files' if not file_type else file_type + ' files'}:")
+        for i, file_info in enumerate(files, 1):
+            size_mb = file_info['size'] / (1024 * 1024)
+            print(f"\n{i}. {file_info['original_name']}")
+            print(f"   Size: {size_mb:.2f} MB")
+            print(f"   Cached: {file_info['cached_at']}")
+            print(f"   Hash: {file_info['file_hash'][:16]}...")
+            
+            # Show upload history
+            if file_info.get('upload_history'):
+                print("   Uploads:")
+                for upload in file_info['upload_history']:
+                    provider = upload['provider']
+                    file_id = upload['upload_info'].get('file_id', 'embedded')
+                    print(f"     - {provider}: {file_id}")
+    
+    @line_magic
+    def llm_cache_clear(self, line):
+        """Clear the file cache.
+        
+        Usage:
+            %llm_cache_clear            # Clear all cached files
+            %llm_cache_clear --days=7   # Clear files older than 7 days
+        """
+        if not hasattr(self.kernel, 'file_upload_manager'):
+            print("ℹ️  No file cache initialized")
+            return
+        
+        older_than_days = None
+        if '--days=' in line:
+            try:
+                days_str = line.split('--days=')[1].split()[0]
+                older_than_days = int(days_str)
+            except:
+                print("❌ Invalid days parameter")
+                return
+        
+        # Confirm before clearing
+        if older_than_days:
+            confirm = input(f"Clear cached files older than {older_than_days} days? (y/N): ")
+        else:
+            confirm = input("Clear ALL cached files? (y/N): ")
+        
+        if confirm.lower() == 'y':
+            count = self.kernel.file_upload_manager.cache_manager.clear_cache(older_than_days)
+            print(f"✅ Cleared {count} cached files")
+        else:
+            print("❌ Cache clear cancelled")

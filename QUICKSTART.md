@@ -2,6 +2,31 @@
 
 Get up and running with the LLM Kernel in 5 minutes!
 
+## 🎯 NEW: Copy & Paste Multimodal Content!
+
+The LLM Kernel now supports seamless file pasting with native uploads:
+
+```python
+# Copy any file (Ctrl+C) then:
+%llm_paste
+
+# Works with:
+# - PDFs (uploaded natively via OpenAI Assistants API)
+# - Images (PNG, JPG, etc.)
+# - Screenshots
+# - Text
+
+# Ask questions in any cell:
+What's in this document?
+```
+
+**Smart Upload Handling:**
+- **OpenAI**: Uses Assistants API for native PDF reading - no conversion needed!
+- **Claude**: Embeds PDFs directly in messages
+- **Files are cached**: Avoids re-uploading the same file
+- **Automatic fallback**: Converts to images if native upload isn't supported
+- **Machine-readable output**: LLMs can read and analyze PDF content directly
+
 ## 🚀 Installation
 
 ### Quick Start for VS Code Users
