@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=0.19.0",
     "requests>=2.25.0",
     "nest-asyncio>=1.5.0",
+    "fastmcp>=0.1.0",
 ]
 requires-python = ">=3.8"
 readme = "README.md"
@@ -111,6 +112,7 @@ platforms = ["win-64"]
 [tool.pixi.pypi-dependencies]
 llm-kernel = { path = ".", editable = true }
 litellm = ">=1.0.0"
+fastmcp = ">=0.1.0"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
@@ -132,6 +134,7 @@ nest-asyncio = "*"
 [tool.pixi.feature.notebook.pypi-dependencies]
 llm-kernel = { path = ".", editable = true }
 litellm = ">=1.0.0"
+fastmcp = ">=0.1.0"
 
 [tool.pixi.tasks]
 install-kernel = { cmd = "python -m llm_kernel.install install", depends-on = ["install-editable"] }

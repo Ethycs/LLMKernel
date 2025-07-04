@@ -404,6 +404,74 @@ List all defined meta functions.
 
 ---
 
+## MCP (Model Context Protocol) Integration
+
+### `%llm_mcp_connect`
+Connect to MCP servers for external tool access.
+
+```python
+%llm_mcp_connect                    # Connect all configured servers
+%llm_mcp_connect filesystem         # Connect specific server
+%llm_mcp_connect https://api.example.com/mcp  # Connect by URL
+```
+
+### `%llm_mcp_disconnect`
+Disconnect from MCP servers.
+
+```python
+%llm_mcp_disconnect                 # Disconnect all
+%llm_mcp_disconnect filesystem      # Disconnect specific server
+```
+
+### `%llm_mcp_tools`
+List available tools from connected MCP servers.
+
+```python
+%llm_mcp_tools                      # List all tools
+%llm_mcp_tools filesystem           # List tools from specific server
+%llm_mcp_tools --json              # Output as JSON
+```
+
+**Output example:**
+```
+🛠️  Available MCP Tools (15 total):
+
+📦 filesystem (5 tools):
+   • filesystem.read_file
+     Read contents of a file
+   • filesystem.write_file
+     Write content to a file
+   • filesystem.list_directory
+     List directory contents
+```
+
+### `%llm_mcp_call`
+Call an MCP tool directly.
+
+```python
+%llm_mcp_call filesystem.read_file {"path": "README.md"}
+%llm_mcp_call github.create_issue {"title": "Bug report", "body": "..."}
+```
+
+### `%llm_mcp_config`
+Manage MCP server configuration.
+
+```python
+%llm_mcp_config                     # Show current config
+%llm_mcp_config reload              # Reload from file
+%llm_mcp_config ./my-config.json    # Load specific config
+```
+
+### `%%llm_mcp` (Cell Magic)
+Query LLM with MCP tool access (coming soon).
+
+```python
+%%llm_mcp
+Can you read the README.md and summarize the project?
+```
+
+---
+
 ## Common Workflows
 
 ### Starting a New Session
@@ -526,6 +594,12 @@ def filter_cells(messages):
 | `%llm_rerank_clear` | Clear reranking |
 | `%llm_apply_meta` | Apply custom functions |
 | `%llm_meta_list` | List meta functions |
+| **MCP Integration** |
+| `%llm_mcp_connect` | Connect to MCP servers |
+| `%llm_mcp_disconnect` | Disconnect servers |
+| `%llm_mcp_tools` | List available tools |
+| `%llm_mcp_call` | Call MCP tool |
+| `%llm_mcp_config` | Manage MCP config |
 | **Config** |
 | `%llm_config` | Configuration panel |
 | `%llm_display` | Set display mode |
@@ -537,6 +611,7 @@ def filter_cells(messages):
 | `%%llm_compare` | Compare models |
 | `%%hide` | Hide cell from context |
 | `%%meta` | Define custom functions |
+| `%%llm_mcp` | Query with MCP tools |
 
 ---
 

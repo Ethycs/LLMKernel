@@ -196,7 +196,15 @@ Based on analysis of the codebase vs README documentation.
 - [x] Added `%llm_token_count` for accurate token counting using model-specific tokenizers
 - [x] Added `%llm_cost` to track session costs and estimate query costs
 - [x] Updated `%llm_context` to show accurate token usage with warnings
+- [x] Implemented basic MCP (Model Context Protocol) integration with FastMCP
+- [x] Added `%llm_mcp_connect` to connect to MCP servers
+- [x] Added `%llm_mcp_disconnect` to disconnect from servers
+- [x] Added `%llm_mcp_tools` to list available tools
+- [x] Added `%llm_mcp_call` to call tools directly
+- [x] Added `%llm_mcp_config` to manage MCP configuration
+- [x] Created `%%llm_mcp` cell magic (tool calling in LLM not yet implemented)
+- [x] Added MCPManager class for handling MCP connections
 
 ---
 
-*Last updated: 2025-01-04 - Added context window management features*
+*Last updated: 2025-01-04 - Added MCP integration features*
