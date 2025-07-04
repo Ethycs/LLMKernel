@@ -145,3 +145,96 @@
 2025-07-04 11:29:13 - [llm_kernel] INFO: LLM Kernel initialized successfully
 2025-07-04 11:29:13 - [llm_kernel] INFO: Active model: gpt-4o
 2025-07-04 11:29:13 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 11:36:35 - [llm_kernel] INFO: ============================================================
+2025-07-04 11:36:35 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 11:36:35 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 11:36:36 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 11:36:36 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 11:36:36 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 11:36:36 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 11:36:36 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 11:36:36 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 11:36:36 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 11:41:34 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[1][39m[32m, line 1[39m
+[31m    [39m[31mexec(open('test_multimodal_display.py').read())[39m
+    ^
+[31mIndentationError[39m[31m:[39m unexpected indent
+
+2025-07-04 11:41:43 - [llm_kernel] INFO: Exception in execute request:
+[31m---------------------------------------------------------------------------[39m
+[31mUnicodeDecodeError[39m                        Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[2][39m[32m, line 1[39m
+[32m----> [39m[32m1[39m exec([38;5;28;43mopen[39;49m[43m([49m[33;43m'[39;49m[33;43mtest_multimodal_display.py[39;49m[33;43m'[39;49m[43m)[49m[43m.[49m[43mread[49m[43m([49m[43m)[49m)
+[32m      2[39m test_image_display()
+
+[36mFile [39m[32mF:\Keytone\Documents\GitHub\LLMKernel\.pixi\envs\notebook\Lib\encodings\cp1252.py:23[39m, in [36mIncrementalDecoder.decode[39m[34m(self, input, final)[39m
+[32m     22[39m [38;5;28;01mdef[39;00m[38;5;250m [39m[34mdecode[39m([38;5;28mself[39m, [38;5;28minput[39m, final=[38;5;28;01mFalse[39;00m):
+[32m---> [39m[32m23[39m     [38;5;28;01mreturn[39;00m [43mcodecs[49m[43m.[49m[43mcharmap_decode[49m[43m([49m[38;5;28;43minput[39;49m[43m,[49m[38;5;28;43mself[39;49m[43m.[49m[43merrors[49m[43m,[49m[43mdecoding_table[49m[43m)[49m[[32m0[39m]
+
+[31mUnicodeDecodeError[39m: 'charmap' codec can't decode byte 0x9d in position 909: character maps to <undefined>
+2025-07-04 11:42:15 - [llm_kernel] INFO: Exception in execute request:
+[31m---------------------------------------------------------------------------[39m
+[31mUnicodeDecodeError[39m                        Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[3][39m[32m, line 1[39m
+[32m----> [39m[32m1[39m exec([38;5;28;43mopen[39;49m[43m([49m[33;43m'[39;49m[33;43mtest_multimodal_display.py[39;49m[33;43m'[39;49m[43m)[49m[43m.[49m[43mread[49m[43m([49m[43m)[49m)
+[32m      2[39m test_image_display()
+
+[36mFile [39m[32mF:\Keytone\Documents\GitHub\LLMKernel\.pixi\envs\notebook\Lib\encodings\cp1252.py:23[39m, in [36mIncrementalDecoder.decode[39m[34m(self, input, final)[39m
+[32m     22[39m [38;5;28;01mdef[39;00m[38;5;250m [39m[34mdecode[39m([38;5;28mself[39m, [38;5;28minput[39m, final=[38;5;28;01mFalse[39;00m):
+[32m---> [39m[32m23[39m     [38;5;28;01mreturn[39;00m [43mcodecs[49m[43m.[49m[43mcharmap_decode[49m[43m([49m[38;5;28;43minput[39;49m[43m,[49m[38;5;28;43mself[39;49m[43m.[49m[43merrors[49m[43m,[49m[43mdecoding_table[49m[43m)[49m[[32m0[39m]
+
+[31mUnicodeDecodeError[39m: 'charmap' codec can't decode byte 0x9d in position 934: character maps to <undefined>
+2025-07-04 11:42:16 - [llm_kernel] INFO: Exception in execute request:
+[31m---------------------------------------------------------------------------[39m
+[31mUnicodeDecodeError[39m                        Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[4][39m[32m, line 1[39m
+[32m----> [39m[32m1[39m exec([38;5;28;43mopen[39;49m[43m([49m[33;43m'[39;49m[33;43mtest_multimodal_display.py[39;49m[33;43m'[39;49m[43m)[49m[43m.[49m[43mread[49m[43m([49m[43m)[49m)
+[32m      2[39m test_image_display()
+
+[36mFile [39m[32mF:\Keytone\Documents\GitHub\LLMKernel\.pixi\envs\notebook\Lib\encodings\cp1252.py:23[39m, in [36mIncrementalDecoder.decode[39m[34m(self, input, final)[39m
+[32m     22[39m [38;5;28;01mdef[39;00m[38;5;250m [39m[34mdecode[39m([38;5;28mself[39m, [38;5;28minput[39m, final=[38;5;28;01mFalse[39;00m):
+[32m---> [39m[32m23[39m     [38;5;28;01mreturn[39;00m [43mcodecs[49m[43m.[49m[43mcharmap_decode[49m[43m([49m[38;5;28;43minput[39;49m[43m,[49m[38;5;28;43mself[39;49m[43m.[49m[43merrors[49m[43m,[49m[43mdecoding_table[49m[43m)[49m[[32m0[39m]
+
+[31mUnicodeDecodeError[39m: 'charmap' codec can't decode byte 0x9d in position 934: character maps to <undefined>
+2025-07-04 11:42:17 - [llm_kernel] INFO: Exception in execute request:
+[31m---------------------------------------------------------------------------[39m
+[31mUnicodeDecodeError[39m                        Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[5][39m[32m, line 1[39m
+[32m----> [39m[32m1[39m exec([38;5;28;43mopen[39;49m[43m([49m[33;43m'[39;49m[33;43mtest_multimodal_display.py[39;49m[33;43m'[39;49m[43m)[49m[43m.[49m[43mread[49m[43m([49m[43m)[49m)
+[32m      2[39m test_image_display()
+
+[36mFile [39m[32mF:\Keytone\Documents\GitHub\LLMKernel\.pixi\envs\notebook\Lib\encodings\cp1252.py:23[39m, in [36mIncrementalDecoder.decode[39m[34m(self, input, final)[39m
+[32m     22[39m [38;5;28;01mdef[39;00m[38;5;250m [39m[34mdecode[39m([38;5;28mself[39m, [38;5;28minput[39m, final=[38;5;28;01mFalse[39;00m):
+[32m---> [39m[32m23[39m     [38;5;28;01mreturn[39;00m [43mcodecs[49m[43m.[49m[43mcharmap_decode[49m[43m([49m[38;5;28;43minput[39;49m[43m,[49m[38;5;28;43mself[39;49m[43m.[49m[43merrors[49m[43m,[49m[43mdecoding_table[49m[43m)[49m[[32m0[39m]
+
+[31mUnicodeDecodeError[39m: 'charmap' codec can't decode byte 0x9d in position 934: character maps to <undefined>
+2025-07-04 11:42:17 - [llm_kernel] INFO: Exception in execute request:
+[31m---------------------------------------------------------------------------[39m
+[31mUnicodeDecodeError[39m                        Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[6][39m[32m, line 1[39m
+[32m----> [39m[32m1[39m exec([38;5;28;43mopen[39;49m[43m([49m[33;43m'[39;49m[33;43mtest_multimodal_display.py[39;49m[33;43m'[39;49m[43m)[49m[43m.[49m[43mread[49m[43m([49m[43m)[49m)
+[32m      2[39m test_image_display()
+
+[36mFile [39m[32mF:\Keytone\Documents\GitHub\LLMKernel\.pixi\envs\notebook\Lib\encodings\cp1252.py:23[39m, in [36mIncrementalDecoder.decode[39m[34m(self, input, final)[39m
+[32m     22[39m [38;5;28;01mdef[39;00m[38;5;250m [39m[34mdecode[39m([38;5;28mself[39m, [38;5;28minput[39m, final=[38;5;28;01mFalse[39;00m):
+[32m---> [39m[32m23[39m     [38;5;28;01mreturn[39;00m [43mcodecs[49m[43m.[49m[43mcharmap_decode[49m[43m([49m[38;5;28;43minput[39;49m[43m,[49m[38;5;28;43mself[39;49m[43m.[49m[43merrors[49m[43m,[49m[43mdecoding_table[49m[43m)[49m[[32m0[39m]
+
+[31mUnicodeDecodeError[39m: 'charmap' codec can't decode byte 0x9d in position 934: character maps to <undefined>
+2025-07-04 12:01:29 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[13][39m[32m, line 2[39m
+[31m    [39m[31mWHat's in the image above?[39m
+        ^
+[31mSyntaxError[39m[31m:[39m unterminated string literal (detected at line 2)
+
+2025-07-04 12:30:22 - [llm_kernel] INFO: ============================================================
+2025-07-04 12:30:22 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 12:30:22 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 12:30:23 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 12:30:23 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 12:30:23 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 12:30:23 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-04 12:30:23 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 12:30:23 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 12:30:23 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 12:30:23 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']

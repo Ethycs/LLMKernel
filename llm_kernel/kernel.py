@@ -50,10 +50,12 @@ from .magic_commands import (
 
 try:
     from .magic_commands.multimodal import MultimodalMagics
+    from .magic_commands.multimodal_native_pdf import NativePDFMagics
     HAS_MULTIMODAL = True
 except ImportError:
     HAS_MULTIMODAL = False
     MultimodalMagics = None
+    NativePDFMagics = None
 
 
 class LLMKernel(IPythonKernel):
@@ -372,6 +374,14 @@ class LLMKernel(IPythonKernel):
                 self.shell.register_magic_function(multimodal_magics.llm_media_list, 'line', 'llm_media_list')
                 self.shell.register_magic_function(multimodal_magics.llm_vision, 'cell', 'llm_vision')
                 self.log.info("Multimodal magic commands registered")
+                
+                # Native PDF commands (for direct PDF upload)
+                if NativePDFMagics:
+                    native_pdf_magics = NativePDFMagics(self.shell, self)
+                    self.shell.register_magic_function(native_pdf_magics.llm_pdf_native, 'line', 'llm_pdf_native')
+                    self.shell.register_magic_function(native_pdf_magics.llm_files_list, 'line', 'llm_files_list')
+                    self.shell.register_magic_function(native_pdf_magics.llm_files_clear, 'line', 'llm_files_clear')
+                    self.log.info("Native PDF magic commands registered")
             
             self.log.info("All magic commands registered successfully")
             
@@ -503,6 +513,10 @@ class LLMKernel(IPythonKernel):
                         
         except Exception as e:
             self.log.warning(f"Could not get notebook history: {e}")
+        
+        # Add conversation history (including pasted images) to the end
+        if hasattr(self, 'conversation_history') and self.conversation_history:
+            messages.extend(self.conversation_history)
             
         return messages
 

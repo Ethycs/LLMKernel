@@ -735,9 +735,12 @@ def filter_cells(messages):
 | **Multimodal** |
 | `%llm_paste` | Paste clipboard content |
 | `%llm_image` | Include image file/URL |
-| `%llm_pdf` | Include PDF content |
+| `%llm_pdf` | Include PDF as images |
+| `%llm_pdf_native` | Upload PDF directly |
 | `%llm_media_clear` | Clear attached media |
 | `%llm_media_list` | List attached media |
+| `%llm_files_list` | List uploaded files |
+| `%llm_files_clear` | Clear uploaded files |
 
 ---
 
@@ -745,8 +748,15 @@ def filter_cells(messages):
 
 The LLM Kernel supports multimodal content including images, PDFs, and clipboard content for vision-capable models.
 
+**Important:** Images and PDFs are now added to the conversation context and persist across cells, just like in regular LLM chat interfaces!
+
+### Two Ways to Handle PDFs
+
+1. **%llm_pdf** - Converts PDF pages to images (works with any vision model)
+2. **%llm_pdf_native** - Uploads the PDF file directly (for APIs that support native PDF like OpenAI GPT-4.1+, Claude)
+
 ### `%llm_paste`
-Paste and include clipboard content (image or text) in the next LLM query.
+Paste and include clipboard content (image or text) in the conversation context.
 
 ```python
 %llm_paste                    # Paste clipboard content
@@ -757,12 +767,14 @@ Paste and include clipboard content (image or text) in the next LLM query.
 
 **Example:**
 ```python
-# Copy an image to clipboard, then:
+# Cell 1: Copy an image to clipboard, then paste it
 %llm_paste
-What's in this image?
+✅ Pasted image (800x600) - added to conversation context
 
-# Or check first:
-%llm_paste --show
+# Cell 2: Ask about it in a different cell!
+What's in the image I just pasted?
+
+# The LLM can see the image from the previous cell!
 ```
 
 ### `%llm_image`
@@ -785,7 +797,7 @@ What trends do you see in this chart?
 ```
 
 ### `%llm_pdf`
-Include PDF content in the next LLM query as images or text.
+Include PDF content in the conversation context as images or text.
 
 ```python
 %llm_pdf path/to/document.pdf           # Include all pages as images
@@ -796,20 +808,74 @@ Include PDF content in the next LLM query as images or text.
 
 **Example:**
 ```python
+# Cell 1: Add PDF pages as images
 %llm_pdf report.pdf --pages 1,2,3
+✅ Added 3 page images from PDF
+
+# Cell 2: Ask about them in a different cell!
 Summarize the key findings from these pages
 
-# Extract as text for non-vision models:
+# Or extract as text (also persists across cells):
 %llm_pdf article.pdf --text
+✅ Extracted text from 10 pages
+
+# Later cells can reference the PDF content
 What are the main arguments in this paper?
 ```
 
+### `%llm_pdf_native`
+Upload PDF files directly to the conversation (for APIs that support native PDF).
+
+This is the modern approach supported by OpenAI GPT-4.1+, Claude, and other APIs that accept PDF files directly without conversion to images.
+
+```python
+%llm_pdf_native document.pdf              # Upload entire PDF
+%llm_pdf_native --preview document.pdf    # Preview file info without uploading
+```
+
+**Example:**
+```python
+# Cell 1: Upload a PDF directly
+%llm_pdf_native research_paper.pdf
+✅ Uploaded PDF 'research_paper.pdf' (2.3 MB) to conversation
+
+# Cell 2: Ask about it in any subsequent cell
+What are the key findings in this paper?
+
+# Cell 3: The LLM has full access to the PDF content
+Can you extract all the citations from this paper?
+```
+
+### `%llm_files_list`
+List all files uploaded to the conversation.
+
+```python
+%llm_files_list    # Show all uploaded files
+```
+
+**Output example:**
+```
+📁 Uploaded files in conversation:
+  1. research_paper.pdf (pdf, 2.3 MB)
+      Path: /home/user/documents/research_paper.pdf
+  2. data_analysis.pdf (pdf, 1.5 MB)
+      Path: /home/user/documents/data_analysis.pdf
+```
+
+### `%llm_files_clear`
+Clear uploaded files from conversation history.
+
+```python
+%llm_files_clear    # Remove all file uploads from conversation
+```
+
 ### `%llm_media_clear`
-Clear multimodal content from cells.
+Clear multimodal content from cells or conversation history.
 
 ```python
 %llm_media_clear              # Clear current cell's media
 %llm_media_clear all          # Clear all cells' media
+%llm_media_clear history      # Clear images from conversation history
 ```
 
 ### `%llm_media_list`

@@ -76,8 +76,24 @@ class MultimodalMagics(Magics):
         cell_id = getattr(self.kernel, '_current_cell_id', 'unknown')
         
         if img_content:
+            # Add image to conversation history as a multimodal message
+            image_message = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_content['data']}"
+                        }
+                    }
+                ]
+            }
+            self.kernel.conversation_history.append(image_message)
+            
+            # Also add to cell for immediate use
             self.multimodal.add_to_cell(cell_id, img_content)
-            print(f"✅ Pasted image ({img_content['size'][0]}x{img_content['size'][1]}) - will be included in next LLM query")
+            
+            print(f"✅ Pasted image ({img_content['size'][0]}x{img_content['size'][1]}) - added to conversation context")
             # Show thumbnail - convert base64 to bytes
             import base64
             img_bytes = base64.b64decode(img_content['data'])
@@ -131,11 +147,25 @@ class MultimodalMagics(Magics):
                 display(IPImage(data=img_bytes, format='png', width=400))
                 return
             
-            # Add to current cell's multimodal content
+            # Add image to conversation history as a multimodal message
+            image_message = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_content['data']}"
+                        }
+                    }
+                ]
+            }
+            self.kernel.conversation_history.append(image_message)
+            
+            # Also add to current cell's multimodal content
             cell_id = getattr(self.kernel, '_current_cell_id', 'unknown')
             self.multimodal.add_to_cell(cell_id, img_content)
             
-            print(f"✅ Added image ({img_content['size'][0]}x{img_content['size'][1]}) - will be included in next LLM query")
+            print(f"✅ Added image ({img_content['size'][0]}x{img_content['size'][1]}) - added to conversation context")
             # Show thumbnail
             import base64
             img_bytes = base64.b64decode(img_content['data'])
@@ -211,6 +241,29 @@ class MultimodalMagics(Magics):
             cell_id = getattr(self.kernel, '_current_cell_id', 'unknown')
             for item in content_items:
                 self.multimodal.add_to_cell(cell_id, item)
+                
+                # Add to conversation history
+                if item['type'] == 'image':
+                    # Add images as multimodal messages
+                    image_message = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{item['data']}"
+                                }
+                            }
+                        ]
+                    }
+                    self.kernel.conversation_history.append(image_message)
+                elif item['type'] == 'text':
+                    # Add extracted text as regular message
+                    text_message = {
+                        "role": "user",
+                        "content": f"[PDF Text from {pdf_path}]:\n{item['data']}"
+                    }
+                    self.kernel.conversation_history.append(text_message)
             
             if as_text:
                 print(f"✅ Extracted text from {len(content_items)} pages")
@@ -228,11 +281,12 @@ class MultimodalMagics(Magics):
     
     @line_magic
     def llm_media_clear(self, line):
-        """Clear multimodal content from the current cell.
+        """Clear multimodal content from the current cell or conversation.
         
         Usage:
             %llm_media_clear              # Clear current cell's media
             %llm_media_clear all          # Clear all cells' media
+            %llm_media_clear history      # Clear images from conversation history
         """
         if not self.multimodal:
             print("❌ Multimodal support not available.")
@@ -240,7 +294,20 @@ class MultimodalMagics(Magics):
         
         if line.strip() == 'all':
             self.multimodal._cell_media.clear()
-            print("✅ Cleared all multimodal content")
+            print("✅ Cleared all multimodal content from cells")
+        elif line.strip() == 'history':
+            # Remove multimodal messages from conversation history
+            if hasattr(self.kernel, 'conversation_history'):
+                original_len = len(self.kernel.conversation_history)
+                self.kernel.conversation_history = [
+                    msg for msg in self.kernel.conversation_history 
+                    if not (isinstance(msg.get('content'), list) and 
+                           any(item.get('type') == 'image_url' for item in msg['content']))
+                ]
+                removed = original_len - len(self.kernel.conversation_history)
+                print(f"✅ Removed {removed} image messages from conversation history")
+            else:
+                print("ℹ️  No conversation history found")
         else:
             cell_id = getattr(self.kernel, '_current_cell_id', 'unknown')
             if cell_id in self.multimodal._cell_media:
