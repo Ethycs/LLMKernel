@@ -29,6 +29,7 @@ class ConfigMagics(Magics):
         """Show interactive configuration panel."""
         self.create_config_panel()
     
+    
     @line_magic
     def llm_context_window(self, line):
         """Display or set context window information for the current model.

@@ -213,7 +213,9 @@ LLM_KERNEL_CONTEXT_STRATEGY=smart
 LLM_KERNEL_MAX_TOKENS=4000
 LLM_KERNEL_MAX_CELLS=20
 LLM_KERNEL_AUTO_PRUNE=true
-LLM_KERNEL_LOG_LEVEL=INFO
+LLM_KERNEL_LOGGING=true              # Enable/disable file logging (true/false)
+LLM_KERNEL_DEBUG=INFO                # Log level when logging is enabled
+LLM_KERNEL_LOG_FILE=llm_kernel.log   # Log file location
 ```
 
 ### Configuration Files

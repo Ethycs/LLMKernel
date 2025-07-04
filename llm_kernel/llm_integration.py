@@ -35,25 +35,9 @@ class LLMIntegration:
             
         model_name = self.kernel.llm_clients[model]
         
-        # Check if we're in notebook context mode
-        use_notebook_context = getattr(self.kernel, 'notebook_context_mode', False)
-        
-        if use_notebook_context:
-            # Use notebook cells as context
-            messages = self.kernel.get_notebook_cells_as_context()
-            messages.append({"role": "user", "content": query})
-        else:
-            # Use traditional context manager
-            context = self.kernel.context_manager.get_context_for_model(model)
-            
-            # Build messages
-            messages = []
-            for ctx in context:
-                messages.append({"role": "user", "content": ctx['input']})
-                if ctx.get('output'):
-                    messages.append({"role": "assistant", "content": ctx['output']})
-            
-            messages.append({"role": "user", "content": query})
+        # Always use notebook cells as context when in a notebook environment
+        messages = self.kernel.get_notebook_cells_as_context()
+        messages.append({"role": "user", "content": query})
         
         try:
             # Use LiteLLM to query the model
@@ -96,18 +80,9 @@ class LLMIntegration:
         if hasattr(self.kernel, 'mcp_manager') and self.kernel.mcp_manager:
             mcp_tools = self._get_mcp_tools_for_llm()
         
-        # Build messages
-        if getattr(self.kernel, 'notebook_context_mode', False):
-            messages = self.kernel.get_notebook_cells_as_context()
-            messages.append({"role": "user", "content": query})
-        else:
-            context = self.kernel.context_manager.get_context_for_model(model)
-            messages = []
-            for ctx in context:
-                messages.append({"role": "user", "content": ctx['input']})
-                if ctx.get('output'):
-                    messages.append({"role": "assistant", "content": ctx['output']})
-            messages.append({"role": "user", "content": query})
+        # Always use notebook cells as context
+        messages = self.kernel.get_notebook_cells_as_context()
+        messages.append({"role": "user", "content": query})
         
         # Add system message about available tools
         if mcp_tools:

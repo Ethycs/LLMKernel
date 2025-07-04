@@ -31,31 +31,23 @@ class BaseMagics(Magics):
             if hasattr(self.kernel, 'chat_mode') and self.kernel.chat_mode:
                 self.kernel.chat_mode = False
                 self.kernel.display_mode = 'inline'
-                self.kernel.notebook_context_mode = False
                 print("💬 Chat mode: OFF")
-                print("📓 Notebook context mode: OFF")
             else:
                 self.kernel.chat_mode = True
                 self.kernel.display_mode = 'chat'
-                self.kernel.notebook_context_mode = True  # Enable notebook context
                 print("💬 Chat mode: ON")
-                print("📓 Notebook context mode: ON")
                 print("📝 Just type in any cell to chat!")
                 print("💡 Your notebook cells are now the LLM's context window!")
         elif arg in ['on', 'true', '1']:
             self.kernel.chat_mode = True
             self.kernel.display_mode = 'chat'
-            self.kernel.notebook_context_mode = True
             print("💬 Chat mode: ON")
-            print("📓 Notebook context mode: ON")
             print("📝 Just type in any cell to chat!")
             print("💡 Your notebook cells are now the LLM's context window!")
         elif arg in ['off', 'false', '0']:
             self.kernel.chat_mode = False
             self.kernel.display_mode = 'inline'
-            self.kernel.notebook_context_mode = False
             print("💬 Chat mode: OFF")
-            print("📓 Notebook context mode: OFF")
         elif arg == 'status':
             status = "ON" if hasattr(self.kernel, 'chat_mode') and self.kernel.chat_mode else "OFF"
             print(f"💬 Chat mode: {status}")

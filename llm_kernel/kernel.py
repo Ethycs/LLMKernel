@@ -112,7 +112,6 @@ class LLMKernel(IPythonKernel):
         
         # Chat mode
         self.chat_mode = False
-        self.notebook_context_mode = False
         
         # Async executor for parallel queries
         self.executor = ThreadPoolExecutor(max_workers=4)
@@ -137,6 +136,15 @@ class LLMKernel(IPythonKernel):
 
     def setup_logging(self):
         """Configure logging for the kernel."""
+        # Check if logging is disabled
+        if os.getenv('LLM_KERNEL_LOGGING', 'true').lower() == 'false':
+            # Create a null logger that does nothing
+            self.log = logging.getLogger('llm_kernel')
+            self.log.setLevel(logging.CRITICAL + 1)  # Disable all logging
+            self.log.handlers = []
+            self.log.addHandler(logging.NullHandler())
+            return
+        
         log_level = os.getenv('LLM_KERNEL_DEBUG', 'INFO').upper()
         
         # Create a logger
@@ -298,7 +306,6 @@ class LLMKernel(IPythonKernel):
             
             # Context commands
             self.shell.register_magic_function(context_magics.llm_context, 'line', 'llm_context')
-            self.shell.register_magic_function(context_magics.llm_notebook_context, 'line', 'llm_notebook_context')
             self.shell.register_magic_function(context_magics.hide, 'cell', 'hide')
             self.shell.register_magic_function(context_magics.llm_unhide, 'line', 'llm_unhide')
             self.shell.register_magic_function(context_magics.llm_hidden, 'line', 'llm_hidden')
@@ -448,12 +455,24 @@ class LLMKernel(IPythonKernel):
         execution_count = self.execution_count if hasattr(self, 'execution_count') else 0
         self.execution_tracker.track_execution(cell_id, code, execution_count)
         
-        # Check if we're in chat mode and this is not a magic command
-        if (hasattr(self, 'chat_mode') and self.chat_mode and 
-            not code.strip().startswith('%') and not code.strip().startswith('!')):
+        # Check if we're in chat mode and this is not a magic command or shell command
+        # Magic commands (%) and shell commands (!) should always execute normally
+        code_stripped = code.strip()
+        
+        # Check if any line in the code starts with a magic command
+        # This handles multi-line cells where magic commands aren't on the first line
+        has_magic = any(line.strip().startswith('%') or line.strip().startswith('!') 
+                       for line in code.splitlines())
+        
+        # Debug logging
+        self.log.debug(f"do_execute called with code: {code_stripped[:50]}...")
+        self.log.debug(f"Chat mode: {getattr(self, 'chat_mode', False)}")
+        self.log.debug(f"Has magic command: {has_magic}")
+        
+        if (hasattr(self, 'chat_mode') and self.chat_mode and not has_magic):
             
-            # In chat mode, treat non-magic commands as LLM queries
-            query = code.strip()
+            # In chat mode, treat non-magic/non-shell commands as LLM queries
+            query = code_stripped
             if query:
                 try:
                     # Use the LLM integration to handle the query
@@ -494,7 +513,10 @@ class LLMKernel(IPythonKernel):
                     self.log.error(f"Chat mode error: {e}")
         
         # Normal execution
-        return super().do_execute(code, silent, store_history, user_expressions, allow_stdin)
+        self.log.debug(f"Executing normally (not as LLM query): {code_stripped[:50]}...")
+        result = super().do_execute(code, silent, store_history, user_expressions, allow_stdin)
+        self.log.debug(f"Execution result: {result}")
+        return result
 
     def do_shutdown(self, restart):
         """Clean shutdown of kernel."""

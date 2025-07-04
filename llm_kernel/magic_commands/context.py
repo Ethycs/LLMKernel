@@ -29,15 +29,15 @@ class ContextMagics(Magics):
     @line_magic
     def llm_context(self, line):
         """Show current context that will be sent to the LLM"""
-        if getattr(self.kernel, 'notebook_context_mode', False):
-            print("📓 Notebook Context Mode - Showing cells that will be sent to LLM:")
-            print("=" * 60)
-            
-            messages = self.kernel.get_notebook_cells_as_context()
-            
-            if not messages:
-                print("No context available yet. Start typing in cells!")
-            else:
+        # Always show notebook cells as context when in a notebook environment
+        print("📓 Notebook Context - Showing cells that will be sent to LLM:")
+        print("=" * 60)
+        
+        messages = self.kernel.get_notebook_cells_as_context()
+        
+        if not messages:
+            print("No context available yet. Start typing in cells!")
+        else:
                 for i, msg in enumerate(messages):
                     role = msg['role'].upper()
                     content = msg['content']
@@ -87,42 +87,7 @@ class ContextMagics(Magics):
                 if hasattr(self.kernel, 'hidden_cells') and self.kernel.hidden_cells:
                     hidden_nums = sorted([int(cell_id.split('_')[1]) for cell_id in self.kernel.hidden_cells])
                     print(f"\n🙈 Hidden cells: {', '.join(map(str, hidden_nums))}")
-        else:
-            print("📝 Traditional Context Mode")
-            print("Use %llm_status to see conversation history")
     
-    @line_magic
-    def llm_notebook_context(self, line):
-        """Toggle notebook context mode on/off
-        
-        When enabled, the LLM sees notebook cells as its context window
-        instead of using the traditional conversation history.
-        """
-        arg = line.strip().lower()
-        
-        if not arg:
-            # Toggle mode
-            current = getattr(self.kernel, 'notebook_context_mode', False)
-            self.kernel.notebook_context_mode = not current
-            status = "ON" if self.kernel.notebook_context_mode else "OFF"
-            print(f"📓 Notebook context mode: {status}")
-            if self.kernel.notebook_context_mode:
-                print("📝 The LLM now sees your notebook cells as context!")
-                print("💡 Each cell becomes part of the conversation")
-        elif arg in ['on', 'true', '1']:
-            self.kernel.notebook_context_mode = True
-            print("📓 Notebook context mode: ON")
-            print("📝 The LLM now sees your notebook cells as context!")
-        elif arg in ['off', 'false', '0']:
-            self.kernel.notebook_context_mode = False
-            print("📓 Notebook context mode: OFF")
-            print("📝 Using traditional conversation history")
-        elif arg == 'status':
-            status = "ON" if getattr(self.kernel, 'notebook_context_mode', False) else "OFF"
-            print(f"📓 Notebook context mode: {status}")
-        else:
-            print("Usage: %llm_notebook_context [on|off|status]")
-            print("       %llm_notebook_context  (toggles mode)")
     
     @cell_magic
     def hide(self, line, cell):
@@ -206,8 +171,7 @@ class ContextMagics(Magics):
                 'conversation_history': self.kernel.conversation_history,
                 'metadata': {
                     'saved_at': time.time(),
-                    'active_model': self.kernel.active_model,
-                    'notebook_context_mode': getattr(self.kernel, 'notebook_context_mode', False)
+                    'active_model': self.kernel.active_model
                 }
             }
             
@@ -248,8 +212,6 @@ class ContextMagics(Magics):
             metadata = context_data.get('metadata', {})
             if 'active_model' in metadata:
                 self.kernel.active_model = metadata['active_model']
-            if 'notebook_context_mode' in metadata:
-                self.kernel.notebook_context_mode = metadata['notebook_context_mode']
             
             # Store loaded context for later use
             self.kernel.saved_context = context_data.get('messages', [])

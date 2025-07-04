@@ -6,3 +6,24 @@
 2025-07-04 01:22:08 - [llm_kernel] INFO: LLM Kernel initialized successfully
 2025-07-04 01:22:08 - [llm_kernel] INFO: Active model: gpt-4o
 2025-07-04 01:22:08 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 01:22:27 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[3][39m[32m, line 2[39m
+[31m    [39m[31mThe lucky number is now 6[39m
+        ^
+[31mSyntaxError[39m[31m:[39m invalid syntax
+
+2025-07-04 01:22:30 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[4][39m[32m, line 2[39m
+[31m    [39m[31mThe lucky number is now 6[39m
+        ^
+[31mSyntaxError[39m[31m:[39m invalid syntax
+
+2025-07-04 01:38:51 - [llm_kernel] INFO: ============================================================
+2025-07-04 01:38:51 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 01:38:51 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 01:38:52 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 01:38:52 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 01:38:52 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 01:38:52 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 01:38:52 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 01:38:52 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
