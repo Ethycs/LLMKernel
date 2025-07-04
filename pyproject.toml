@@ -117,6 +117,7 @@ dev = { features = ["dev"], solve-group = "default" }
 semantic = { features = ["semantic"], solve-group = "default" }
 visualization = { features = ["visualization"], solve-group = "default" }
 notebook = { features = ["notebook"], solve-group = "notebook" }
+test = { features = ["test"], solve-group = "test" }
 
 [tool.pixi.feature.notebook.dependencies]
 jupyter = "*"
@@ -135,6 +136,48 @@ llm-kernel = { path = ".", editable = true }
 litellm = ">=1.0.0"
 fastmcp = ">=0.1.0"
 
+[tool.pixi.feature.test.dependencies]
+pytest = ">=8.0.0"
+pytest-asyncio = ">=0.21.0"
+pytest-cov = ">=4.1.0"
+pytest-mock = ">=3.12.0"
+pytest-xdist = ">=3.5.0"
+pytest-watch = ">=4.2.0"
+pytest-html = ">=3.2.0"
+python = ">=3.8"
+ipykernel = ">=6.29.5,<7"
+ipython = ">=7.0.0"
+ipywidgets = ">=7.0.0"
+python-dotenv = ">=0.19.0"
+requests = ">=2.25.0"
+nest-asyncio = ">=1.5.0"
+pillow = ">=9.0.0"
+pyperclip = ">=1.8.0"
+pymupdf = ">=1.23.0"
+reportlab = ">=4.0.0"
+openai = ">=1.0.0"
+anthropic = ">=0.3.0"
+google-generativeai = ">=0.3.0"
+
+[tool.pixi.feature.test.pypi-dependencies]
+llm-kernel = { path = ".", editable = true }
+litellm = ">=1.0.0"
+fastmcp = ">=0.1.0"
+
+[tool.pixi.feature.test.tasks]
+test-all = "pytest tests/ -v"
+test-magic = "pytest tests/ -m magic -v"
+test-unit = "pytest tests/ -m unit -v"
+test-integration = "pytest tests/ -m integration -v"
+test-quick = "pytest tests/ -m 'not slow' -v"
+test-coverage = "pytest tests/ --cov=llm_kernel --cov-report=html --cov-report=term-missing -v"
+test-watch = "pytest-watch tests/ -v"
+test-parallel = "pytest tests/ -n auto -v"
+test-debug = "pytest tests/ --pdb --pdbcls=IPython.terminal.debugger:TerminalPdb -s -v"
+test-specific = "pytest tests/test_magic_commands.py -v"
+test-verbose = "pytest tests/ -vvs"
+test-report = "pytest tests/ --html=report.html --self-contained-html -v"
+
 [tool.pixi.tasks]
 install-kernel = { cmd = "python -m llm_kernel.install install", depends-on = [
     "install-editable",
@@ -142,7 +185,11 @@ install-kernel = { cmd = "python -m llm_kernel.install install", depends-on = [
 install-editable = "pip install -e ."
 notebook = "jupyter notebook"
 lab = "jupyter lab"
-test = "pytest test_kernel.py -v"
+test = "pytest tests/ -v"
+test-simple = "pytest test_kernel.py -v"
+test-markers = "pytest --markers"
+setup-test-env = "cp tests/.env.test .env.test && echo 'Test environment configured!'"
+clean-test = "rm -rf .pytest_cache htmlcov .coverage* report.html && echo 'Test artifacts cleaned!'"
 
 [tool.pixi.feature.notebook.tasks]
 bootstrap = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Starting Jupyter Lab...' && jupyter lab", depends-on = [

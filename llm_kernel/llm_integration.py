@@ -140,7 +140,24 @@ class LLMIntegration:
             
         except Exception as e:
             self.logger.error(f"Error querying {model}: {e}")
-            return f"Error: {str(e)}"
+            
+            # Provide more helpful error messages
+            error_msg = str(e)
+            if "InternalServerError" in error_msg and "OpenAI" in error_msg:
+                return (f"Error: {error_msg}\n\n"
+                       "💡 This is a temporary OpenAI server issue. Suggestions:\n"
+                       "  • Wait a few moments and try again\n"
+                       "  • If using a PDF, ensure it's under 20MB\n" 
+                       "  • Try with a smaller or different PDF\n"
+                       "  • Check OpenAI status: https://status.openai.com")
+            elif "rate_limit" in error_msg.lower():
+                return (f"Error: {error_msg}\n\n"
+                       "⏱️ Rate limit reached. Please wait a few minutes before trying again.")
+            elif "Invalid value: 'input_file'" in error_msg:
+                return (f"Error: {error_msg}\n\n"
+                       "⚠️ File format issue. This might be due to an API version mismatch.")
+            else:
+                return f"Error: {error_msg}"
     
     async def query_llm_with_mcp_async(self, query: str, model: str = None, **kwargs) -> str:
         """Query LLM with MCP tools available for function calling."""

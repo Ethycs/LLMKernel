@@ -273,21 +273,105 @@ cd llm-kernel
 pip install -e ".[dev]"
 ```
 
+### Test Structure
+
+The test suite is organized as follows:
+
+```
+tests/
+├── .env.test                  # Test environment configuration
+├── conftest.py               # Pytest fixtures and configuration
+├── test_magic_commands.py    # Unit tests for all magic commands
+├── test_integration_magic.py # Integration tests with real kernel
+└── README.md                # Detailed testing documentation
+```
+
+Key test files:
+- `conftest.py` - Provides mock fixtures, test environment isolation, and helper utilities
+- `test_magic_commands.py` - Comprehensive unit tests for each magic command with mocked dependencies
+- `test_integration_magic.py` - Integration tests that execute commands in a real kernel environment
+
 ### Run Tests
+
+The project includes a comprehensive test suite for all magic commands and kernel functionality.
+
+#### Using Pixi (Recommended)
+
+```bash
+# Install test environment
+pixi install -e test
+
+# Run all tests
+pixi run -e test test-all
+
+# Run magic command tests only
+pixi run -e test test-magic
+
+# Run unit tests only
+pixi run -e test test-unit
+
+# Run integration tests only
+pixi run -e test test-integration
+
+# Run with coverage report
+pixi run -e test test-coverage
+
+# Run tests in parallel
+pixi run -e test test-parallel
+
+# Run quick tests (skip slow tests)
+pixi run -e test test-quick
+
+# Debug failing tests
+pixi run -e test test-debug
+
+# Watch for changes and re-run tests
+pixi run -e test test-watch
+```
+
+#### Using Pytest Directly
 
 ```bash
 # Run all tests
-pytest test_kernel.py -v
+pytest tests/ -v
 
-# Run specific test classes
-pytest test_kernel.py::TestContextManager -v
+# Run specific test suites by marker
+pytest tests/ -m magic -v        # Magic command tests only
+pytest tests/ -m unit -v         # Unit tests only
+pytest tests/ -m integration -v  # Integration tests only
 
-# Run with coverage (if installed)
-pytest test_kernel.py --cov=llm_kernel
+# Run with coverage
+pytest tests/ --cov=llm_kernel --cov-report=html --cov-report=term-missing -v
 
-# Run only unit tests (skip integration tests)
-pytest test_kernel.py -m "not integration" -v
+# Run quick tests (skip slow)
+pytest tests/ -m "not slow" -v
+
+# Run specific test files
+pytest tests/test_magic_commands.py -v
+pytest tests/test_integration_magic.py -v
+
+# Run specific test
+pytest tests/test_magic_commands.py::test_llm_model -v
+
+# Run tests in parallel
+pytest tests/ -n auto -v
+
+# Run with detailed output
+pytest tests/ -vvs
+
+# Generate HTML report
+pytest tests/ --html=report.html --self-contained-html -v
 ```
+
+#### Test Categories
+
+Tests are organized with pytest markers:
+
+- `unit` - Fast unit tests with mocked dependencies
+- `integration` - Tests using real kernel instances
+- `slow` - Tests that take longer to run
+- `magic` - Tests specific to magic commands
+- `requires_api_key` - Tests requiring real API keys
 
 ### Code Formatting
 
