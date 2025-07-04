@@ -48,15 +48,21 @@ class MultimodalMagics(Magics):
         
         # Try to get clipboard content
         img_content = None
+        pdf_content = None
         text_content = None
         
         if not force_text:
+            # Try image first
             img_content = self.multimodal.get_clipboard_image()
+            
+            # If no image, try PDF
+            if not img_content:
+                pdf_content = self.multimodal.get_clipboard_pdf()
         
-        if not force_image and not img_content:
+        if not force_image and not img_content and not pdf_content:
             text_content = self.multimodal.get_clipboard_text()
         
-        if not img_content and not text_content:
+        if not img_content and not pdf_content and not text_content:
             print("❌ No content found in clipboard")
             return
         
@@ -67,6 +73,10 @@ class MultimodalMagics(Magics):
                 import base64
                 img_bytes = base64.b64decode(img_content['data'])
                 display(IPImage(data=img_bytes, format='png'))
+            elif pdf_content:
+                print(f"📋 Clipboard contains a PDF file path: {pdf_content['filename']}")
+                print(f"   Size: {pdf_content['size'] / (1024*1024):.2f} MB")
+                print(f"   Path: {pdf_content['path']}")
             elif text_content:
                 print("📋 Clipboard contains text:")
                 print(text_content[:500] + "..." if len(text_content) > 500 else text_content)
@@ -98,6 +108,41 @@ class MultimodalMagics(Magics):
             import base64
             img_bytes = base64.b64decode(img_content['data'])
             display(IPImage(data=img_bytes, format='png', width=200))
+        elif pdf_content:
+            # Add PDF to conversation history as a file message
+            pdf_message = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": pdf_content['filename'],
+                            "file_data": f"data:application/pdf;base64,{pdf_content['data']}",
+                            "file_size": pdf_content['size']
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": f"[Pasted PDF: {pdf_content['filename']}]"
+                    }
+                ]
+            }
+            self.kernel.conversation_history.append(pdf_message)
+            
+            # Track uploaded file
+            if not hasattr(self.kernel, '_uploaded_files'):
+                self.kernel._uploaded_files = []
+            
+            self.kernel._uploaded_files.append({
+                'filename': pdf_content['filename'],
+                'path': pdf_content['path'],
+                'size': pdf_content['size'],
+                'type': 'pdf',
+                'source': 'clipboard'
+            })
+            
+            print(f"✅ Pasted PDF '{pdf_content['filename']}' ({pdf_content['size'] / (1024*1024):.2f} MB) - added to conversation context")
+            print("💡 You can now ask questions about this PDF in any cell")
         elif text_content:
             self.multimodal.add_to_cell(cell_id, {
                 'type': 'text',

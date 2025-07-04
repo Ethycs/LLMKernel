@@ -2689,7 +2689,7 @@ packages:
 - pypi: .
   name: llm-kernel
   version: 0.1.0
-  sha256: cfa630a4f48f50438b052bd6a8c013880d472a6ae7c41e43eb5fca1edb505d21
+  sha256: bbf8dad7c6a1411fd990f3ec56850e8882f260bf549b88e9698449c666ddf89e
   requires_dist:
   - ipykernel>=6.0.0
   - ipython>=7.0.0
@@ -2712,6 +2712,8 @@ packages:
   - pillow>=9.0.0 ; extra == 'multimodal'
   - pyperclip>=1.8.0 ; extra == 'multimodal'
   - pymupdf>=1.23.0 ; extra == 'multimodal'
+  - pywin32>=300 ; sys_platform == 'win32' and extra == 'clipboard-win'
+  - python-xlib>=0.29 ; sys_platform == 'linux' and extra == 'clipboard-linux'
   requires_python: '>=3.8'
   editable: true
 - pypi: https://files.pythonhosted.org/packages/42/d7/1ec15b46af6af88f19b8e5ffea08fa375d433c998b8a7639e76935c14f1f/markdown_it_py-3.0.0-py3-none-any.whl

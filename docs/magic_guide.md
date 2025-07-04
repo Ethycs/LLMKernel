@@ -756,7 +756,7 @@ The LLM Kernel supports multimodal content including images, PDFs, and clipboard
 2. **%llm_pdf_native** - Uploads the PDF file directly (for APIs that support native PDF like OpenAI GPT-4.1+, Claude)
 
 ### `%llm_paste`
-Paste and include clipboard content (image or text) in the conversation context.
+Paste and include clipboard content (image, PDF, or text) in the conversation context.
 
 ```python
 %llm_paste                    # Paste clipboard content
@@ -764,6 +764,12 @@ Paste and include clipboard content (image or text) in the conversation context.
 %llm_paste --as-image       # Force treat as image
 %llm_paste --as-text        # Force treat as text
 ```
+
+**Supported clipboard content:**
+- **Files (Ctrl+C)** - Copy files in File Explorer with Ctrl+C and paste directly!
+- **Images** - Copy an image (screenshot, from web, etc.) and paste
+- **PDF paths** - Copy a PDF file path as text and paste
+- **Text** - Any other text content
 
 **Example:**
 ```python
@@ -774,7 +780,19 @@ Paste and include clipboard content (image or text) in the conversation context.
 # Cell 2: Ask about it in a different cell!
 What's in the image I just pasted?
 
-# The LLM can see the image from the previous cell!
+# Or copy a PDF file with Ctrl+C in File Explorer:
+%llm_paste
+✅ Pasted PDF 'report.pdf' (2.3 MB) - added to conversation context
+
+# Cell 3: Ask about the PDF
+Summarize this PDF for me
+
+# The LLM can see both the image and PDF from previous cells!
+
+# Platform-specific file copying:
+# Windows: Select file → Ctrl+C → %llm_paste
+# macOS: Select file → Cmd+C → %llm_paste  
+# Linux: Select file → Ctrl+C → %llm_paste (requires xclip)
 ```
 
 ### `%llm_image`

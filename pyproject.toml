@@ -50,6 +50,9 @@ multimodal = [
     "pyperclip>=1.8.0",
     "pymupdf>=1.23.0",
 ]
+# Platform-specific clipboard file support
+clipboard-win = ["pywin32>=300; sys_platform=='win32'"]
+clipboard-linux = ["python-xlib>=0.29; sys_platform=='linux'"]
 
 [project.scripts]
 llm-kernel-install = "llm_kernel.install:main"

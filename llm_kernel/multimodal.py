@@ -26,6 +26,12 @@ try:
 except ImportError:
     HAS_CLIPBOARD = False
 
+try:
+    from .clipboard_utils import get_clipboard_files
+    HAS_FILE_CLIPBOARD = True
+except ImportError:
+    HAS_FILE_CLIPBOARD = False
+
 
 class MultimodalContent:
     """Handles multimodal content for LLM interactions."""
@@ -157,6 +163,29 @@ class MultimodalContent:
         Returns:
             Encoded image dict or None
         """
+        # First try to get image files from clipboard
+        files = self.get_clipboard_files()
+        if files:
+            # Look for image files
+            image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp']
+            for file_info in files:
+                if file_info.get('extension') in image_extensions and 'data' in file_info:
+                    # Decode the base64 image to get dimensions
+                    try:
+                        img_bytes = base64.b64decode(file_info['data'])
+                        img = Image.open(io.BytesIO(img_bytes))
+                        return {
+                            'type': 'image',
+                            'mime_type': mimetypes.guess_type(file_info['filename'])[0] or 'image/png',
+                            'data': file_info['data'],
+                            'size': img.size,
+                            'source': 'clipboard_file',
+                            'filename': file_info['filename']
+                        }
+                    except Exception:
+                        pass
+        
+        # Fallback to ImageGrab for screenshots/copied images
         try:
             from PIL import ImageGrab
             
@@ -168,6 +197,64 @@ class MultimodalContent:
         except Exception as e:
             if self.log:
                 self.log.debug(f"No image in clipboard: {e}")
+        
+        return None
+    
+    def get_clipboard_files(self) -> Optional[List[Dict[str, Any]]]:
+        """Get files from clipboard (when copied with Ctrl+C)."""
+        if HAS_FILE_CLIPBOARD:
+            try:
+                files = get_clipboard_files()
+                if files:
+                    return files
+            except Exception as e:
+                if self.log:
+                    self.log.debug(f"Error getting clipboard files: {e}")
+        
+        return None
+    
+    def get_clipboard_pdf(self) -> Optional[Dict[str, Any]]:
+        """Get PDF from clipboard if available (file path or file content)."""
+        # First try to get actual files from clipboard
+        files = self.get_clipboard_files()
+        if files:
+            # Look for PDFs in the file list
+            for file_info in files:
+                if file_info.get('extension') == '.pdf' and 'data' in file_info:
+                    return {
+                        'type': 'pdf',
+                        'filename': file_info['filename'],
+                        'data': file_info['data'],
+                        'size': file_info['size'],
+                        'source': 'clipboard_file',
+                        'path': file_info['path']
+                    }
+        
+        # Fallback to checking if clipboard contains a file path
+        if HAS_CLIPBOARD:
+            try:
+                # Get text from clipboard (might be a file path)
+                text = pyperclip.paste()
+                if text and text.strip().lower().endswith('.pdf'):
+                    # It's a PDF file path
+                    pdf_path = Path(text.strip().strip('"'))  # Remove quotes if present
+                    if pdf_path.exists():
+                        # Read and encode the PDF
+                        with open(pdf_path, 'rb') as f:
+                            pdf_bytes = f.read()
+                        
+                        return {
+                            'type': 'pdf',
+                            'filename': pdf_path.name,
+                            'data': base64.b64encode(pdf_bytes).decode('utf-8'),
+                            'size': len(pdf_bytes),
+                            'source': 'clipboard_path',
+                            'path': str(pdf_path)
+                        }
+                
+            except Exception as e:
+                if self.log:
+                    self.log.debug(f"Error checking clipboard for PDF path: {e}")
         
         return None
     
