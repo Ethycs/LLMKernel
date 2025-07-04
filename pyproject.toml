@@ -2,21 +2,19 @@
 name = "llm-kernel"
 version = "0.1.0"
 description = "A Jupyter kernel with LiteLLM integration and intelligent context management"
-authors = [
-    {name = "LLM Kernel Team"}
-]
+authors = [{ name = "LLM Kernel Team" }]
 dependencies = [
     "ipykernel>=6.0.0",
-    "ipython>=7.0.0", 
+    "ipython>=7.0.0",
     "ipywidgets>=7.0.0",
     "python-dotenv>=0.19.0",
     "requests>=2.25.0",
     "nest-asyncio>=1.5.0",
-    "fastmcp>=0.1.0",
+    # "fastmcp>=0.1.0",
 ]
 requires-python = ">=3.8"
 readme = "README.md"
-license = {text = "MIT"}
+license = { text = "MIT" }
 keywords = ["jupyter", "kernel", "llm", "ai", "context-management", "litellm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -46,11 +44,7 @@ semantic = [
     "scikit-learn>=1.0.0",
     "numpy>=1.20.0",
 ]
-visualization = [
-    "matplotlib>=3.3.0",
-    "networkx>=2.5.0",
-    "plotly>=5.0.0",
-]
+visualization = ["matplotlib>=3.3.0", "networkx>=2.5.0", "plotly>=5.0.0"]
 
 [project.scripts]
 llm-kernel-install = "llm_kernel.install:main"
@@ -71,20 +65,15 @@ testpaths = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = [
-    "-v",
-    "--tb=short",
-    "--strict-markers",
-    "--disable-warnings"
-]
+addopts = ["-v", "--tb=short", "--strict-markers", "--disable-warnings"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
-    "unit: marks tests as unit tests"
+    "unit: marks tests as unit tests",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
-    "ignore::PendingDeprecationWarning"
+    "ignore::PendingDeprecationWarning",
 ]
 
 [tool.black]
@@ -137,16 +126,24 @@ litellm = ">=1.0.0"
 fastmcp = ">=0.1.0"
 
 [tool.pixi.tasks]
-install-kernel = { cmd = "python -m llm_kernel.install install", depends-on = ["install-editable"] }
+install-kernel = { cmd = "python -m llm_kernel.install install", depends-on = [
+    "install-editable",
+] }
 install-editable = "pip install -e ."
 notebook = "jupyter notebook"
 lab = "jupyter lab"
 test = "pytest test_kernel.py -v"
 
 [tool.pixi.feature.notebook.tasks]
-bootstrap = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Starting Jupyter Lab...' && jupyter lab", depends-on = ["install-editable"] }
-bootstrap-vscode = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Open VS Code and select LLM Kernel from the kernel picker.'", depends-on = ["install-editable"] }
-vscode = { cmd = "python -m llm_kernel.install install && code . && echo 'VS Code opened. Select LLM Kernel in any .ipynb file.'", depends-on = ["install-editable"] }
+bootstrap = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Starting Jupyter Lab...' && jupyter lab", depends-on = [
+    "install-editable",
+] }
+bootstrap-vscode = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Open VS Code and select LLM Kernel from the kernel picker.'", depends-on = [
+    "install-editable",
+] }
+vscode = { cmd = "python -m llm_kernel.install install && code . && echo 'VS Code opened. Select LLM Kernel in any .ipynb file.'", depends-on = [
+    "install-editable",
+] }
 
 [tool.pixi.dependencies]
 pytest = ">=8.4.1,<9"

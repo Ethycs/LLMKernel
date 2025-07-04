@@ -204,7 +204,13 @@ Based on analysis of the codebase vs README documentation.
 - [x] Added `%llm_mcp_config` to manage MCP configuration
 - [x] Created `%%llm_mcp` cell magic (tool calling in LLM not yet implemented)
 - [x] Added MCPManager class for handling MCP connections
+- [x] Implemented full MCP tool calling integration in LLM queries
+- [x] Added LLMIntegration module for handling LLM+MCP queries
+- [x] Refactored kernel.py from 2122 lines into modular components:
+  - magic_commands/ directory with separate modules for each category
+  - llm_integration.py for core LLM functionality
+  - Reduced main kernel.py to ~550 lines
 
 ---
 
-*Last updated: 2025-01-04 - Added MCP integration features*
+*Last updated: 2025-01-04 - Completed kernel refactoring and full MCP integration*

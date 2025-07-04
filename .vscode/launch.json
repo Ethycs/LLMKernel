@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug LLM Kernel",
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5678
+            },
+            "pathMappings": [
+                {
+                    "localRoot": "${workspaceFolder}",
+                    "remoteRoot": "${workspaceFolder}"
+                }
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Debug Kernel Installation",
+            "type": "python",
+            "request": "launch",
+            "module": "llm_kernel.install",
+            "args": ["install", "--user"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
