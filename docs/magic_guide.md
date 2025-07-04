@@ -362,6 +362,36 @@ Clear reranking and restore original cell order.
 %llm_rerank_clear
 ```
 
+### `%llm_rerank_apply`
+Apply the current reranking by physically reorganizing cells in the notebook file.
+
+⚠️ **WARNING**: This command modifies your notebook file! Always backup first.
+
+```python
+%llm_rerank_apply              # Apply ranking (modifies notebook!)
+%llm_rerank_apply --backup     # Create backup first (recommended)
+```
+
+**Workflow:**
+```python
+# 1. First rerank cells by relevance
+%llm_rerank "data analysis and visualization"
+
+# 2. Check the new order
+%llm_context
+
+# 3. If happy with the order, apply it permanently
+%llm_rerank_apply --backup
+
+# 4. Reload notebook in Jupyter to see changes
+```
+
+**Use cases:**
+- Organizing research notes by topic
+- Grouping related code cells together
+- Creating a narrative flow for presentations
+- Cleaning up exploratory notebooks
+
 ### `%%meta` (Cell Magic)
 Define custom context processing functions for filtering, ranking, or transforming.
 
@@ -604,6 +634,26 @@ def filter_cells(messages):
 %llm_rerank_clear
 ```
 
+### Organizing Notebooks with Reranking
+```python
+# Reorganize a messy notebook by topic
+%llm_rerank "data preprocessing and cleaning"
+
+# Review the suggested order
+%llm_context
+
+# If you like it, permanently reorganize the notebook
+%llm_rerank_apply --backup
+
+# Or try a different organization
+%llm_rerank_clear
+%llm_rerank "model training and evaluation"
+%llm_context
+
+# Apply when satisfied
+%llm_rerank_apply --backup
+```
+
 ---
 
 ## Tips and Best Practices
@@ -659,6 +709,7 @@ def filter_cells(messages):
 | **Reranking** |
 | `%llm_rerank` | Reorder cells by relevance |
 | `%llm_rerank_clear` | Clear reranking |
+| `%llm_rerank_apply` | Apply reranking to notebook file |
 | `%llm_apply_meta` | Apply custom functions |
 | `%llm_meta_list` | List meta functions |
 | **MCP Integration** |

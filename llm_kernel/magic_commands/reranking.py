@@ -157,6 +157,112 @@ Your ranking:"""
         else:
             print("ℹ️  No reranking active")
     
+    @line_magic
+    def llm_rerank_apply(self, line):
+        """Apply the current reranking by actually reorganizing the notebook cells.
+        
+        WARNING: This will modify your notebook file! The cells will be physically
+        reordered according to the current ranking. Make sure to save a backup first.
+        
+        Usage:
+            %llm_rerank_apply            # Apply current ranking
+            %llm_rerank_apply --backup   # Create backup first (recommended)
+        """
+        # Check if we have a reranking active
+        if not hasattr(self.kernel, '_reranked_context') or not self.kernel._reranked_context:
+            print("❌ No reranking active. Use %llm_rerank first.")
+            return
+        
+        # Parse arguments
+        create_backup = '--backup' in line
+        
+        # Get the notebook path
+        if not hasattr(self.kernel, 'notebook_utils'):
+            print("❌ Notebook utilities not available")
+            return
+            
+        nb_path = self.kernel.notebook_utils.get_notebook_path()
+        if not nb_path:
+            print("❌ Could not find notebook file")
+            return
+        
+        try:
+            # Create backup if requested
+            if create_backup:
+                import shutil
+                from datetime import datetime
+                backup_path = nb_path.replace('.ipynb', f'_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.ipynb')
+                shutil.copy2(nb_path, backup_path)
+                print(f"💾 Created backup: {backup_path}")
+            
+            # Read the current notebook
+            notebook_data = self.kernel.notebook_utils.read_notebook(force_reload=True)
+            if not notebook_data:
+                print("❌ Could not read notebook file")
+                return
+            
+            # Get the original cells
+            original_cells = notebook_data.get('cells', [])
+            
+            # Create mapping from cell content to cell data
+            # We need to match the reranked messages back to original cells
+            content_to_cell = {}
+            for cell in original_cells:
+                cell_source = ''.join(cell.get('source', []))
+                # Use a hash or simplified version as key to handle duplicates
+                key = (cell_source.strip(), cell.get('cell_type', 'code'))
+                if key not in content_to_cell:
+                    content_to_cell[key] = []
+                content_to_cell[key].append(cell)
+            
+            # Build the reordered cells list based on _reranked_context
+            reordered_cells = []
+            used_cells = set()
+            
+            for msg in self.kernel._reranked_context:
+                if msg['role'] != 'user':
+                    continue  # Skip assistant messages
+                    
+                content = msg['content'].strip()
+                
+                # Try to find matching cell
+                # First try exact match
+                for cell_type in ['code', 'markdown']:
+                    key = (content, cell_type)
+                    if key in content_to_cell:
+                        for cell in content_to_cell[key]:
+                            cell_id = id(cell)
+                            if cell_id not in used_cells:
+                                reordered_cells.append(cell)
+                                used_cells.add(cell_id)
+                                break
+                        break
+            
+            # Add any cells that weren't matched (to avoid losing cells)
+            for cell in original_cells:
+                if id(cell) not in used_cells:
+                    reordered_cells.append(cell)
+            
+            # Update the notebook with reordered cells
+            notebook_data['cells'] = reordered_cells
+            
+            # Write back to file
+            with open(nb_path, 'w', encoding='utf-8') as f:
+                json.dump(notebook_data, f, indent=1, ensure_ascii=False)
+            
+            print(f"✅ Applied reranking to notebook: {nb_path}")
+            print(f"📝 Reordered {len(reordered_cells)} cells")
+            print("⚠️  Please reload the notebook in Jupyter to see changes")
+            print("💡 The reranking has been cleared - run %llm_rerank again if needed")
+            
+            # Clear the reranking since we've applied it
+            del self.kernel._reranked_context
+            
+        except Exception as e:
+            print(f"❌ Error applying reranking: {e}")
+            import traceback
+            traceback.print_exc()
+    
     @cell_magic
     def meta(self, line, cell):
         """Define custom context processing functions.

@@ -337,6 +337,7 @@ class LLMKernel(IPythonKernel):
             # Reranking commands
             self.shell.register_magic_function(reranking_magics.llm_rerank, 'line', 'llm_rerank')
             self.shell.register_magic_function(reranking_magics.llm_rerank_clear, 'line', 'llm_rerank_clear')
+            self.shell.register_magic_function(reranking_magics.llm_rerank_apply, 'line', 'llm_rerank_apply')
             self.shell.register_magic_function(reranking_magics.meta, 'cell', 'meta')
             self.shell.register_magic_function(reranking_magics.llm_apply_meta, 'line', 'llm_apply_meta')
             self.shell.register_magic_function(reranking_magics.llm_meta_list, 'line', 'llm_meta_list')
