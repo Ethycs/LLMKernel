@@ -48,6 +48,13 @@ from .magic_commands import (
     ConfigMagics
 )
 
+try:
+    from .magic_commands.multimodal import MultimodalMagics
+    HAS_MULTIMODAL = True
+except ImportError:
+    HAS_MULTIMODAL = False
+    MultimodalMagics = None
+
 
 class LLMKernel(IPythonKernel):
     """
@@ -134,6 +141,13 @@ class LLMKernel(IPythonKernel):
         
         # Notebook utilities for reading notebook files
         self.notebook_utils = NotebookUtils(self)
+        
+        # Multimodal content support
+        try:
+            from .multimodal import MultimodalContent
+            self.multimodal = MultimodalContent(self)
+        except ImportError:
+            self.multimodal = None
         
         # Register magic commands
         self.register_magic_commands()
@@ -347,6 +361,17 @@ class LLMKernel(IPythonKernel):
             self.shell.register_magic_function(config_magics.llm_context_window, 'line', 'llm_context_window')
             self.shell.register_magic_function(config_magics.llm_token_count, 'line', 'llm_token_count')
             self.shell.register_magic_function(config_magics.llm_cost, 'line', 'llm_cost')
+            
+            # Multimodal commands (if available)
+            if HAS_MULTIMODAL and MultimodalMagics:
+                multimodal_magics = MultimodalMagics(self.shell, self)
+                self.shell.register_magic_function(multimodal_magics.llm_paste, 'line', 'llm_paste')
+                self.shell.register_magic_function(multimodal_magics.llm_image, 'line', 'llm_image')
+                self.shell.register_magic_function(multimodal_magics.llm_pdf, 'line', 'llm_pdf')
+                self.shell.register_magic_function(multimodal_magics.llm_media_clear, 'line', 'llm_media_clear')
+                self.shell.register_magic_function(multimodal_magics.llm_media_list, 'line', 'llm_media_list')
+                self.shell.register_magic_function(multimodal_magics.llm_vision, 'cell', 'llm_vision')
+                self.log.info("Multimodal magic commands registered")
             
             self.log.info("All magic commands registered successfully")
             

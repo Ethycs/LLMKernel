@@ -26,7 +26,14 @@ class LLMIntegration:
         self.executor = ThreadPoolExecutor(max_workers=4)
     
     async def query_llm_async(self, query: str, model: str = None, **kwargs) -> str:
-        """Asynchronously query an LLM model."""
+        """Asynchronously query an LLM model.
+        
+        Args:
+            query: The query text (can be empty if messages are provided)
+            model: Model to use (defaults to active model)
+            messages: Optional custom messages list (for multimodal)
+            **kwargs: Additional arguments for litellm
+        """
         if model is None:
             model = self.kernel.active_model
             
@@ -35,9 +42,30 @@ class LLMIntegration:
             
         model_name = self.kernel.llm_clients[model]
         
-        # Always use notebook cells as context when in a notebook environment
-        messages = self.kernel.get_notebook_cells_as_context()
-        messages.append({"role": "user", "content": query})
+        # Check if custom messages are provided (e.g., for multimodal)
+        if 'messages' in kwargs:
+            messages = kwargs.pop('messages')
+        else:
+            # Always use notebook cells as context when in a notebook environment
+            messages = self.kernel.get_notebook_cells_as_context()
+            if query:  # Only add query if not empty
+                messages.append({"role": "user", "content": query})
+        
+        # Check if current cell has multimodal content
+        if hasattr(self.kernel, 'multimodal') and self.kernel.multimodal:
+            cell_id = getattr(self.kernel, '_current_cell_id', None)
+            if cell_id:
+                media_items = self.kernel.multimodal.get_cell_media(cell_id)
+                if media_items and query:
+                    # Format multimodal content
+                    content_items = media_items + [{'type': 'text', 'data': query}]
+                    multimodal_msgs = self.kernel.multimodal.format_for_llm(content_items, model)
+                    
+                    # Replace last user message with multimodal version
+                    if messages and messages[-1]['role'] == 'user':
+                        messages[-1] = multimodal_msgs[0]
+                    else:
+                        messages.extend(multimodal_msgs)
         
         try:
             # Use LiteLLM to query the model

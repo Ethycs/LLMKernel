@@ -13,6 +13,7 @@ This guide covers all magic commands available in the LLM Kernel, organized by c
 7. [Configuration & Settings](#configuration--settings)
 8. [Debugging & Development](#debugging--development)
 9. [Cell Magic Commands](#cell-magic-commands)
+10. [Multimodal Content](#multimodal-content)
 
 ---
 
@@ -730,6 +731,163 @@ def filter_cells(messages):
 | `%%hide` | Hide cell from context |
 | `%%meta` | Define custom functions |
 | `%%llm_mcp` | Query with MCP tools |
+| `%%llm_vision` | Query with multimodal content |
+| **Multimodal** |
+| `%llm_paste` | Paste clipboard content |
+| `%llm_image` | Include image file/URL |
+| `%llm_pdf` | Include PDF content |
+| `%llm_media_clear` | Clear attached media |
+| `%llm_media_list` | List attached media |
+
+---
+
+## Multimodal Content
+
+The LLM Kernel supports multimodal content including images, PDFs, and clipboard content for vision-capable models.
+
+### `%llm_paste`
+Paste and include clipboard content (image or text) in the next LLM query.
+
+```python
+%llm_paste                    # Paste clipboard content
+%llm_paste --show            # Show what's in clipboard
+%llm_paste --as-image       # Force treat as image
+%llm_paste --as-text        # Force treat as text
+```
+
+**Example:**
+```python
+# Copy an image to clipboard, then:
+%llm_paste
+What's in this image?
+
+# Or check first:
+%llm_paste --show
+```
+
+### `%llm_image`
+Include an image file or URL in the next LLM query.
+
+```python
+%llm_image path/to/image.png              # Include local image
+%llm_image https://example.com/image.jpg  # Include image from URL
+%llm_image --show path/to/image.png       # Preview without including
+```
+
+**Example:**
+```python
+%llm_image diagram.png
+Can you explain this diagram?
+
+# Or from URL:
+%llm_image https://example.com/chart.png
+What trends do you see in this chart?
+```
+
+### `%llm_pdf`
+Include PDF content in the next LLM query as images or text.
+
+```python
+%llm_pdf path/to/document.pdf           # Include all pages as images
+%llm_pdf --pages 1,3,5 document.pdf     # Include specific pages
+%llm_pdf --text document.pdf            # Extract text instead of images
+%llm_pdf --show document.pdf            # Preview first page
+```
+
+**Example:**
+```python
+%llm_pdf report.pdf --pages 1,2,3
+Summarize the key findings from these pages
+
+# Extract as text for non-vision models:
+%llm_pdf article.pdf --text
+What are the main arguments in this paper?
+```
+
+### `%llm_media_clear`
+Clear multimodal content from cells.
+
+```python
+%llm_media_clear              # Clear current cell's media
+%llm_media_clear all          # Clear all cells' media
+```
+
+### `%llm_media_list`
+List multimodal content attached to cells.
+
+```python
+%llm_media_list               # List all media
+%llm_media_list current       # List current cell's media
+```
+
+**Output example:**
+```
+📎 Media in current cell (cell_5):
+  1. image - diagram.png
+     Size: (1024, 768)
+  2. image - clipboard
+     Size: (800, 600)
+```
+
+### `%%llm_vision` (Cell Magic)
+Query a vision-capable LLM with attached images and text.
+
+```python
+%%llm_vision
+What do you see in these images?
+
+%%llm_vision --model=gpt-4o
+Compare and contrast these visualizations
+```
+
+**Complete workflow example:**
+```python
+# Cell 1: Attach multiple images
+%llm_image screenshot1.png
+%llm_image screenshot2.png
+%llm_paste  # Add from clipboard
+
+# Cell 2: Check what's attached
+%llm_media_list current
+
+# Cell 3: Query with vision model
+%%llm_vision
+Can you analyze these UI screenshots and suggest improvements?
+
+# Cell 4: Clear media when done
+%llm_media_clear
+```
+
+### Supported Vision Models
+
+The following models have vision capabilities:
+- **OpenAI**: `gpt-4-vision`, `gpt-4o`, `gpt-4o-mini`
+- **Anthropic**: `claude-3-opus`, `claude-3-sonnet`, `claude-3-haiku`
+- **Google**: `gemini-pro-vision`, `gemini-1.5-pro`
+- **Local**: `llava`, `bakllava` (via Ollama)
+
+### Requirements
+
+For full multimodal support, install optional dependencies:
+
+```bash
+# For clipboard support
+pip install pyperclip pillow
+
+# For PDF support
+pip install pymupdf
+
+# Or install all at once
+pip install llm-kernel[multimodal]
+```
+
+### Tips for Multimodal Usage
+
+1. **Check model compatibility** - Ensure your active model supports vision before attaching images
+2. **Image size** - Large images are automatically resized to fit model limits (max 2048x2048)
+3. **Multiple images** - You can attach multiple images to a single query
+4. **Context persistence** - Attached media is tied to specific cells
+5. **Memory usage** - Clear media after use to free memory with `%llm_media_clear`
 
 ---
 
