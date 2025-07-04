@@ -255,20 +255,25 @@ class LLMKernel(IPythonKernel):
                 'gpt-4o': 'gpt-4o',
                 'gpt-4o-mini': 'gpt-4o-mini',
                 'gpt-4': 'gpt-4',
-                'gpt-3.5-turbo': 'gpt-3.5-turbo'
+                'gpt-3.5-turbo': 'gpt-3.5-turbo',
+                'gpt-4.1': 'gpt-4.1',  # New GPT-4.1 model
+                'o3': 'o3',  # New o3 model
+                'o3-mini': 'o3-mini'  # Also add o3-mini if available
             })
             
         if os.getenv('ANTHROPIC_API_KEY'):
             available_models.update({
                 'claude-3-opus': 'claude-3-opus-20240229',
                 'claude-3-sonnet': 'claude-3-sonnet-20240229',
-                'claude-3-haiku': 'claude-3-haiku-20240307'
+                'claude-3-haiku': 'claude-3-haiku-20240307',
+                'claude-opus-4': 'claude-opus-4-20250514',  # New Claude Opus 4
+                'claude-sonnet-4': 'claude-sonnet-4-20250514',  # New Claude Sonnet 4
+                'claude-3-5-sonnet': 'claude-3-5-sonnet-20241022'  # Claude 3.5 Sonnet
             })
             
         if os.getenv('GOOGLE_API_KEY'):
             available_models.update({
-                'gemini-pro': 'gemini/gemini-pro',
-                'gemini-1.5-pro': 'gemini/gemini-1.5-pro'
+                'gemini-2.5-pro': 'gemini/gemini-2.5-pro'  # New Gemini 2.5 Pro
             })
             
         # Local models via Ollama
@@ -599,19 +604,18 @@ class LLMKernel(IPythonKernel):
                         )
                     
                     # Display result based on mode
-                    if self.display_mode == 'chat':
-                        from IPython.display import display, HTML
-                        html = f'''
-                        <div style="margin: 10px 0 20px 40px; padding: 10px; background: #f5f5f5; 
-                                    border-radius: 10px; border-left: 3px solid #2196F3;">
-                            <strong>🤖 {self.active_model}:</strong><br>
-                            <div style="margin-top: 8px; white-space: pre-wrap;">{result}</div>
-                        </div>
-                        '''
-                        display(HTML(html))
+                    if result:  # Only display if we have a result
+                        if self.display_mode == 'chat':
+                            # Use print with formatting instead of HTML display
+                            print(f"\n🤖 {self.active_model}:")
+                            print("-" * 40)
+                            print(result)
+                            print("-" * 40)
+                        else:
+                            # For markdown mode, just print the result
+                            print(result)
                     else:
-                        from IPython.display import display, Markdown
-                        display(Markdown(result))
+                        print(f"⚠️ No response from {self.active_model}")
                     
                     # Return success
                     return {'status': 'ok', 'execution_count': self.execution_count,

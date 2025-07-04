@@ -238,3 +238,75 @@
 2025-07-04 12:30:23 - [llm_kernel] INFO: LLM Kernel initialized successfully
 2025-07-04 12:30:23 - [llm_kernel] INFO: Active model: gpt-4o
 2025-07-04 12:30:23 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 13:18:02 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[2][39m[32m, line 2[39m
+[31m    [39m[31mf:\Keytone\OneDrive\LaTex\Tex\AI_Research\the alignment trap final\the_alignment_trap.pdf[39m
+       ^
+[31mSyntaxError[39m[31m:[39m unexpected character after line continuation character
+
+2025-07-04 13:18:19 - [llm_kernel] INFO: ============================================================
+2025-07-04 13:18:19 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 13:18:19 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 13:18:20 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 13:18:20 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 13:18:20 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 13:18:20 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-04 13:18:20 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 13:18:20 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 13:18:20 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 13:18:20 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 13:19:20 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[1][39m[32m, line 2[39m
+[31m    [39m[31mWhat's in the pdf[39m
+        ^
+[31mSyntaxError[39m[31m:[39m unterminated string literal (detected at line 2)
+
+2025-07-04 13:19:26 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[2][39m[32m, line 2[39m
+[31m    [39m[31mWhat's in the pdf[39m
+        ^
+[31mSyntaxError[39m[31m:[39m unterminated string literal (detected at line 2)
+
+2025-07-04 13:20:01 - [llm_kernel] ERROR: Error querying gpt-4o: litellm.BadRequestError: OpenAIException - Missing required parameter: 'messages[1].content[0].file.file_id'.
+2025-07-04 13:20:02 - [llm_kernel] ERROR: Error querying gpt-4o: litellm.BadRequestError: OpenAIException - Missing required parameter: 'messages[2].content[0].file.file_id'.
+2025-07-04 13:48:43 - [llm_kernel] INFO: Found notebook at: f:\Keytone\Documents\GitHub\LLMKernel\example.ipynb
+2025-07-04 13:51:40 - [llm_kernel] INFO: ============================================================
+2025-07-04 13:51:40 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 13:51:40 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 13:51:41 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 13:51:41 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 13:51:41 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 13:51:41 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-04 13:51:41 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 13:51:41 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 13:51:41 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 13:51:41 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 13:51:54 - [llm_kernel] INFO: Found notebook at: f:\Keytone\Documents\GitHub\LLMKernel\example.ipynb
+2025-07-04 13:52:16 - [llm_kernel] INFO: Cached file: the_measure_of_apocalypse.pdf -> 20250704_135216_fc6b7037_the_measure_of_apocalypse.pdf
+2025-07-04 13:52:17 - [llm_kernel] ERROR: Failed to save cache metadata: Object of type datetime is not JSON serializable
+2025-07-04 14:53:33 - [llm_kernel] INFO: ============================================================
+2025-07-04 14:53:33 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 14:53:33 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 14:53:34 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 14:53:34 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 14:53:34 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 14:53:34 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-04 14:53:34 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 14:53:34 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 14:53:34 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 14:53:34 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 14:53:40 - [llm_kernel] INFO: Cached file: the_measure_of_apocalypse.pdf -> 20250704_145340_fc6b7037_the_measure_of_apocalypse.pdf
+2025-07-04 14:53:42 - [llm_kernel] INFO: Uploaded file to OpenAI: file-RVdkEWKuWzULAbZMhyeqgU
+2025-07-04 14:53:48 - [llm_kernel] INFO: Found notebook at: f:\Keytone\Documents\GitHub\LLMKernel\example.ipynb
+2025-07-04 15:04:08 - [llm_kernel] INFO: ============================================================
+2025-07-04 15:04:08 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 15:04:08 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 15:04:09 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 15:04:09 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 15:04:09 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 15:04:09 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-04 15:04:09 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 15:04:09 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 15:04:09 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 15:04:09 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 15:04:16 - [llm_kernel] INFO: Found notebook at: f:\Keytone\Documents\GitHub\LLMKernel\example.ipynb

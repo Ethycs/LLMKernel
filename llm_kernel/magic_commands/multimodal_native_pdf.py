@@ -64,8 +64,11 @@ class NativePDFMagics(Magics):
                 print(f"   Full path: {pdf_path.absolute()}")
                 return
             
-            # Check if we're using an OpenAI model
-            if hasattr(self.kernel, 'active_model') and 'gpt' in self.kernel.active_model.lower():
+            # Determine the provider based on the active model
+            provider = self._get_provider_from_model(self.kernel.active_model if hasattr(self.kernel, 'active_model') else '')
+            
+            # Check if we should use file upload API
+            if provider in ['openai', 'anthropic', 'gemini']:
                 # Use file upload manager for OpenAI
                 if not hasattr(self.kernel, 'file_upload_manager'):
                     from ..file_upload_manager import FileUploadManager
@@ -79,28 +82,50 @@ class NativePDFMagics(Magics):
                 upload_info = self.kernel.file_upload_manager.upload_file(
                     str(pdf_path),
                     purpose="assistants",
-                    provider="openai"
+                    provider=provider
                 )
                 
-                if upload_info and 'file_id' in upload_info:
-                    # Create a message with the file_id reference
+                if upload_info and ('file_id' in upload_info or 'file_name' in upload_info):
+                    # Create a message with the file reference
+                    if provider == 'openai':
+                        # Use the correct format for OpenAI
+                        file_ref = {
+                            "type": "file",
+                            "file": {
+                                "file_id": upload_info['file_id']
+                            }
+                        }
+                        print(f"✅ Uploaded PDF '{pdf_path.name}' to OpenAI (file_id: {upload_info['file_id']})")
+                    elif provider == 'anthropic':
+                        file_ref = {
+                            "type": "document",
+                            "source": {
+                                "type": "file",
+                                "file_id": upload_info['file_id']
+                            }
+                        }
+                        print(f"✅ Uploaded PDF '{pdf_path.name}' to Claude (file_id: {upload_info['file_id']})")
+                    elif provider == 'gemini':
+                        file_ref = {
+                            "type": "file",
+                            "file": {
+                                "file_name": upload_info['file_name'],
+                                "filename": pdf_path.name,
+                                "provider": "gemini"
+                            }
+                        }
+                        print(f"✅ Uploaded PDF '{pdf_path.name}' to Gemini (file: {upload_info['file_name']})")
+                    
                     pdf_message = {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "file",
-                                "file": {
-                                    "file_id": upload_info['file_id'],
-                                    "filename": pdf_path.name
-                                }
-                            },
+                            file_ref,
                             {
                                 "type": "text", 
                                 "text": f"[Uploaded PDF: {pdf_path.name}]"
                             }
                         ]
                     }
-                    print(f"✅ Uploaded PDF '{pdf_path.name}' to OpenAI (file_id: {upload_info['file_id']})")
                 else:
                     # Fallback to base64 encoding
                     pdf_message = {
@@ -207,3 +232,18 @@ class NativePDFMagics(Magics):
             print(f"✅ Removed {removed} file uploads from conversation history")
         else:
             print("ℹ️  No conversation history found")
+    
+    def _get_provider_from_model(self, model_name: str) -> str:
+        """Determine the provider from the model name."""
+        if not model_name:
+            return "unknown"
+        
+        model_lower = model_name.lower()
+        if 'gpt' in model_lower or 'o3' in model_lower:
+            return 'openai'
+        elif 'claude' in model_lower:
+            return 'anthropic'
+        elif 'gemini' in model_lower or 'bison' in model_lower:
+            return 'gemini'
+        else:
+            return 'unknown'

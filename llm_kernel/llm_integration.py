@@ -97,41 +97,8 @@ class LLMIntegration:
             if query:  # Only add query if not empty
                 messages.append({"role": "user", "content": query})
         
-        # Check if we have uploaded files for OpenAI models
-        if 'gpt' in model.lower():
-            file_ids = self._get_uploaded_file_ids(messages)
-            if file_ids:
-                # Use Assistants API for file-based queries
-                self.logger.info(f"Using OpenAI Assistants API with {len(file_ids)} files")
-                
-                # Extract text content from messages for context
-                context_text = ""
-                for msg in messages:
-                    if msg['role'] == 'user':
-                        if isinstance(msg['content'], str):
-                            context_text += msg['content'] + "\n\n"
-                        elif isinstance(msg['content'], list):
-                            for item in msg['content']:
-                                if item.get('type') == 'text':
-                                    context_text += item.get('text', '') + "\n\n"
-                
-                # Query using Assistant API
-                result = await asyncio.get_event_loop().run_in_executor(
-                    self.executor,
-                    lambda: self.openai_assistant.query_with_files(
-                        query=context_text.strip() or query,
-                        file_ids=file_ids,
-                        model=model_name.replace('gpt-', ''),  # Remove prefix
-                        conversation_id=getattr(self.kernel, '_current_cell_id', 'default')
-                    )
-                )
-                
-                if result:
-                    # Track the exchange
-                    self.kernel.track_exchange(model, query, result)
-                    return result
-                else:
-                    self.logger.warning("Assistant API query failed, falling back to regular completion")
+        # OpenAI now supports files directly in chat completions!
+        # Files with type "input_file" will be processed automatically
         
         # Check if current cell has multimodal content
         if hasattr(self.kernel, 'multimodal') and self.kernel.multimodal:

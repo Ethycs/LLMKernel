@@ -17,8 +17,8 @@ class ConfigManager:
     def __init__(self):
         self.default_config = {
             # Model settings
-            'default_model': 'gpt-4o-mini',
-            'fallback_model': 'gpt-3.5-turbo',
+            'default_model': 'gpt-4o',
+            'fallback_model': 'gpt-4o-mini',
             'model_temperature': 0.7,
             'model_max_tokens': None,
             

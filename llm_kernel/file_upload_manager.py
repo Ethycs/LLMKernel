@@ -83,6 +83,8 @@ class FileUploadManager:
             upload_info = self._upload_to_openai(cached_path, purpose)
         elif provider == "anthropic":
             upload_info = self._upload_to_anthropic(cached_path)
+        elif provider == "gemini" or provider == "google":
+            upload_info = self._upload_to_gemini(cached_path)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
             
@@ -114,9 +116,10 @@ class FileUploadManager:
         try:
             # Upload file to OpenAI
             with open(file_path, 'rb') as f:
+                # Use "user_data" purpose for model inputs as recommended
                 file_obj = client.files.create(
                     file=f,
-                    purpose=purpose
+                    purpose="user_data"  # Changed from "assistants" to "user_data"
                 )
             
             if self.log:
@@ -150,10 +153,22 @@ class FileUploadManager:
     
     def _upload_to_anthropic(self, file_path: Path) -> Optional[Dict[str, Any]]:
         """Upload file to Anthropic."""
-        # Note: Anthropic doesn't have a separate file upload API
-        # Files are included directly in messages
-        # We'll store the file data for later use
+        # Try using the new Files API first (for Claude 3.5+ models)
+        if HAS_ANTHROPIC:
+            try:
+                from .anthropic_file_integration import AnthropicFileIntegration
+                anthropic_files = AnthropicFileIntegration(logger=self.log)
+                
+                result = anthropic_files.upload_file(str(file_path))
+                if result and 'file_id' in result:
+                    if self.log:
+                        self.log.info(f"Successfully uploaded to Anthropic Files API: {result['file_id']}")
+                    return result
+            except Exception as e:
+                if self.log:
+                    self.log.debug(f"Anthropic Files API not available or failed: {e}")
         
+        # Fallback to embedding file data directly (for older models or if Files API fails)
         with open(file_path, 'rb') as f:
             file_data = f.read()
             
@@ -162,8 +177,27 @@ class FileUploadManager:
             'filename': file_path.name,
             'size': len(file_data),
             'provider': 'anthropic',
-            'mime_type': self._get_mime_type(file_path)
+            'mime_type': self._get_mime_type(file_path),
+            'embed_directly': True  # Flag to indicate this should be embedded in messages
         }
+    
+    def _upload_to_gemini(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """Upload file to Google Gemini."""
+        try:
+            from .gemini_file_integration import GeminiFileIntegration
+            gemini_files = GeminiFileIntegration(logger=self.log)
+            
+            result = gemini_files.upload_file(str(file_path))
+            if result:
+                if self.log:
+                    self.log.info(f"Successfully uploaded to Gemini: {result['file_name']}")
+                return result
+        except Exception as e:
+            if self.log:
+                self.log.error(f"Failed to upload to Gemini: {e}")
+        
+        # No fallback for Gemini - it should support files directly
+        return None
     
     def _get_mime_type(self, file_path: Path) -> str:
         """Get MIME type for file."""
@@ -202,15 +236,34 @@ class FileUploadManager:
                 }
             }
         elif provider == "anthropic":
-            # Anthropic expects file data in the message
-            import base64
-            return {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": upload_info['mime_type'],
-                    "data": base64.b64encode(upload_info['file_data']).decode('utf-8')
+            # Check if we have a file_id (new Files API) or need to embed directly
+            if 'file_id' in upload_info:
+                # Use the Files API format
+                return {
+                    "type": "document",
+                    "source": {
+                        "type": "file",
+                        "file_id": upload_info['file_id']
+                    }
                 }
+            else:
+                # Fallback to embedding file data directly
+                import base64
+                return {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": upload_info['mime_type'],
+                        "data": base64.b64encode(upload_info['file_data']).decode('utf-8')
+                    }
+                }
+        elif provider == "gemini" or provider == "google":
+            # Gemini uses the file object directly, not in message format
+            # This is handled differently in the LLM integration
+            return {
+                "type": "file",
+                "file_name": upload_info['file_name'],
+                "provider": "gemini"
             }
         else:
             raise ValueError(f"Unsupported provider: {provider}")

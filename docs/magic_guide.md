@@ -756,7 +756,13 @@ The LLM Kernel supports multimodal content including images, PDFs, and clipboard
 ### Two Ways to Handle PDFs
 
 1. **%llm_pdf** - Converts PDF pages to images (works with any vision model)
-2. **%llm_pdf_native** - Uploads the PDF file directly (for APIs that support native PDF like OpenAI GPT-4.1+, Claude)
+2. **%llm_pdf_native** - Uploads the PDF file directly (machine-readable!)
+
+**How PDF uploads work:**
+- **OpenAI (GPT-4o, etc.)**: Uses the Assistants API for true PDF reading - the model can analyze text, tables, and content
+- **Claude (3.5+)**: Uses the new Files API (beta) for native PDF support - full text extraction and analysis
+- **Gemini (1.5+, 2.0)**: Uses Google's Files API - supports up to 1000 pages with native PDF understanding
+- **Other models**: Automatic fallback to image conversion
 
 ### `%llm_paste`
 Paste and include clipboard content (image, PDF, or text) in the conversation context.
@@ -845,9 +851,13 @@ What are the main arguments in this paper?
 ```
 
 ### `%llm_pdf_native`
-Upload PDF files directly to the conversation (for APIs that support native PDF).
+Upload PDF files directly for native, machine-readable analysis.
 
-This is the modern approach supported by OpenAI GPT-4.1+, Claude, and other APIs that accept PDF files directly without conversion to images.
+This is the recommended approach for PDFs as it provides the best results:
+- **OpenAI**: Uploads via Files API and uses Assistants API for analysis
+- **Claude 3.5+**: Uses the Files API (beta) for native PDF processing
+- **Gemini 1.5+/2.0**: Uses Google's Files API with support for up to 1000 pages
+- **Machine-readable**: All providers can extract text, analyze tables, read citations, etc.
 
 ```python
 %llm_pdf_native document.pdf              # Upload entire PDF
@@ -858,14 +868,25 @@ This is the modern approach supported by OpenAI GPT-4.1+, Claude, and other APIs
 ```python
 # Cell 1: Upload a PDF directly
 %llm_pdf_native research_paper.pdf
-✅ Uploaded PDF 'research_paper.pdf' (2.3 MB) to conversation
+✅ Uploaded PDF 'research_paper.pdf' to OpenAI (file_id: file-ABC123)
+💡 You can now ask questions about this PDF in any cell
 
-# Cell 2: Ask about it in any subsequent cell
+# Cell 2: The LLM can read the actual text content!
 What are the key findings in this paper?
 
-# Cell 3: The LLM has full access to the PDF content
-Can you extract all the citations from this paper?
+# Cell 3: Extract specific information
+Can you create a table of all the experiments and their results?
+
+# Cell 4: Complex analysis
+Extract all citations and format them in APA style
 ```
+
+**Benefits over image conversion:**
+- Full text extraction and search
+- Table and data analysis
+- Citation extraction
+- Much smaller context usage
+- Faster processing
 
 ### `%llm_files_list`
 List all files uploaded to the conversation.
@@ -975,6 +996,30 @@ pip install llm-kernel[multimodal]
 3. **Multiple images** - You can attach multiple images to a single query
 4. **Context persistence** - Attached media is tied to specific cells
 5. **Memory usage** - Clear media after use to free memory with `%llm_media_clear`
+
+### How Native PDF Support Works
+
+The LLM Kernel provides seamless PDF support across major providers:
+
+#### OpenAI (GPT-4o, etc.)
+1. **File Upload**: PDFs are uploaded to OpenAI's Files API with purpose="user_data"
+2. **Direct Chat Support**: PDFs are now supported directly in chat completions - no Assistant API needed!
+3. **True PDF Reading**: The model can read text, analyze tables, extract data directly
+
+#### Claude (3.5+)
+1. **Files API**: PDFs are uploaded using Anthropic's new Files API (beta)
+2. **Native Processing**: Claude can directly read and analyze PDF content
+3. **Full Document Understanding**: Extract text, tables, citations, and more
+
+#### Gemini (1.5+, 2.0)
+1. **Google Files API**: PDFs are uploaded with support for up to 1000 pages
+2. **Multimodal Understanding**: Gemini processes PDFs as documents, not images
+3. **Efficient Processing**: Each page counts as only 258 tokens
+
+#### All Providers
+- **Persistent Context**: File references stay in your conversation across cells
+- **Automatic Caching**: Files are cached locally to avoid re-uploading
+- **Machine-readable**: LLMs actually understand the PDF content, not just "see" it!
 
 ---
 
