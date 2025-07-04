@@ -28,6 +28,10 @@ Toggle chat mode on/off. When enabled, you can type naturally in cells without u
 %llm_chat status   # Check current status
 ```
 
+**New in v0.2.0:**
+- Context automatically rescans when you add new cells
+- Works with notebook file reading - all cells above are included
+
 **Example:**
 ```python
 %llm_chat on
@@ -71,25 +75,28 @@ Switch between different LLM models or check the current model.
 ### `%llm_context`
 Display the current context that will be sent to the LLM. Shows all messages in the context window.
 
+**New in v0.2.0:** This command now reads directly from the notebook file and automatically rescans for changes.
+
 ```python
-%llm_context
+%llm_context                  # Show context and rescan for changes
+%llm_context --no-rescan      # Show context without rescanning
 ```
 
+**Features:**
+- **Automatic rescanning**: Detects and includes new/edited cells above the current position
+- **Notebook file reading**: Shows ALL cells in the notebook, not just executed ones
+- **Smart tracking**: Auto-rescans when you've added cells since the last scan
+
 **Output includes:**
+- Notebook file path being read
 - List of all messages (truncated for display)
 - Total message count
 - Estimated token usage
 - Hidden cells (if any)
+- Auto-rescan indicator when new cells are detected
 
-### `%llm_notebook_context`
-Toggle notebook context mode. When enabled (default with chat mode), notebook cells literally become the LLM's context window.
-
-```python
-%llm_notebook_context          # Toggle mode
-%llm_notebook_context on       # Enable
-%llm_notebook_context off      # Disable
-%llm_notebook_context status   # Check status
-```
+### `%llm_notebook_context` (Deprecated)
+*Note: This command has been removed in v0.2.0. The kernel now always uses notebook cells as context.*
 
 ### `%llm_clear`
 Clear the conversation history.
@@ -472,6 +479,62 @@ Can you read the README.md and summarize the project?
 
 ---
 
+## Context Auto-Rescanning (New in v0.2.0)
+
+The kernel now intelligently manages context by reading directly from the notebook file and automatically rescanning when needed.
+
+### How It Works
+
+1. **Notebook File Reading**: The kernel finds and reads your `.ipynb` file directly
+2. **Automatic Detection**: Tracks when you've added or edited cells
+3. **Smart Rescanning**: Automatically rescans when:
+   - You run `%llm_context`
+   - You make an LLM query and new cells were added
+   - You toggle chat mode
+
+### Key Benefits
+
+- **See ALL cells**: No need to execute cells first - they appear in context immediately
+- **Edit freely**: Make changes to cells above and they're automatically picked up
+- **No restarts needed**: Add new context without restarting the kernel
+
+### Example Workflow
+
+```python
+# Cell 1: Define some data
+data = [1, 2, 3, 4, 5]
+
+# Cell 2: Enable chat mode
+%llm_chat on
+
+# Cell 3: Check context - sees all cells above
+%llm_context
+
+# Cell 4: Add a NEW cell above (between 1 and 2)
+# Go back and insert: mean_value = 3.0
+
+# Cell 5: Ask about it - auto-rescans and includes the new cell!
+What is the mean_value I defined?
+
+# Cell 6: Check what happened
+%llm_context  # Shows "✨ Auto-rescanned (1 new cells detected)"
+```
+
+### Manual Control
+
+```python
+# Force a rescan
+%llm_context
+
+# Skip rescanning (faster if no changes)
+%llm_context --no-rescan
+
+# The rescan indicator shows when it happens
+# ✨ Auto-rescanned (3 new cells detected)
+```
+
+---
+
 ## Common Workflows
 
 ### Starting a New Session
@@ -557,6 +620,10 @@ def filter_cells(messages):
 
 6. **Compare models for best results** - Use `%%llm_compare` to find which model works best for your use case
 
+7. **Let auto-rescan work for you** - Just add cells naturally; the kernel will detect and include them automatically
+
+8. **All cells are visible** - With notebook file reading, you don't need to execute cells for them to appear in context
+
 ---
 
 ## Quick Reference
@@ -569,8 +636,8 @@ def filter_cells(messages):
 | `%llm_models` | List available models |
 | `%llm_model` | Switch active model |
 | **Context** |
-| `%llm_context` | Show current context |
-| `%llm_notebook_context` | Toggle notebook context mode |
+| `%llm_context` | Show current context (auto-rescans) |
+| `%llm_context --no-rescan` | Show context without rescanning |
 | `%llm_clear` | Clear conversation |
 | `%llm_context_window` | Show context window info |
 | `%llm_token_count` | Count tokens |

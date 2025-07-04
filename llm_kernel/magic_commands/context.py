@@ -28,12 +28,38 @@ class ContextMagics(Magics):
     
     @line_magic
     def llm_context(self, line):
-        """Show current context that will be sent to the LLM"""
+        """Show current context that will be sent to the LLM.
+        
+        This command also rescans the notebook file to pick up any new or edited cells above.
+        """
+        # Parse arguments
+        args = line.strip().split()
+        no_rescan = '--no-rescan' in args
+        
         # Always show notebook cells as context when in a notebook environment
         print("📓 Notebook Context - Showing cells that will be sent to LLM:")
+        
+        # Show notebook file info if available
+        if hasattr(self.kernel, 'notebook_utils'):
+            nb_path = self.kernel.notebook_utils.get_notebook_path()
+            if nb_path:
+                print(f"📔 Reading from: {nb_path}")
+                if not no_rescan:
+                    print("🔄 Rescanning notebook for changes...")
+            else:
+                print("📔 Notebook file not found - using execution history")
+        
         print("=" * 60)
         
-        messages = self.kernel.get_notebook_cells_as_context()
+        # Track if we had cells since last scan
+        cells_since_scan = getattr(self.kernel, '_cells_since_last_scan', 0)
+        
+        # Get context with rescan (unless --no-rescan is specified)
+        messages = self.kernel.get_notebook_cells_as_context(force_rescan=not no_rescan)
+        
+        # Show if auto-rescan happened
+        if cells_since_scan > 0 and not no_rescan:
+            print(f"✨ Auto-rescanned ({cells_since_scan} new cells detected)")
         
         if not messages:
             print("No context available yet. Start typing in cells!")
@@ -87,6 +113,10 @@ class ContextMagics(Magics):
                 if hasattr(self.kernel, 'hidden_cells') and self.kernel.hidden_cells:
                     hidden_nums = sorted([int(cell_id.split('_')[1]) for cell_id in self.kernel.hidden_cells])
                     print(f"\n🙈 Hidden cells: {', '.join(map(str, hidden_nums))}")
+                    
+                # Show info about rescanning
+                print(f"\n💡 Tip: %llm_context rescans the notebook for changes")
+                print(f"   Use %llm_context --no-rescan to skip rescanning")
     
     
     @cell_magic

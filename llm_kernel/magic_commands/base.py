@@ -38,12 +38,14 @@ class BaseMagics(Magics):
                 print("💬 Chat mode: ON")
                 print("📝 Just type in any cell to chat!")
                 print("💡 Your notebook cells are now the LLM's context window!")
+                print("🔄 Context auto-rescans when you add cells")
         elif arg in ['on', 'true', '1']:
             self.kernel.chat_mode = True
             self.kernel.display_mode = 'chat'
             print("💬 Chat mode: ON")
             print("📝 Just type in any cell to chat!")
             print("💡 Your notebook cells are now the LLM's context window!")
+            print("🔄 Context auto-rescans when you add cells")
         elif arg in ['off', 'false', '0']:
             self.kernel.chat_mode = False
             self.kernel.display_mode = 'inline'

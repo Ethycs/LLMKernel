@@ -37,6 +37,7 @@ from .dialogue_pruner import DialoguePruner
 from .config_manager import ConfigManager
 from .mcp_manager import MCPManager
 from .llm_integration import LLMIntegration
+from .notebook_utils import NotebookUtils
 
 # Import magic command modules
 from .magic_commands import (
@@ -113,6 +114,10 @@ class LLMKernel(IPythonKernel):
         # Chat mode
         self.chat_mode = False
         
+        # Track context scanning
+        self._last_context_scan_cell = None  # Track which cell we last scanned at
+        self._cells_since_last_scan = 0  # Count cells executed since last scan
+        
         # Async executor for parallel queries
         self.executor = ThreadPoolExecutor(max_workers=4)
         
@@ -126,6 +131,9 @@ class LLMKernel(IPythonKernel):
         
         # LLM integration handler
         self.llm_integration = LLMIntegration(self)
+        
+        # Notebook utilities for reading notebook files
+        self.notebook_utils = NotebookUtils(self)
         
         # Register magic commands
         self.register_magic_commands()
@@ -346,18 +354,69 @@ class LLMKernel(IPythonKernel):
             import traceback
             traceback.print_exc()
 
-    def get_notebook_cells_as_context(self) -> List[Dict[str, str]]:
-        """Get notebook cells as context messages for the LLM."""
-        # Check if we have reranked context
-        if hasattr(self, '_reranked_context') and self._reranked_context:
+    def get_notebook_cells_as_context(self, force_rescan: bool = False, auto_rescan: bool = True) -> List[Dict[str, str]]:
+        """Get notebook cells as context messages for the LLM.
+        
+        Args:
+            force_rescan: Force a rescan of the notebook file
+            auto_rescan: Automatically rescan if cells were executed since last scan
+        """
+        # Determine if we should rescan
+        should_rescan = force_rescan
+        if auto_rescan and self._cells_since_last_scan > 0:
+            self.log.debug(f"Auto-rescanning: {self._cells_since_last_scan} cells executed since last scan")
+            should_rescan = True
+        
+        # Check if we have reranked context (unless rescanning)
+        if not should_rescan and hasattr(self, '_reranked_context') and self._reranked_context:
             return self._reranked_context
             
-        messages = []
-        
-        # If we have saved/loaded context, use that
-        if self.saved_context:
+        # If we have saved/loaded context, use that (unless rescanning)
+        if not should_rescan and self.saved_context:
             return self.saved_context
         
+        # Try to get cells from the notebook file first
+        if hasattr(self, 'notebook_utils'):
+            # Force reload the notebook if rescanning
+            if should_rescan:
+                self.notebook_utils.read_notebook(force_reload=True)
+                self._last_context_scan_cell = self._current_cell_id
+                self._cells_since_last_scan = 0
+            
+            # Determine up_to_cell based on current execution
+            up_to_cell = None
+            if hasattr(self, '_current_cell_content'):
+                # Find the current cell index in the notebook
+                cell_idx = self.notebook_utils.find_cell_index(self._current_cell_content)
+                if cell_idx is not None:
+                    # Include cells up to and including the current one
+                    up_to_cell = cell_idx + 1
+                    self.log.debug(f"Limiting context to cells up to index {cell_idx}")
+            
+            notebook_messages = self.notebook_utils.get_cells_as_context(
+                include_outputs=True,
+                skip_empty=True,
+                up_to_cell=up_to_cell
+            )
+            if notebook_messages:
+                # Apply hidden cells filter
+                filtered_messages = []
+                cell_count = 0
+                
+                for msg in notebook_messages:
+                    cell_id = f"cell_{cell_count}"
+                    if msg['role'] == 'user':  # Each user message is a new cell
+                        if cell_id not in self.hidden_cells:
+                            filtered_messages.append(msg)
+                        cell_count += 1
+                    else:  # Assistant messages (outputs) belong to the same cell
+                        if f"cell_{cell_count-1}" not in self.hidden_cells:
+                            filtered_messages.append(msg)
+                
+                return filtered_messages
+        
+        # Fallback to execution history if notebook reading fails
+        messages = []
         try:
             # Get notebook history through ipykernel mechanisms
             history = self.shell.history_manager.get_range(output=True)
@@ -450,6 +509,12 @@ class LLMKernel(IPythonKernel):
         # Track cell execution
         cell_id = f"cell_{len(self.execution_tracker.execution_history)}"
         self._current_cell_id = cell_id
+        self._current_cell_content = code
+        
+        # Only count non-magic cells towards rescan trigger
+        # (unless it's %llm_context which resets the counter)
+        if not code.strip().startswith('%') or code.strip().startswith('%llm_context'):
+            self._cells_since_last_scan += 1
         
         # Get execution count
         execution_count = self.execution_count if hasattr(self, 'execution_count') else 0
