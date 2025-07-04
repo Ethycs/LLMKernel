@@ -66,6 +66,9 @@ class LLMKernel(IPythonKernel):
         # Initialize logging
         self.setup_logging()
         
+        # Enable VS Code debugging if requested
+        self.setup_debugging()
+        
         # Load environment and configuration
         self.config_manager = ConfigManager()
         self.load_environment()
@@ -85,6 +88,9 @@ class LLMKernel(IPythonKernel):
         self.conversation_history = []
         self.model_contexts = defaultdict(list)
         
+        # Display options
+        self.display_mode = 'inline'  # 'inline' or 'chat'
+        
         # Async executor for parallel queries
         self.executor = ThreadPoolExecutor(max_workers=4)
         
@@ -103,6 +109,27 @@ class LLMKernel(IPythonKernel):
         # Ensure self.log is available even when not running in full Jupyter context
         if not hasattr(self, 'log') or self.log is None:
             self.log = logging.getLogger(__name__)
+    
+    def setup_debugging(self):
+        """Setup VS Code debugging if enabled."""
+        if os.getenv('LLM_KERNEL_DEBUGGER') == 'true':
+            try:
+                import debugpy
+                port = int(os.getenv('LLM_KERNEL_DEBUG_PORT', '5678'))
+                
+                # Use 0.0.0.0 to allow connections from any interface
+                debugpy.listen(("0.0.0.0", port))
+                self.log.info(f"Debugger listening on 0.0.0.0:{port}")
+                
+                # Wait for debugger if requested
+                if os.getenv('LLM_KERNEL_DEBUG_WAIT') == 'true':
+                    self.log.info("Waiting for debugger to attach...")
+                    debugpy.wait_for_client()
+                    self.log.info("Debugger attached!")
+            except ImportError:
+                self.log.warning("debugpy not installed - install with: pixi install -e notebook")
+            except Exception as e:
+                self.log.warning(f"Could not start debugger: {e}")
 
     def load_environment(self):
         """Load environment variables from .env files."""
@@ -261,7 +288,34 @@ class LLMKernel(IPythonKernel):
         
         self.execution_tracker.track_execution(cell_id, code, self.execution_count)
         
-        # Call parent execute
+        # Check if we're in chat mode and this isn't a magic command
+        if (hasattr(self, 'chat_mode') and self.chat_mode and 
+            not code.strip().startswith('%') and 
+            not code.strip().startswith('!') and
+            code.strip() and
+            not code.strip().startswith('#')):
+            
+            # In chat mode, treat non-magic, non-empty cells as LLM queries
+            try:
+                # Find the LLMKernelMagics instance
+                magic_instance = None
+                for mc in self.shell.magics_manager.registry.values():
+                    if isinstance(mc, LLMKernelMagics):
+                        magic_instance = mc
+                        break
+                
+                if magic_instance:
+                    # Call the llm method directly
+                    magic_instance.llm('', code)
+                    # Return successful execution
+                    return {'status': 'ok', 'execution_count': self.execution_count,
+                            'payload': [], 'user_expressions': {}}
+                else:
+                    self.log.error("Could not find LLMKernelMagics instance")
+            except Exception as e:
+                self.log.error(f"Error in chat mode: {e}", exc_info=True)
+        
+        # Normal execution for magic commands, empty cells, or when not in chat mode
         return super().do_execute(code, silent, store_history, user_expressions, allow_stdin)
 
 
@@ -331,8 +385,41 @@ class LLMKernelMagics(Magics):
         except RuntimeError:
             # Fallback: create new event loop
             result = asyncio.run(self.kernel.query_llm_async(cell, model))
+        except Exception as e:
+            print(f"❌ Error querying LLM: {e}")
+            return None
         
-        print(result)
+        # Display based on mode
+        if self.kernel.display_mode == 'chat':
+            # Chat mode - clean cell-based display
+            model_name = model or self.kernel.active_model
+            
+            # Show model info
+            print(f"[{model_name}]")
+            print("-" * 40)
+            
+            # Show the response
+            print(result)
+            
+            # Add spacing and continuation hint
+            print("\n" + "=" * 40)
+            print("💬 Continue in next cell with %%llm")
+            
+            # Track this as part of a conversation thread
+            if not hasattr(self.kernel, '_chat_thread_id'):
+                import uuid
+                self.kernel._chat_thread_id = str(uuid.uuid4())[:8]
+            
+            # Store thread metadata
+            if hasattr(self.kernel, '_current_cell_id'):
+                cell_id = self.kernel._current_cell_id
+                if not hasattr(self.kernel.execution_tracker, 'chat_threads'):
+                    self.kernel.execution_tracker.chat_threads = {}
+                self.kernel.execution_tracker.chat_threads[cell_id] = self.kernel._chat_thread_id
+        else:
+            # Default inline display
+            print(result)
+        
         return result
 
     @cell_magic
@@ -422,6 +509,62 @@ class LLMKernelMagics(Magics):
         self.kernel.conversation_history.clear()
         self.kernel.model_contexts.clear()
         print("✅ Conversation history cleared")
+    
+    @line_magic
+    def llm_history(self, line):
+        """Show conversation history as a static chat window."""
+        args = line.split() if line else []
+        show_cells = '--cells' in args
+        show_all = '--all' in args
+        
+        if not self.kernel.conversation_history:
+            print("💬 No conversation history yet")
+            return
+        
+        # Build HTML chat display
+        html_parts = ['<div style="font-family: Arial, sans-serif; max-width: 800px;">']
+        html_parts.append('<h3>💬 LLM Conversation History</h3>')
+        
+        # Sort by notebook order if available
+        if hasattr(self.kernel.context_manager, 'sort_by_notebook_order'):
+            sorted_history = self.kernel.context_manager.sort_by_notebook_order(
+                self.kernel.conversation_history.copy()
+            )
+        else:
+            # Fallback to chronological order
+            sorted_history = self.kernel.conversation_history.copy()
+        
+        for i, exchange in enumerate(sorted_history):
+            cell_info = ""
+            if show_cells and exchange.get('cell_id'):
+                cell_num = self.kernel.execution_tracker.cell_id_to_number.get(
+                    exchange['cell_id'], '?'
+                )
+                cell_info = f" <small style='color: #666;'>[Cell {cell_num}]</small>"
+            
+            # User message
+            import html as html_module
+            escaped_input = html_module.escape(exchange['input'])
+            html_parts.append(f'''
+            <div style="margin: 10px 0; padding: 10px; background: #e3f2fd; border-radius: 10px;">
+                <strong>👤 User{cell_info}:</strong><br>
+                <pre style="white-space: pre-wrap; margin: 5px 0;">{escaped_input}</pre>
+            </div>
+            ''')
+            
+            # Assistant response
+            if exchange.get('output'):
+                model = exchange.get('model', 'Unknown')
+                escaped_output = html_module.escape(exchange['output'])
+                html_parts.append(f'''
+                <div style="margin: 10px 0 20px 40px; padding: 10px; background: #f5f5f5; border-radius: 10px;">
+                    <strong>🤖 {model}:</strong><br>
+                    <pre style="white-space: pre-wrap; margin: 5px 0;">{escaped_output}</pre>
+                </div>
+                ''')
+        
+        html_parts.append('</div>')
+        display(HTML(''.join(html_parts)))
 
     @line_magic
     def llm_pin_cell(self, line):
@@ -459,6 +602,366 @@ class LLMKernelMagics(Magics):
             print(f"✅ Context strategy set to: {strategy}")
         except ValueError as e:
             print(f"❌ {e}")
+
+    @line_magic
+    def llm_debug(self, line):
+        """Enable debugging: %llm_debug [port]"""
+        try:
+            import debugpy
+            port = int(line.strip()) if line.strip() else 5678
+            
+            # Check if already debugging
+            if debugpy.is_client_connected():
+                print("✅ Debugger already connected")
+                return
+                
+            # Start debug server
+            try:
+                debugpy.listen(("0.0.0.0", port))
+                print(f"🐛 Debugger listening on port {port}")
+                print("📎 In VS Code: Run and Debug → 'Debug LLM Kernel' → Start Debugging (F5)")
+                
+                # Optional: wait for attach
+                if '--wait' in line:
+                    print("⏸️  Waiting for debugger to attach...")
+                    debugpy.wait_for_client()
+                    print("✅ Debugger attached!")
+            except RuntimeError as e:
+                if "already listening" in str(e):
+                    print(f"ℹ️  Debugger already listening on port {port}")
+                else:
+                    raise
+                    
+        except ImportError:
+            print("❌ debugpy not installed")
+            print("Run: pixi install -e notebook")
+        except Exception as e:
+            print(f"❌ Error starting debugger: {e}")
+    
+    @line_magic
+    def llm_chat(self, line):
+        """Toggle chat mode on/off or check status"""
+        arg = line.strip().lower()
+        
+        # Helper function to swap keys
+        def swap_keys(enable_chat):
+            from IPython.display import Javascript, display
+            
+            if enable_chat:
+                # Swap keys for chat mode
+                js_code = """
+                // Swap Enter and Shift+Enter for chat mode
+                (function() {
+                    if (window._llm_keys_swapped) return;
+                    
+                    console.log('🔧 Installing LLM chat key handler...');
+                    
+                    // Check if we're in classic Jupyter Notebook
+                    if (typeof Jupyter !== 'undefined' && Jupyter.keyboard_manager) {
+                        console.log('📓 Detected classic Jupyter Notebook');
+                        
+                        // Add Enter shortcut in edit mode to run cell
+                        Jupyter.keyboard_manager.edit_shortcuts.add_shortcut('enter', {
+                            help: 'run cell (chat mode)',
+                            handler: function() {
+                                Jupyter.notebook.execute_cell();
+                                return false;
+                            }
+                        });
+                        
+                        // Optional: Modify shift+enter to just insert newline
+                        // (This is tricky in classic notebook, might need to keep default)
+                        
+                        window._llm_keys_swapped = true;
+                        console.log('✅ Chat mode keys active in classic Notebook');
+                        
+                    } else {
+                        // JupyterLab - use direct DOM manipulation
+                        console.log('🧪 Detected JupyterLab, using event interception');
+                        
+                        window._llm_key_handler = function(e) {
+                            // Only work in code cell editors
+                            const isInCell = e.target.closest('.jp-Cell-inputArea') || 
+                                           e.target.closest('.CodeMirror') ||
+                                           e.target.classList.contains('CodeMirror-line');
+                            
+                            if (!isInCell || e.key !== 'Enter' || e.repeat) return;
+                            
+                            if (e.shiftKey) {
+                                // Shift+Enter: Allow default (newline)
+                                console.log('Shift+Enter: newline');
+                            } else {
+                                // Plain Enter: Execute cell
+                                e.preventDefault();
+                                e.stopPropagation();
+                                e.stopImmediatePropagation();
+                                
+                                console.log('Enter: executing cell');
+                                
+                                // Method 1: Click the run button
+                                const runButton = document.querySelector('[data-jp-item-name="notebook:run-cell"]') ||
+                                                document.querySelector('[title*="Run"]') ||
+                                                document.querySelector('.jp-ToolbarButtonComponent[title*="Run"]') ||
+                                                document.querySelector('.jp-RunIcon');
+                                
+                                if (runButton) {
+                                    runButton.click();
+                                    console.log('✅ Executed via button click');
+                                } else {
+                                    // Method 2: Simulate Shift+Enter
+                                    const shiftEnter = new KeyboardEvent('keydown', {
+                                        key: 'Enter',
+                                        code: 'Enter',
+                                        shiftKey: true,
+                                        bubbles: true,
+                                        cancelable: true,
+                                        view: window,
+                                        composed: true
+                                    });
+                                    
+                                    // Try dispatching to different targets
+                                    const targets = [
+                                        e.target,
+                                        document.activeElement,
+                                        e.target.closest('.CodeMirror'),
+                                        e.target.closest('.jp-InputArea-editor')
+                                    ].filter(Boolean);
+                                    
+                                    for (const target of targets) {
+                                        if (target.dispatchEvent(shiftEnter)) {
+                                            console.log('✅ Executed via simulated Shift+Enter');
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        
+                        // Install with capture to intercept before JupyterLab
+                        document.addEventListener('keydown', window._llm_key_handler, true);
+                        
+                        // Also try to patch CodeMirror instances
+                        const patchCodeMirror = () => {
+                            document.querySelectorAll('.CodeMirror').forEach(cm => {
+                                if (cm.CodeMirror && !cm.CodeMirror._llmPatched) {
+                                    const cmInstance = cm.CodeMirror;
+                                    const origKeyMap = cmInstance.getOption('keyMap');
+                                    
+                                    // Add our Enter handler
+                                    cmInstance.addKeyMap({
+                                        'Enter': function(cm) {
+                                            // Execute cell instead of newline
+                                            const runBtn = document.querySelector('[title*="Run"]');
+                                            if (runBtn) {
+                                                runBtn.click();
+                                                return true;
+                                            }
+                                            return false;
+                                        }
+                                    });
+                                    
+                                    cmInstance._llmPatched = true;
+                                    console.log('✅ Patched CodeMirror instance');
+                                }
+                            });
+                        };
+                        
+                        // Patch existing cells
+                        patchCodeMirror();
+                        
+                        // Watch for new cells
+                        const observer = new MutationObserver(() => patchCodeMirror());
+                        observer.observe(document.body, { 
+                            childList: true, 
+                            subtree: true 
+                        });
+                        
+                        window._llm_keys_swapped = true;
+                        window._llm_cm_observer = observer;
+                        console.log('✅ Chat mode keys active in JupyterLab');
+                    }
+                })();
+                """
+            else:
+                # Restore normal keys
+                js_code = """
+                // Restore normal key behavior
+                (function() {
+                    if (!window._llm_keys_swapped) return;
+                    
+                    console.log('🔧 Restoring normal key behavior...');
+                    
+                    // Check if we're in classic Jupyter Notebook
+                    if (typeof Jupyter !== 'undefined' && Jupyter.keyboard_manager) {
+                        // Remove the Enter shortcut
+                        Jupyter.keyboard_manager.edit_shortcuts.remove_shortcut('enter');
+                        console.log('✅ Restored classic Notebook keys');
+                        
+                    } else {
+                        // JupyterLab - remove event handler
+                        if (window._llm_key_handler) {
+                            document.removeEventListener('keydown', window._llm_key_handler, true);
+                            delete window._llm_key_handler;
+                        }
+                        
+                        // Stop observing for new cells
+                        if (window._llm_cm_observer) {
+                            window._llm_cm_observer.disconnect();
+                            delete window._llm_cm_observer;
+                        }
+                        
+                        // Remove CodeMirror patches
+                        document.querySelectorAll('.CodeMirror').forEach(cm => {
+                            if (cm.CodeMirror && cm.CodeMirror._llmPatched) {
+                                // Remove our keymap by adding an empty one
+                                cm.CodeMirror.removeKeyMap({Enter: null});
+                                delete cm.CodeMirror._llmPatched;
+                            }
+                        });
+                        
+                        console.log('✅ Restored JupyterLab keys');
+                    }
+                    
+                    window._llm_keys_swapped = false;
+                    console.log('✅ Normal keys restored: Shift+Enter=execute, Enter=newline');
+                })();
+                """
+            
+            display(Javascript(js_code))
+        
+        if not arg:
+            # Toggle mode
+            if hasattr(self.kernel, 'chat_mode') and self.kernel.chat_mode:
+                self.kernel.chat_mode = False
+                self.kernel.display_mode = 'inline'
+                swap_keys(False)  # Restore normal keys
+                print("💬 Chat mode: OFF")
+                print("⌨️  Keys restored: Shift+Enter = execute")
+            else:
+                self.kernel.chat_mode = True
+                self.kernel.display_mode = 'chat'
+                swap_keys(True)  # Enable chat keys
+                print("💬 Chat mode: ON")
+                print("⌨️  Keys swapped: Enter = execute")
+                print("📝 Just type in any cell to chat!")
+        elif arg in ['on', 'true', '1']:
+            self.kernel.chat_mode = True
+            self.kernel.display_mode = 'chat'
+            swap_keys(True)
+            print("💬 Chat mode: ON")
+            print("⌨️  Keys swapped: Enter = execute")
+        elif arg in ['off', 'false', '0']:
+            self.kernel.chat_mode = False
+            self.kernel.display_mode = 'inline'
+            swap_keys(False)
+            print("💬 Chat mode: OFF")
+            print("⌨️  Keys restored: Shift+Enter = execute")
+        elif arg == 'status':
+            status = "ON" if hasattr(self.kernel, 'chat_mode') and self.kernel.chat_mode else "OFF"
+            print(f"💬 Chat mode: {status}")
+        else:
+            print("Usage: %llm_chat [on|off|status]")
+            print("       %llm_chat  (toggles mode)")
+    
+    @line_magic
+    def llm_display(self, line):
+        """Set display mode: %llm_display chat"""
+        mode = line.strip()
+        if not mode:
+            print(f"Current display mode: {self.kernel.display_mode}")
+            print("Available modes: inline, chat")
+            return
+        
+        if mode in ['inline', 'chat']:
+            self.kernel.display_mode = mode
+            print(f"✅ Display mode set to: {mode}")
+            
+            if mode == 'chat':
+                # Also enable chat mode
+                self.kernel.chat_mode = True
+                print("💬 Chat mode enabled - use %%llm to continue conversations")
+        else:
+            print(f"❌ Invalid mode. Use 'inline' or 'chat'")
+
+    @line_magic
+    def llm_swap_keys(self, line):
+        """Swap Enter and Shift+Enter in JupyterLab notebooks"""
+        from IPython.display import Javascript, display
+        
+        js_code = """
+        // Function to swap Enter and Shift+Enter
+        (function() {
+            // For JupyterLab
+            if (window.jupyterlab || window.jupyterapp) {
+                console.log('Swapping Enter and Shift+Enter keys...');
+                
+                // Override keyboard event handling
+                document.addEventListener('keydown', function(e) {
+                    // Only work in code cells
+                    if (e.target.classList.contains('jp-InputArea-editor') || 
+                        e.target.classList.contains('CodeMirror-line')) {
+                        
+                        if (e.key === 'Enter') {
+                            if (e.shiftKey) {
+                                // Shift+Enter: Just add newline
+                                e.stopPropagation();
+                                e.preventDefault();
+                                
+                                // Insert newline at cursor
+                                const selection = window.getSelection();
+                                if (selection.rangeCount > 0) {
+                                    const range = selection.getRangeAt(0);
+                                    const br = document.createElement('br');
+                                    range.insertNode(br);
+                                    range.setStartAfter(br);
+                                    range.collapse(true);
+                                    selection.removeAllRanges();
+                                    selection.addRange(range);
+                                }
+                            } else {
+                                // Plain Enter: Execute cell
+                                e.stopPropagation();
+                                e.preventDefault();
+                                
+                                // Find and click the run button or trigger run command
+                                try {
+                                    const app = window.jupyterlab || window.jupyterapp;
+                                    if (app && app.commands) {
+                                        app.commands.execute('notebook:run-cell');
+                                    }
+                                } catch (err) {
+                                    // Fallback: simulate Shift+Enter
+                                    const event = new KeyboardEvent('keydown', {
+                                        key: 'Enter',
+                                        shiftKey: true,
+                                        bubbles: true
+                                    });
+                                    e.target.dispatchEvent(event);
+                                }
+                            }
+                        }
+                    }
+                }, true);  // Use capture phase to intercept before JupyterLab
+                
+                console.log('✅ Keys swapped! Enter=execute, Shift+Enter=newline');
+            }
+            
+            // For classic Notebook
+            else if (typeof Jupyter !== 'undefined' && Jupyter.notebook) {
+                // Override keyboard shortcuts
+                Jupyter.keyboard_manager.command_shortcuts.add_shortcut('enter', 'jupyter-notebook:run-cell');
+                Jupyter.keyboard_manager.edit_shortcuts.add_shortcut('enter', 'jupyter-notebook:run-cell');
+                Jupyter.keyboard_manager.edit_shortcuts.add_shortcut('shift-enter', 'jupyter-notebook:enter-command-mode');
+                
+                console.log('✅ Keys swapped in classic notebook!');
+            }
+        })();
+        """
+        
+        display(Javascript(js_code))
+        print("🔄 Enter and Shift+Enter have been swapped!")
+        print("   Enter = Execute cell")
+        print("   Shift+Enter = New line")
 
     @line_magic
     def llm_prune(self, line):
