@@ -191,7 +191,12 @@ Based on analysis of the codebase vs README documentation.
 - [x] Added `%llm_meta_list` to list defined meta functions
 - [x] Implemented context persistence with save/load functionality
 - [x] Added `%llm_context_save`, `%llm_context_load`, `%llm_context_reset`, `%llm_context_persist`
+- [x] Implemented context window size management using LiteLLM's `get_max_tokens`
+- [x] Added `%llm_context_window` to display context window info with visual progress bar
+- [x] Added `%llm_token_count` for accurate token counting using model-specific tokenizers
+- [x] Added `%llm_cost` to track session costs and estimate query costs
+- [x] Updated `%llm_context` to show accurate token usage with warnings
 
 ---
 
-*Last updated: 2025-01-04 - Added reranking and context persistence to completed features*
+*Last updated: 2025-01-04 - Added context window management features*

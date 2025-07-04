@@ -287,6 +287,55 @@ Compare responses from multiple models side-by-side.
 What's the best way to handle errors in Python?
 ```
 
+## Context Window Management
+
+### `%llm_context_window`
+Display context window information and usage for LLM models.
+
+```python
+%llm_context_window                # Show current model's context window
+%llm_context_window all            # Show all models' context windows  
+%llm_context_window gpt-4          # Show specific model's context window
+```
+
+**Output example:**
+```
+📊 Context Window for gpt-4o:
+   Max tokens: 128,000
+   Current usage: 2,450 tokens (1.9%)
+   [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]
+```
+
+### `%llm_token_count`
+Count tokens in current context or provided text using model-specific tokenizers.
+
+```python
+%llm_token_count                           # Count tokens in current context
+%llm_token_count "Hello world!"            # Count tokens in text
+%llm_token_count --model=claude-3 "text"   # Use specific model tokenizer
+```
+
+### `%llm_cost`
+Track and estimate costs for LLM usage.
+
+```python
+%llm_cost                    # Show session costs
+%llm_cost estimate           # Estimate cost for current context
+%llm_cost --model=gpt-4      # Show costs for specific model
+```
+
+**Output example:**
+```
+💰 Session Costs:
+   Total: $0.002450
+   
+   By Model:
+   - gpt-4o: $0.001800
+   - claude-3-sonnet: $0.000650
+```
+
+---
+
 ## Context Reranking & Custom Processing
 
 ### `%llm_rerank`
@@ -455,6 +504,9 @@ def filter_cells(messages):
 | `%llm_context` | Show current context |
 | `%llm_notebook_context` | Toggle notebook context mode |
 | `%llm_clear` | Clear conversation |
+| `%llm_context_window` | Show context window info |
+| `%llm_token_count` | Count tokens |
+| `%llm_cost` | Track/estimate costs |
 | **Hide/Show** |
 | `%%hide` | Hide cell from LLM |
 | `%llm_unhide` | Unhide cells |
