@@ -77,6 +77,45 @@ Based on analysis of the codebase vs README documentation.
 - [ ] Multi-user session support
 - [ ] Context versioning
 
+## 🚀 New Feature Ideas
+
+### MCP (Model Context Protocol) Integration
+- [ ] Implement MCP client for connecting to external tools
+- [ ] Add `%llm_mcp_connect` command to connect to MCP servers
+- [ ] Add `%llm_mcp_tools` to list available MCP tools
+- [ ] Create `%%llm_mcp` cell magic for queries with MCP tools available
+- [ ] Support for file access, database queries, API integrations via MCP
+
+### GitHub Copilot Workspace Integration
+- [ ] Scan workspace for relevant files and documentation
+- [ ] Add `%llm_workspace_add <pattern>` to include files in context
+- [ ] Implement `%llm_workspace_search` for semantic search in codebase
+- [ ] Create document embeddings for workspace files
+- [ ] Add `%%llm_with_workspace` for queries with workspace context
+
+### Context Import/Export Enhancements
+- [ ] Implement `%llm_export_context` with full session state
+- [ ] Add `%llm_import_context` to restore previous sessions
+- [ ] Create `%llm_context_merge` to combine multiple context files
+- [ ] Support context templates and presets
+- [ ] Add context versioning and diff capabilities
+
+### Kernel Passthrough Mode
+- [ ] Create wrapper mode to add LLM capabilities to ANY kernel
+- [ ] Implement `%llm_passthrough <kernel>` command
+- [ ] Add input preprocessing with LLM enhancement
+- [ ] Add output postprocessing and error explanation
+- [ ] Support for intercepting errors, warnings, and specific patterns
+- [ ] Create `%llm_intercept` for configuring what to process
+
+### Editable Context (Input AND Output)
+- [ ] Implement `%llm_edit_cell <num>` to edit both input and output
+- [ ] Add visual editor interface for modifying cell history
+- [ ] Create `%llm_synthetic_cell` to add cells that never executed
+- [ ] Track original vs edited history
+- [ ] Allow rewriting conversation history for better context
+- [ ] Add `%llm_rewrite_history` for bulk editing
+
 ## 📝 Documentation Updates
 
 - [ ] Update README to reflect actual implemented features
@@ -117,11 +156,42 @@ Based on analysis of the codebase vs README documentation.
 
 ## Priority Order
 
-1. **Immediate**: Fix context tracking with cell reordering
-2. **High**: Implement missing magic commands (`%llm_graph`, export/import)
-3. **Medium**: Add visualization features
-4. **Low**: Advanced features from roadmap
+1. **Immediate**: 
+   - Fix context tracking with cell reordering
+   - Complete `%%hide` cell magic implementation ✅
+
+2. **High**: 
+   - Implement missing magic commands (`%llm_graph`, export/import)
+   - MCP (Model Context Protocol) integration
+   - Kernel passthrough mode
+
+3. **Medium**: 
+   - Add visualization features
+   - GitHub Copilot Workspace integration
+   - Editable context (input AND output editing)
+   - Context import/export enhancements
+
+4. **Low**: 
+   - Advanced features from roadmap
+   - Collaboration features
+   - Plugin system
+
+## Recently Completed ✅
+
+- [x] Implemented `%%hide` cell magic to exclude cells from context
+- [x] Added `%llm_unhide` command to unhide cells
+- [x] Added `%llm_hidden` to show hidden cells
+- [x] Implemented notebook context mode where cells ARE the context
+- [x] Added `%llm_notebook_context` toggle
+- [x] Created `%llm_context` to show current context window
+- [x] Implemented `%llm_rerank` for LLM-based cell reranking by relevance
+- [x] Added `%llm_rerank_clear` to restore original cell order
+- [x] Implemented `%%meta` cell magic for custom context processing functions
+- [x] Added `%llm_apply_meta` to apply custom filter/ranking/transform functions
+- [x] Added `%llm_meta_list` to list defined meta functions
+- [x] Implemented context persistence with save/load functionality
+- [x] Added `%llm_context_save`, `%llm_context_load`, `%llm_context_reset`, `%llm_context_persist`
 
 ---
 
-*Last updated: Based on codebase analysis*
+*Last updated: 2025-01-04 - Added reranking and context persistence to completed features*
