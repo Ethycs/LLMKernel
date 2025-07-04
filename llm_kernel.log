@@ -99,3 +99,49 @@
 2025-07-04 03:43:46 - [llm_kernel] INFO: LLM Kernel initialized successfully
 2025-07-04 03:43:46 - [llm_kernel] INFO: Active model: gpt-4o
 2025-07-04 03:43:46 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 04:14:49 - [llm_kernel] INFO: Exception in execute request:
+[31m---------------------------------------------------------------------------[39m
+[31mAttributeError[39m                            Traceback (most recent call last)
+[36mCell[39m[36m [39m[32mIn[10][39m[32m, line 1[39m
+[32m----> [39m[32m1[39m [43mget_ipython[49m[43m([49m[43m)[49m[43m.[49m[43mrun_line_magic[49m[43m([49m[33;43m'[39;49m[33;43mllm_status[39;49m[33;43m'[39;49m[43m,[49m[43m [49m[33;43m'[39;49m[33;43m'[39;49m[43m)[49m
+
+[36mFile [39m[32mF:\Keytone\Documents\GitHub\LLMKernel\.pixi\envs\notebook\Lib\site-packages\IPython\core\interactiveshell.py:2504[39m, in [36mInteractiveShell.run_line_magic[39m[34m(self, magic_name, line, _stack_depth)[39m
+[32m   2502[39m     kwargs[[33m'[39m[33mlocal_ns[39m[33m'[39m] = [38;5;28mself[39m.get_local_scope(stack_depth)
+[32m   2503[39m [38;5;28;01mwith[39;00m [38;5;28mself[39m.builtin_trap:
+[32m-> [39m[32m2504[39m     result = [43mfn[49m[43m([49m[43m*[49m[43margs[49m[43m,[49m[43m [49m[43m*[49m[43m*[49m[43mkwargs[49m[43m)[49m
+[32m   2506[39m [38;5;66;03m# The code below prevents the output from being displayed[39;00m
+[32m   2507[39m [38;5;66;03m# when using magics with decorator @output_can_be_silenced[39;00m
+[32m   2508[39m [38;5;66;03m# when the last Python token in the expression is a ';'.[39;00m
+[32m   2509[39m [38;5;28;01mif[39;00m [38;5;28mgetattr[39m(fn, magic.MAGIC_OUTPUT_CAN_BE_SILENCED, [38;5;28;01mFalse[39;00m):
+
+[36mFile [39m[32mf:\Keytone\Documents\GitHub\LLMKernel\llm_kernel\magic_commands\base.py:112[39m, in [36mllm_status[39m[34m(self, line)[39m
+[32m    107[39m     [38;5;28mprint[39m([33mf[39m[33m"[39m[33mContext Window Usage: [39m[38;5;132;01m{[39;00mwindow_usage[38;5;132;01m:[39;00m[33m.1f[39m[38;5;132;01m}[39;00m[33m%[39m[33m"[39m)
+[32m    109[39m [38;5;66;03m# Token usage estimate[39;00m
+[32m    110[39m total_tokens = [38;5;28msum[39m(
+[32m    111[39m     [38;5;28mlen[39m(exchange.get([33m'[39m[33minput[39m[33m'[39m, [33m'[39m[33m'[39m)) + [38;5;28mlen[39m(exchange.get([33m'[39m[33moutput[39m[33m'[39m, [33m'[39m[33m'[39m))
+[32m--> [39m[32m112[39m     [38;5;28;01mfor[39;00m exchange [38;5;129;01min[39;00m [38;5;28mself[39m.kernel.conversation_history
+[32m    113[39m ) // [32m4[39m  [38;5;66;03m# Rough token estimate[39;00m
+[32m    115[39m [38;5;28mprint[39m([33mf[39m[33m"[39m[33mEstimated Total Tokens: ~[39m[38;5;132;01m{[39;00mtotal_tokens[38;5;132;01m:[39;00m[33m,[39m[38;5;132;01m}[39;00m[33m"[39m)
+[32m    117[39m [38;5;66;03m# Chat mode status[39;00m
+
+[31mAttributeError[39m: 'ContextManager' object has no attribute 'get_window_usage'
+2025-07-04 11:21:57 - [llm_kernel] INFO: ============================================================
+2025-07-04 11:21:57 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 11:21:57 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 11:21:58 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 11:21:58 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 11:21:58 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 11:21:58 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 11:21:58 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 11:21:58 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 11:21:58 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 11:29:12 - [llm_kernel] INFO: ============================================================
+2025-07-04 11:29:12 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 11:29:12 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 11:29:13 - [llm_kernel] INFO: Initialized 10 LLM models
+2025-07-04 11:29:13 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 11:29:13 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 11:29:13 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 11:29:13 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 11:29:13 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 11:29:13 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']

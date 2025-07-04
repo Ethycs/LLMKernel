@@ -63,7 +63,10 @@ class MultimodalMagics(Magics):
         if show_only:
             if img_content:
                 print("📋 Clipboard contains an image:")
-                display(IPImage(data=img_content['data'], format='png'))
+                # Convert base64 string to bytes for IPython display
+                import base64
+                img_bytes = base64.b64decode(img_content['data'])
+                display(IPImage(data=img_bytes, format='png'))
             elif text_content:
                 print("📋 Clipboard contains text:")
                 print(text_content[:500] + "..." if len(text_content) > 500 else text_content)
@@ -75,8 +78,10 @@ class MultimodalMagics(Magics):
         if img_content:
             self.multimodal.add_to_cell(cell_id, img_content)
             print(f"✅ Pasted image ({img_content['size'][0]}x{img_content['size'][1]}) - will be included in next LLM query")
-            # Show thumbnail
-            display(IPImage(data=img_content['data'], format='png', width=200))
+            # Show thumbnail - convert base64 to bytes
+            import base64
+            img_bytes = base64.b64decode(img_content['data'])
+            display(IPImage(data=img_bytes, format='png', width=200))
         elif text_content:
             self.multimodal.add_to_cell(cell_id, {
                 'type': 'text',
@@ -121,7 +126,9 @@ class MultimodalMagics(Magics):
             
             if show_only:
                 print(f"🖼️ Preview of {image_path}:")
-                display(IPImage(data=img_content['data'], format='png', width=400))
+                import base64
+                img_bytes = base64.b64decode(img_content['data'])
+                display(IPImage(data=img_bytes, format='png', width=400))
                 return
             
             # Add to current cell's multimodal content
@@ -130,7 +137,9 @@ class MultimodalMagics(Magics):
             
             print(f"✅ Added image ({img_content['size'][0]}x{img_content['size'][1]}) - will be included in next LLM query")
             # Show thumbnail
-            display(IPImage(data=img_content['data'], format='png', width=200))
+            import base64
+            img_bytes = base64.b64decode(img_content['data'])
+            display(IPImage(data=img_bytes, format='png', width=200))
             
         except Exception as e:
             print(f"❌ Error loading image: {e}")
@@ -191,7 +200,9 @@ class MultimodalMagics(Magics):
                 print(f"📄 Preview of {pdf_path}:")
                 if content_items:
                     if content_items[0]['type'] == 'image':
-                        display(IPImage(data=content_items[0]['data'], format='png', width=600))
+                        import base64
+                        img_bytes = base64.b64decode(content_items[0]['data'])
+                        display(IPImage(data=img_bytes, format='png', width=600))
                     else:
                         print(content_items[0]['data'][:1000] + "...")
                 return
@@ -208,7 +219,9 @@ class MultimodalMagics(Magics):
                 # Show thumbnail of first page
                 if content_items and content_items[0]['type'] == 'image':
                     print("📄 First page preview:")
-                    display(IPImage(data=content_items[0]['data'], format='png', width=200))
+                    import base64
+                    img_bytes = base64.b64decode(content_items[0]['data'])
+                    display(IPImage(data=img_bytes, format='png', width=200))
             
         except Exception as e:
             print(f"❌ Error processing PDF: {e}")
