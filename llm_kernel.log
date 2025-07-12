@@ -310,3 +310,44 @@
 2025-07-04 15:04:09 - [llm_kernel] INFO: Active model: gpt-4o
 2025-07-04 15:04:09 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
 2025-07-04 15:04:16 - [llm_kernel] INFO: Found notebook at: f:\Keytone\Documents\GitHub\LLMKernel\example.ipynb
+2025-07-04 16:18:57 - [llm_kernel] INFO: ============================================================
+2025-07-04 16:18:57 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-04 16:18:57 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-04 16:18:58 - [llm_kernel] INFO: Initialized 16 LLM models
+2025-07-04 16:18:58 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 16:18:58 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-04 16:18:58 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-04 16:18:58 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-04 16:18:58 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-04 16:18:58 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-04 16:18:58 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'gpt-4.1', 'o3', 'o3-mini', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'claude-opus-4', 'claude-sonnet-4', 'claude-3-5-sonnet', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-04 16:19:14 - [llm_kernel] INFO: Exception in execute request:
+  [36mCell[39m[36m [39m[32mIn[2][39m[32m, line 2[39m
+[31m    [39m[31mWhat is 2 + 2?[39m
+                 ^
+[31mSyntaxError[39m[31m:[39m invalid syntax
+
+2025-07-04 16:19:25 - [llm_kernel] INFO: Uploaded file to OpenAI: file-BWir9z64yfT2LccNaviLBP
+2025-07-04 16:19:33 - [llm_kernel] ERROR: Error querying gpt-4o: litellm.InternalServerError: OpenAIException - The server had an error processing your request. Sorry about that! You can retry your request, or contact us through our help center at help.openai.com if you keep seeing this error. (Please include the request ID req_d26389ba29fa5f8e197c018f53c7858f in your email.)
+2025-07-04 16:19:48 - [llm_kernel] ERROR: Error querying gpt-4o: litellm.InternalServerError: OpenAIException - The server had an error processing your request. Sorry about that! You can retry your request, or contact us through our help center at help.openai.com if you keep seeing this error. (Please include the request ID req_13196557e660765f4315176ae4b343fc in your email.)
+2025-07-11 11:12:04 - [llm_kernel] INFO: ============================================================
+2025-07-11 11:12:04 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-11 11:12:04 - [llm_kernel] INFO: LLM Kernel starting up...
+2025-07-11 11:12:04 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-11 11:12:04 - [llm_kernel] INFO: Loaded environment from f:\Keytone\Documents\GitHub\LLMKernel\.env
+2025-07-11 11:12:05 - [llm_kernel] INFO: Initialized 16 LLM models
+2025-07-11 11:12:05 - [llm_kernel] INFO: Initialized 16 LLM models
+2025-07-11 11:12:05 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-11 11:12:05 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-11 11:12:05 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-11 11:12:05 - [llm_kernel] INFO: Multimodal magic commands registered
+2025-07-11 11:12:05 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-11 11:12:05 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-11 11:12:05 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-11 11:12:05 - [llm_kernel] INFO: Native PDF magic commands registered
+2025-07-11 11:12:05 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-11 11:12:05 - [llm_kernel] INFO: All magic commands registered successfully
+2025-07-11 11:12:05 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'gpt-4.1', 'o3', 'o3-mini', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'claude-opus-4', 'claude-sonnet-4', 'claude-3-5-sonnet', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']
+2025-07-11 11:12:05 - [llm_kernel] INFO: LLM Kernel initialized successfully
+2025-07-11 11:12:05 - [llm_kernel] INFO: Active model: gpt-4o
+2025-07-11 11:12:05 - [llm_kernel] INFO: Available models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4', 'gpt-3.5-turbo', 'gpt-4.1', 'o3', 'o3-mini', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku', 'claude-opus-4', 'claude-sonnet-4', 'claude-3-5-sonnet', 'ollama/llama3', 'ollama/codellama', 'ollama/mistral']

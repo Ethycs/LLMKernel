@@ -1,0 +1,454 @@
+{
+  "name": "llm-kernel-universal",
+  "displayName": "Universal LLM Kernel",
+  "description": "Add LLM capabilities to ANY Jupyter kernel - works with Python, R, Julia, JavaScript, and more",
+  "version": "1.0.0",
+  "publisher": "llm-kernel",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/LLMKernel"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Notebooks",
+    "Machine Learning",
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "jupyter",
+    "llm",
+    "ai",
+    "gpt",
+    "claude",
+    "notebook",
+    "kernel"
+  ],
+  "activationEvents": [
+    "onNotebook:*",
+    "onCommand:llm-kernel.setupForWorkspace",
+    "onCommand:llm-kernel.queryGPT4",
+    "onCommand:llm-kernel.queryClaude",
+    "onCommand:llm-kernel.switchModel"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "llm-kernel.setupForWorkspace",
+        "title": "Set up LLM Kernel for this workspace",
+        "category": "LLM Kernel"
+      },
+      {
+        "command": "llm-kernel.queryGPT4",
+        "title": "Query with GPT-4",
+        "category": "LLM Kernel",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "llm-kernel.queryClaude",
+        "title": "Query with Claude",
+        "category": "LLM Kernel",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "llm-kernel.switchModel",
+        "title": "Switch LLM Model",
+        "category": "LLM Kernel",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "llm-kernel.pruneContext",
+        "title": "Prune Context",
+        "category": "LLM Kernel",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "llm-kernel.explainCurrentCell",
+        "title": "Explain Current Cell",
+        "category": "LLM Kernel",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "llm-kernel.refactorCurrentCell",
+        "title": "Refactor Current Cell",
+        "category": "LLM Kernel",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "llm-kernel.compareModels",
+        "title": "Compare Models",
+        "category": "LLM Kernel",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "llm-kernel.showDashboard",
+        "title": "Show LLM Dashboard",
+        "category": "LLM Kernel",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "llm-kernel.queryInCurrentCell",
+        "title": "Add LLM Query",
+        "category": "LLM Kernel",
+        "icon": "$(add)"
+      },
+      {
+        "command": "llm-kernel.addLLMCell",
+        "title": "Add LLM Cell",
+        "category": "LLM Kernel",
+        "icon": "$(robot)"
+      },
+      {
+        "command": "llm-kernel.createNewLLMNotebook",
+        "title": "Create New LLM Notebook",
+        "category": "LLM Kernel",
+        "icon": "$(notebook)"
+      },
+      {
+        "command": "llm-kernel.toggleChatMode",
+        "title": "Toggle Chat Mode",
+        "category": "LLM Kernel",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "llm-kernel.enableChatMode",
+        "title": "Enable Chat Mode",
+        "category": "LLM Kernel",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "llm-kernel.disableChatMode",
+        "title": "Disable Chat Mode",
+        "category": "LLM Kernel",
+        "icon": "$(circle-slash)"
+      }
+    ],
+    "keybindings": [
+      {
+        "key": "ctrl+shift+l",
+        "command": "llm-kernel.queryInCurrentCell",
+        "when": "notebookEditorFocused && !inputFocus"
+      },
+      {
+        "key": "ctrl+shift+4",
+        "command": "llm-kernel.queryGPT4",
+        "when": "notebookEditorFocused && !inputFocus"
+      },
+      {
+        "key": "ctrl+shift+c",
+        "command": "llm-kernel.queryClaude",
+        "when": "notebookEditorFocused && !inputFocus"
+      },
+      {
+        "key": "ctrl+shift+p",
+        "command": "llm-kernel.pruneContext",
+        "when": "notebookEditorFocused"
+      },
+      {
+        "key": "ctrl+shift+m",
+        "command": "llm-kernel.switchModel",
+        "when": "notebookEditorFocused"
+      },
+      {
+        "key": "ctrl+shift+e",
+        "command": "llm-kernel.explainCurrentCell",
+        "when": "notebookEditorFocused"
+      },
+      {
+        "key": "ctrl+shift+r",
+        "command": "llm-kernel.refactorCurrentCell",
+        "when": "notebookEditorFocused"
+      },
+      {
+        "key": "ctrl+shift+enter",
+        "command": "runCommands",
+        "args": {
+          "commands": [
+            "llm-kernel.optimizeContext",
+            "llm-kernel.executeWithBestModel",
+            "llm-kernel.showAnalytics"
+          ]
+        },
+        "when": "notebookEditorFocused"
+      },
+      {
+        "key": "ctrl+shift+t",
+        "command": "llm-kernel.toggleChatMode",
+        "when": "notebookEditorFocused"
+      }
+    ],
+    "notebookRenderer": [
+      {
+        "id": "llm-response-renderer",
+        "displayName": "LLM Response Renderer",
+        "entrypoint": "./out/renderers/llmResponseRenderer.js",
+        "mimeTypes": [
+          "application/llm-response"
+        ],
+        "requiresMessaging": "optional"
+      },
+      {
+        "id": "llm-context-renderer",
+        "displayName": "LLM Context Visualization",
+        "entrypoint": "./out/renderers/contextRenderer.js",
+        "mimeTypes": [
+          "application/llm-context"
+        ],
+        "requiresMessaging": "optional"
+      },
+      {
+        "id": "llm-cell-renderer",
+        "displayName": "LLM Cell Renderer",
+        "entrypoint": "./out/renderers/llmCellRenderer.js",
+        "mimeTypes": [
+          "application/llm-cell"
+        ],
+        "requiresMessaging": "optional"
+      }
+    ],
+    "notebooks": [
+      {
+        "type": "jupyter-notebook",
+        "displayName": "Jupyter Notebook",
+        "selector": [
+          {
+            "filenamePattern": "*.ipynb"
+          }
+        ]
+      },
+      {
+        "type": "llm-notebook",
+        "displayName": "LLM Enhanced Notebook",
+        "selector": [
+          {
+            "filenamePattern": "*.llmnb"
+          }
+        ]
+      }
+    ],
+    "notebookSerializer": [
+      {
+        "viewType": "llm-notebook",
+        "displayName": "LLM Notebook",
+        "selector": [
+          {
+            "filenamePattern": "*.llmnb"
+          }
+        ]
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "llmKernelStatus",
+          "name": "LLM Kernel Status",
+          "icon": "$(pulse)",
+          "contextualTitle": "LLM Kernel"
+        },
+        {
+          "id": "llmContextTree",
+          "name": "Context Tree",
+          "icon": "$(list-tree)",
+          "contextualTitle": "LLM Context"
+        },
+        {
+          "id": "llmModelSelection",
+          "name": "Model Selection",
+          "icon": "$(gear)",
+          "contextualTitle": "LLM Models"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "llmKernelStatus",
+        "contents": "No LLM Kernel detected.\n[Set up LLM Kernel](command:llm-kernel.setupForWorkspace)"
+      }
+    ],
+    "configuration": {
+      "title": "LLM Kernel Universal",
+      "properties": {
+        "llm-kernel.repository": {
+          "type": "object",
+          "default": {
+            "owner": "your-username",
+            "repo": "LLMKernel",
+            "branch": "main"
+          },
+          "description": "GitHub repository for kernel bootstrap",
+          "properties": {
+            "owner": {
+              "type": "string",
+              "description": "Repository owner"
+            },
+            "repo": {
+              "type": "string",
+              "description": "Repository name"
+            },
+            "branch": {
+              "type": "string",
+              "description": "Branch to use"
+            }
+          }
+        },
+        "llm-kernel.autoInstall": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically install LLM kernel when extension loads"
+        },
+        "llm-kernel.autoUpdate": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically update kernel when new versions are available"
+        },
+        "llm-kernel.checkForUpdates": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check for kernel updates periodically"
+        },
+        "llm-kernel.updateChannel": {
+          "type": "string",
+          "enum": [
+            "stable",
+            "beta",
+            "dev"
+          ],
+          "default": "stable",
+          "description": "Update channel for kernel releases"
+        },
+        "llm-kernel.defaultModel": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "enum": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "claude-3-sonnet",
+            "claude-3-haiku",
+            "local-llama"
+          ],
+          "description": "Default LLM model to use"
+        },
+        "llm-kernel.contextStrategy": {
+          "type": "string",
+          "enum": [
+            "full",
+            "smart",
+            "minimal",
+            "custom"
+          ],
+          "default": "smart",
+          "description": "Context management strategy"
+        },
+        "llm-kernel.modelPreferences": {
+          "type": "object",
+          "default": {
+            "code": "gpt-4o",
+            "analysis": "claude-3-sonnet",
+            "creative": "gpt-4o",
+            "quick": "gpt-4o-mini"
+          },
+          "description": "Model preferences for different task types"
+        },
+        "llm-kernel.showCostWarnings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show warnings when queries exceed cost threshold"
+        },
+        "llm-kernel.costThreshold": {
+          "type": "number",
+          "default": 0.1,
+          "description": "Cost threshold for warnings (in USD)"
+        },
+        "llm-kernel.streamResponses": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stream LLM responses in real-time"
+        },
+        "llm-kernel.customRepositoryUrl": {
+          "type": "string",
+          "default": null,
+          "description": "Custom repository URL for enterprise installations"
+        }
+      }
+    },
+    "languages": [
+      {
+        "id": "llm-query",
+        "aliases": [
+          "LLM Query",
+          "llm"
+        ],
+        "extensions": [
+          ".llm"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "llm-query",
+        "scopeName": "source.llm",
+        "path": "./syntaxes/llm.tmLanguage.json"
+      }
+    ],
+    "menus": {
+      "notebook/toolbar": [
+        {
+          "command": "llm-kernel.switchModel",
+          "group": "navigation@1"
+        },
+        {
+          "command": "llm-kernel.showDashboard",
+          "group": "navigation@2"
+        }
+      ],
+      "notebook/cell/title": [
+        {
+          "command": "llm-kernel.explainCurrentCell",
+          "group": "inline@1",
+          "when": "notebookType == 'jupyter-notebook'"
+        },
+        {
+          "command": "llm-kernel.refactorCurrentCell",
+          "group": "inline@2",
+          "when": "notebookType == 'jupyter-notebook'"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.0.0",
+    "@types/mocha": "^10.0.0",
+    "@types/node": "16.x",
+    "@types/tar": "^6.1.13",
+    "@types/vscode": "^1.102.0",
+    "@types/vscode-notebook-renderer": "^1.72.0",
+    "@typescript-eslint/eslint-plugin": "^5.45.0",
+    "@typescript-eslint/parser": "^5.45.0",
+    "@vscode/test-electron": "^2.2.0",
+    "eslint": "^8.28.0",
+    "glob": "^8.0.3",
+    "mocha": "^10.1.0",
+    "typescript": "^4.9.3",
+    "vsce": "^2.15.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "node-fetch": "^3.3.0",
+    "semver": "^7.5.4",
+    "tar": "^6.2.0"
+  }
+}

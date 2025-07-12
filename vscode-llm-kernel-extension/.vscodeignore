@@ -1,0 +1,24 @@
+# The following files and directories should be ignored when packaging the extension for distribution
+.vscode/
+node_modules/
+dist/
+out/
+*.ts
+*.map
+*.test.ts
+*.spec.ts
+*.log
+*.json
+*.svg
+*.png
+*.jpg
+*.gif
+.DS_Store
+Thumbs.db
+.vscode-test/
+.vscodeignore
+README.md
+package-lock.json
+yarn.lock
+npm-debug.log
+yarn-error.log

@@ -1,0 +1,91 @@
+{
+  "label": "LLM Theme",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1E1E1E",
+    "editor.foreground": "#D4D4D4",
+    "editorCursor.foreground": "#AEAFAD",
+    "editor.lineHighlightBackground": "#2A2D2E",
+    "editorLineNumber.foreground": "#5A5A5A",
+    "editor.selectionBackground": "#264F78",
+    "editor.inactiveSelectionBackground": "#3A3D3E",
+    "activityBar.background": "#333333",
+    "activityBar.foreground": "#FFFFFF",
+    "activityBarBadge.background": "#007ACC",
+    "activityBarBadge.foreground": "#FFFFFF",
+    "sideBar.background": "#252526",
+    "sideBar.foreground": "#FFFFFF",
+    "statusBar.background": "#007ACC",
+    "statusBar.foreground": "#FFFFFF",
+    "titleBar.activeBackground": "#007ACC",
+    "titleBar.activeForeground": "#FFFFFF",
+    "titleBar.inactiveBackground": "#3C3C3C",
+    "titleBar.inactiveForeground": "#FFFFFF"
+  },
+  "tokenColors": [
+    {
+      "scope": [
+        "comment",
+        "comment.block.documentation"
+      ],
+      "settings": {
+        "foreground": "#6A9955"
+      }
+    },
+    {
+      "scope": [
+        "keyword",
+        "variable.language"
+      ],
+      "settings": {
+        "foreground": "#569CD6"
+      }
+    },
+    {
+      "scope": [
+        "variable",
+        "variable.parameter"
+      ],
+      "settings": {
+        "foreground": "#9CDCFE"
+      }
+    },
+    {
+      "scope": [
+        "string",
+        "string.quoted",
+        "string.template"
+      ],
+      "settings": {
+        "foreground": "#CE9178"
+      }
+    },
+    {
+      "scope": [
+        "constant",
+        "constant.numeric"
+      ],
+      "settings": {
+        "foreground": "#B5CEA8"
+      }
+    },
+    {
+      "scope": [
+        "entity.name.function",
+        "entity.name.method"
+      ],
+      "settings": {
+        "foreground": "#D19A66"
+      }
+    },
+    {
+      "scope": [
+        "entity.name.class",
+        "entity.name.type"
+      ],
+      "settings": {
+        "foreground": "#4EC9B0"
+      }
+    }
+  ]
+}
