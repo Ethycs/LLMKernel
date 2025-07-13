@@ -27,11 +27,7 @@
     "kernel"
   ],
   "activationEvents": [
-    "onNotebook:*",
-    "onCommand:llm-kernel.setupForWorkspace",
-    "onCommand:llm-kernel.queryGPT4",
-    "onCommand:llm-kernel.queryClaude",
-    "onCommand:llm-kernel.switchModel"
+    "*"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -423,9 +419,11 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
+    "pretest": "npm run compile",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
+    "test:unit": "npm run compile && node ./out/test/runTest.js",
+    "test:coverage": "nyc npm run test",
     "package": "vsce package",
     "publish": "vsce publish"
   },

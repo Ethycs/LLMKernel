@@ -1,0 +1,11 @@
+{
+    "remote.WSL.fileWatcher.polling": true,
+    "typescript.preferences.includePackageJsonAutoImports": "on",
+    "typescript.suggest.autoImports": true,
+    "files.watcherExclude": {
+        "**/node_modules/**": true,
+        "**/.git/**": true,
+        "**/out/**": true,
+        "**/.vscode-test/**": true
+    }
+}
