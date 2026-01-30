@@ -27,7 +27,7 @@ What's in this document?
 - **Automatic fallback**: Converts to images if native upload isn't supported
 - **Machine-readable output**: LLMs can read and analyze PDF content directly
 
-## 🚀 Installation
+## 🚀 Installation6
 
 ### Quick Start for VS Code Users
 

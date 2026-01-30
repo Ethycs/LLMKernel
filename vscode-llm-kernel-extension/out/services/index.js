@@ -1,9 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ApiService = exports.NotebookService = exports.KernelService = void 0;
-const kernelService_1 = require("./kernelService");
-Object.defineProperty(exports, "KernelService", { enumerable: true, get: function () { return kernelService_1.KernelService; } });
-const notebookService_1 = require("./notebookService");
-Object.defineProperty(exports, "NotebookService", { enumerable: true, get: function () { return notebookService_1.NotebookService; } });
-const apiService_1 = require("./apiService");
-Object.defineProperty(exports, "ApiService", { enumerable: true, get: function () { return apiService_1.ApiService; } });
+exports.LLMOverlayManager = exports.StatusBarManager = exports.KernelBootstrapper = void 0;
+var kernelBootstrapper_1 = require("./kernelBootstrapper");
+Object.defineProperty(exports, "KernelBootstrapper", { enumerable: true, get: function () { return kernelBootstrapper_1.KernelBootstrapper; } });
+var statusBarManager_1 = require("./statusBarManager");
+Object.defineProperty(exports, "StatusBarManager", { enumerable: true, get: function () { return statusBarManager_1.StatusBarManager; } });
+var llmOverlayManager_1 = require("./llmOverlayManager");
+Object.defineProperty(exports, "LLMOverlayManager", { enumerable: true, get: function () { return llmOverlayManager_1.LLMOverlayManager; } });

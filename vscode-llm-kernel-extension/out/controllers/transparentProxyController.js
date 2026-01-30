@@ -94,7 +94,8 @@ class TransparentProxyController {
         });
     }
     createProxyController(kernelSpec) {
-        const controller = vscode.notebooks.createNotebookController(kernelSpec.name, 'jupyter-notebook', kernelSpec.displayName);
+        const controller = vscode.notebooks.createNotebookController(kernelSpec.name, 'llm-notebook', // Only for .llmnb files — jupyter-notebook uses the real llm_kernel
+        kernelSpec.displayName);
         controller.supportedLanguages = [kernelSpec.language, 'llm-query'];
         controller.supportsExecutionOrder = true;
         controller.description = `${kernelSpec.displayName} with AI assistance`;

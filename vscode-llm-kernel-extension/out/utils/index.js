@@ -14,14 +14,5 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.registerUtilityCommands = void 0;
-const vscode_1 = require("vscode");
 __exportStar(require("./constants"), exports);
 __exportStar(require("./helpers"), exports);
-// Register utility commands
-function registerUtilityCommands() {
-    vscode_1.commands.registerCommand('extension.someUtilityCommand', () => {
-        // Implementation of the utility command
-    });
-}
-exports.registerUtilityCommands = registerUtilityCommands;

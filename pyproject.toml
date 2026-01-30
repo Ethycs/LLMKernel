@@ -191,6 +191,15 @@ test-markers = "pytest --markers"
 setup-test-env = "cp tests/.env.test .env.test && echo 'Test environment configured!'"
 clean-test = "rm -rf .pytest_cache htmlcov .coverage* report.html && echo 'Test artifacts cleaned!'"
 
+# Extension development tasks
+ext-install = { cmd = "npm install", cwd = "vscode-llm-kernel-extension" }
+ext-compile = { cmd = "npm run compile", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-install"] }
+ext-watch = { cmd = "npm run watch", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-install"] }
+ext-lint = { cmd = "npm run lint", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-install"] }
+ext-test = { cmd = "npm test", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-compile"] }
+ext-package = { cmd = "npm run package", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-compile"] }
+dev-setup = { cmd = "echo 'Development environment ready!'", depends-on = ["install-editable", "ext-install"] }
+
 [tool.pixi.feature.notebook.tasks]
 bootstrap = { cmd = "python -m llm_kernel.install install && echo 'LLM Kernel installed! Starting Jupyter Lab...' && jupyter lab", depends-on = [
     "install-editable",

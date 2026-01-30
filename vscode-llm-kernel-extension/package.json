@@ -27,7 +27,7 @@
     "kernel"
   ],
   "activationEvents": [
-    "*"
+    "onNotebook:jupyter-notebook"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -36,6 +36,12 @@
         "command": "llm-kernel.setupForWorkspace",
         "title": "Set up LLM Kernel for this workspace",
         "category": "LLM Kernel"
+      },
+      {
+        "command": "llm-kernel.queryInCurrentCell",
+        "title": "Add LLM Query",
+        "category": "LLM Kernel",
+        "icon": "$(add)"
       },
       {
         "command": "llm-kernel.queryGPT4",
@@ -54,6 +60,12 @@
         "title": "Switch LLM Model",
         "category": "LLM Kernel",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "llm-kernel.switchCellModel",
+        "title": "Switch Model for This Cell",
+        "category": "LLM Kernel",
+        "icon": "$(hubot)"
       },
       {
         "command": "llm-kernel.pruneContext",
@@ -86,12 +98,6 @@
         "icon": "$(dashboard)"
       },
       {
-        "command": "llm-kernel.queryInCurrentCell",
-        "title": "Add LLM Query",
-        "category": "LLM Kernel",
-        "icon": "$(add)"
-      },
-      {
         "command": "llm-kernel.addLLMCell",
         "title": "Add LLM Cell",
         "category": "LLM Kernel",
@@ -120,6 +126,114 @@
         "title": "Disable Chat Mode",
         "category": "LLM Kernel",
         "icon": "$(circle-slash)"
+      },
+      {
+        "command": "llm-kernel.toggleOverlay",
+        "title": "Toggle LLM Overlay",
+        "category": "LLM Kernel",
+        "icon": "$(layers)"
+      },
+      {
+        "command": "llm-kernel.showContext",
+        "title": "Show Context",
+        "category": "LLM Kernel",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "llm-kernel.resetContext",
+        "title": "Reset Context",
+        "category": "LLM Kernel",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "llm-kernel.saveContext",
+        "title": "Save Context",
+        "category": "LLM Kernel",
+        "icon": "$(save)"
+      },
+      {
+        "command": "llm-kernel.loadContext",
+        "title": "Load Context",
+        "category": "LLM Kernel",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "llm-kernel.showHistory",
+        "title": "Show History",
+        "category": "LLM Kernel",
+        "icon": "$(history)"
+      },
+      {
+        "command": "llm-kernel.mcpConnect",
+        "title": "MCP: Connect",
+        "category": "LLM Kernel",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "llm-kernel.mcpTools",
+        "title": "MCP: List Tools",
+        "category": "LLM Kernel",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "llm-kernel.mcpQuery",
+        "title": "MCP: Query",
+        "category": "LLM Kernel",
+        "icon": "$(search)"
+      },
+      {
+        "command": "llm-kernel.mcpConfig",
+        "title": "MCP: Configuration",
+        "category": "LLM Kernel",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "llm-kernel.pasteImage",
+        "title": "Paste Image to Context",
+        "category": "LLM Kernel",
+        "icon": "$(file-media)"
+      },
+      {
+        "command": "llm-kernel.addImage",
+        "title": "Add Image to Context",
+        "category": "LLM Kernel",
+        "icon": "$(file-media)"
+      },
+      {
+        "command": "llm-kernel.addPdf",
+        "title": "Add PDF to Context",
+        "category": "LLM Kernel",
+        "icon": "$(file-pdf)"
+      },
+      {
+        "command": "llm-kernel.visionQuery",
+        "title": "Vision Query",
+        "category": "LLM Kernel",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "llm-kernel.showCost",
+        "title": "Show Cost",
+        "category": "LLM Kernel",
+        "icon": "$(credit-card)"
+      },
+      {
+        "command": "llm-kernel.showTokenCount",
+        "title": "Show Token Count",
+        "category": "LLM Kernel",
+        "icon": "$(symbol-number)"
+      },
+      {
+        "command": "llm-kernel.showConfig",
+        "title": "Show Configuration",
+        "category": "LLM Kernel",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "llm-kernel.showContextWindow",
+        "title": "Show Context Window",
+        "category": "LLM Kernel",
+        "icon": "$(window)"
       }
     ],
     "keybindings": [
@@ -159,18 +273,6 @@
         "when": "notebookEditorFocused"
       },
       {
-        "key": "ctrl+shift+enter",
-        "command": "runCommands",
-        "args": {
-          "commands": [
-            "llm-kernel.optimizeContext",
-            "llm-kernel.executeWithBestModel",
-            "llm-kernel.showAnalytics"
-          ]
-        },
-        "when": "notebookEditorFocused"
-      },
-      {
         "key": "ctrl+shift+t",
         "command": "llm-kernel.toggleChatMode",
         "when": "notebookEditorFocused"
@@ -185,24 +287,6 @@
           "application/llm-response"
         ],
         "requiresMessaging": "optional"
-      },
-      {
-        "id": "llm-context-renderer",
-        "displayName": "LLM Context Visualization",
-        "entrypoint": "./out/renderers/contextRenderer.js",
-        "mimeTypes": [
-          "application/llm-context"
-        ],
-        "requiresMessaging": "optional"
-      },
-      {
-        "id": "llm-cell-renderer",
-        "displayName": "LLM Cell Renderer",
-        "entrypoint": "./out/renderers/llmCellRenderer.js",
-        "mimeTypes": [
-          "application/llm-cell"
-        ],
-        "requiresMessaging": "optional"
       }
     ],
     "notebooks": [
@@ -214,54 +298,15 @@
             "filenamePattern": "*.ipynb"
           }
         ]
-      },
-      {
-        "type": "llm-notebook",
-        "displayName": "LLM Enhanced Notebook",
-        "selector": [
-          {
-            "filenamePattern": "*.llmnb"
-          }
-        ]
       }
     ],
-    "notebookSerializer": [
+    "languages": [
       {
-        "viewType": "llm-notebook",
-        "displayName": "LLM Notebook",
-        "selector": [
-          {
-            "filenamePattern": "*.llmnb"
-          }
+        "id": "llm-kernel",
+        "aliases": [
+          "LLM Kernel",
+          "llm"
         ]
-      }
-    ],
-    "views": {
-      "explorer": [
-        {
-          "id": "llmKernelStatus",
-          "name": "LLM Kernel Status",
-          "icon": "$(pulse)",
-          "contextualTitle": "LLM Kernel"
-        },
-        {
-          "id": "llmContextTree",
-          "name": "Context Tree",
-          "icon": "$(list-tree)",
-          "contextualTitle": "LLM Context"
-        },
-        {
-          "id": "llmModelSelection",
-          "name": "Model Selection",
-          "icon": "$(gear)",
-          "contextualTitle": "LLM Models"
-        }
-      ]
-    },
-    "viewsWelcome": [
-      {
-        "view": "llmKernelStatus",
-        "contents": "No LLM Kernel detected.\n[Set up LLM Kernel](command:llm-kernel.setupForWorkspace)"
       }
     ],
     "configuration": {
@@ -321,9 +366,13 @@
           "enum": [
             "gpt-4o",
             "gpt-4o-mini",
+            "gpt-4.1",
+            "o3-mini",
             "claude-3-sonnet",
             "claude-3-haiku",
-            "local-llama"
+            "claude-3-5-sonnet",
+            "gemini-2.5-pro",
+            "ollama/llama3"
           ],
           "description": "Default LLM model to use"
         },
@@ -370,35 +419,22 @@
         }
       }
     },
-    "languages": [
-      {
-        "id": "llm-query",
-        "aliases": [
-          "LLM Query",
-          "llm"
-        ],
-        "extensions": [
-          ".llm"
-        ],
-        "configuration": "./language-configuration.json"
-      }
-    ],
-    "grammars": [
-      {
-        "language": "llm-query",
-        "scopeName": "source.llm",
-        "path": "./syntaxes/llm.tmLanguage.json"
-      }
-    ],
     "menus": {
       "notebook/toolbar": [
         {
+          "command": "llm-kernel.addLLMCell",
+          "group": "navigation@0",
+          "when": "notebookType == 'jupyter-notebook'"
+        },
+        {
           "command": "llm-kernel.switchModel",
-          "group": "navigation@1"
+          "group": "navigation@1",
+          "when": "notebookType == 'jupyter-notebook'"
         },
         {
           "command": "llm-kernel.showDashboard",
-          "group": "navigation@2"
+          "group": "navigation@2",
+          "when": "notebookType == 'jupyter-notebook'"
         }
       ],
       "notebook/cell/title": [
@@ -444,8 +480,6 @@
     "vsce": "^2.15.0"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "node-fetch": "^3.3.0",
     "semver": "^7.5.4",
     "tar": "^6.2.0"
   }

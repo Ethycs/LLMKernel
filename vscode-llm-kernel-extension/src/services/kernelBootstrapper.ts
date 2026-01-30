@@ -54,14 +54,27 @@ export class KernelBootstrapper {
     }
 
     async isKernelInstalled(): Promise<boolean> {
+        // Check if installed in global storage (remote/release install)
         try {
             await fs.access(this.kernelDir);
             const kernelFile = path.join(this.kernelDir, 'llm_kernel.py');
             await fs.access(kernelFile);
             return true;
         } catch {
-            return false;
+            // Not in global storage
         }
+
+        // Check if kernel is registered with Jupyter (covers local editable install)
+        try {
+            const { stdout } = await execAsync('jupyter kernelspec list');
+            if (stdout.toLowerCase().includes('llm_kernel') || stdout.toLowerCase().includes('llm-kernel')) {
+                return true;
+            }
+        } catch {
+            // jupyter not found or failed
+        }
+
+        return false;
     }
 
     async bootstrapFromRepository(): Promise<void> {
@@ -93,6 +106,96 @@ export class KernelBootstrapper {
                 );
             } catch (error) {
                 this.outputChannel.appendLine(`Bootstrap failed: ${error}`);
+                this.outputChannel.show();
+                throw error;
+            }
+        });
+    }
+
+    /**
+     * Check if we're in local development mode.
+     * True when the workspace contains llm_kernel/ and pyproject.toml,
+     * indicating the monorepo is open and we can install from local source.
+     */
+    async isLocalDevelopment(): Promise<boolean> {
+        const repoRoot = await this.getLocalRepoRoot();
+        return repoRoot !== null;
+    }
+
+    /**
+     * Get the root path of the monorepo workspace containing llm_kernel/.
+     * Returns null if not in local development mode.
+     */
+    async getLocalRepoRoot(): Promise<string | null> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return null;
+        }
+
+        for (const folder of workspaceFolders) {
+            const localKernelPath = path.join(folder.uri.fsPath, 'llm_kernel');
+            const pyprojectPath = path.join(folder.uri.fsPath, 'pyproject.toml');
+            try {
+                await fs.access(localKernelPath);
+                await fs.access(pyprojectPath);
+                return folder.uri.fsPath;
+            } catch {
+                continue;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Bootstrap the kernel from local source code.
+     * Uses pip install -e . for editable install, then registers the kernel spec.
+     */
+    async bootstrapFromLocal(): Promise<void> {
+        const repoRoot = await this.getLocalRepoRoot();
+        if (!repoRoot) {
+            throw new Error('Local repository root not found');
+        }
+
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Installing LLM Kernel from local source...",
+            cancellable: false
+        }, async (progress) => {
+            try {
+                const pythonPath = await this.findPythonPath();
+
+                progress.report({ increment: 20, message: "Installing in editable mode..." });
+                this.outputChannel.appendLine(`Installing from local source: ${repoRoot}`);
+
+                // Run pip install -e . from the repo root
+                const { stdout, stderr } = await execAsync(
+                    `"${pythonPath}" -m pip install -e .`,
+                    { cwd: repoRoot }
+                );
+                this.outputChannel.appendLine(stdout);
+                if (stderr) {
+                    this.outputChannel.appendLine(`Warnings: ${stderr}`);
+                }
+
+                progress.report({ increment: 60, message: "Registering kernel with Jupyter..." });
+
+                // Use the kernel's own install module to register the kernel spec
+                const { stdout: installOut, stderr: installErr } = await execAsync(
+                    `"${pythonPath}" -m llm_kernel.install install --user`,
+                    { cwd: repoRoot }
+                );
+                this.outputChannel.appendLine(installOut);
+                if (installErr) {
+                    this.outputChannel.appendLine(`Warnings: ${installErr}`);
+                }
+
+                progress.report({ increment: 100, message: "Local installation complete!" });
+
+                vscode.window.showInformationMessage(
+                    'LLM Kernel installed from local source (editable mode). Changes to llm_kernel/ take effect immediately.'
+                );
+            } catch (error) {
+                this.outputChannel.appendLine(`Local bootstrap failed: ${error}`);
                 this.outputChannel.show();
                 throw error;
             }
@@ -279,13 +382,15 @@ export class KernelBootstrapper {
     private async findPythonPath(): Promise<string> {
         // Try multiple methods to find Python
         const pythonCommands = ['python3', 'python', 'py'];
-        
+        const whichCommand = process.platform === 'win32' ? 'where' : 'which';
+
         for (const cmd of pythonCommands) {
             try {
                 const { stdout } = await execAsync(`${cmd} --version`);
                 if (stdout.includes('Python')) {
-                    const { stdout: pythonPath } = await execAsync(`which ${cmd}` || `where ${cmd}`);
-                    return pythonPath.trim();
+                    const { stdout: pythonPath } = await execAsync(`${whichCommand} ${cmd}`);
+                    // 'where' on Windows may return multiple lines; take the first
+                    return pythonPath.trim().split(/\r?\n/)[0].trim();
                 }
             } catch {
                 continue;
@@ -295,9 +400,13 @@ export class KernelBootstrapper {
         // Try VS Code's Python extension
         const pythonExtension = vscode.extensions.getExtension('ms-python.python');
         if (pythonExtension) {
-            const pythonPath = await pythonExtension.exports.settings.getExecutionDetails().execCommand;
-            if (pythonPath) {
-                return pythonPath[0];
+            try {
+                const pythonPath = await pythonExtension.exports.settings.getExecutionDetails().execCommand;
+                if (pythonPath) {
+                    return pythonPath[0];
+                }
+            } catch {
+                // Python extension API may have changed
             }
         }
 

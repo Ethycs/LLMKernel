@@ -1,9 +1,3 @@
-import { KernelService } from './kernelService';
-import { NotebookService } from './notebookService';
-import { ApiService } from './apiService';
-
-export {
-    KernelService,
-    NotebookService,
-    ApiService
-};
+export { KernelBootstrapper } from './kernelBootstrapper';
+export { StatusBarManager } from './statusBarManager';
+export { LLMOverlayManager } from './llmOverlayManager';

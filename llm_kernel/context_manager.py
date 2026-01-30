@@ -347,6 +347,18 @@ class ContextManager:
         if max_cells is not None:
             self.max_context_cells = max_cells
     
+    def get_window_usage(self) -> float:
+        """Get the percentage of the context window currently used."""
+        if self.max_context_tokens <= 0:
+            return 0.0
+        total_tokens = sum(self.estimate_tokens(ex) for ex in self.conversation_history)
+        return min(100.0, (total_tokens / self.max_context_tokens) * 100)
+
+    def clear(self):
+        """Clear all conversation history and reset tracking state."""
+        self.conversation_history.clear()
+        self.execution_tracker = ExecutionTracker()
+
     def get_context_stats(self) -> Dict[str, Any]:
         """Get statistics about current context."""
         return {

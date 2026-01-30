@@ -179,7 +179,10 @@ class LLMKernel(IPythonKernel):
         self.log.handlers = []
         
         # File handler for debug logging
-        log_file = os.getenv('LLM_KERNEL_LOG_FILE', 'llm_kernel.log')
+        default_log_dir = os.path.join(os.path.expanduser('~'), '.llm-kernel')
+        os.makedirs(default_log_dir, exist_ok=True)
+        default_log_file = os.path.join(default_log_dir, 'llm_kernel.log')
+        log_file = os.getenv('LLM_KERNEL_LOG_FILE', default_log_file)
         file_handler = logging.FileHandler(log_file, mode='a')
         file_handler.setLevel(getattr(logging, log_level, logging.INFO))
         

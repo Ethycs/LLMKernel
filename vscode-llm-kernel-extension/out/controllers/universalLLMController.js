@@ -37,17 +37,16 @@ const vscode = __importStar(require("vscode"));
 class UniversalLLMController {
     constructor() {
         this._executionOrder = 0;
-        this._controller = vscode.notebooks.createNotebookController('llm-universal-controller', 'jupyter-notebook', // Works with standard Jupyter notebooks
+        this._controller = vscode.notebooks.createNotebookController('llm-universal-controller', 'llm-notebook', // Only for .llmnb files — jupyter-notebook uses the real llm_kernel
         'Universal LLM Controller');
         this._controller.supportedLanguages = [
             'python', 'javascript', 'typescript', 'r', 'julia', 'scala', 'java',
             'rust', 'go', 'sql', 'markdown', 'llm-query'
         ];
         this._controller.supportsExecutionOrder = true;
-        this._controller.description = 'Execute code with any kernel + LLM queries without kernel dependencies';
-        this._controller.detail = 'Works standalone or overlays existing kernels. Use %%llm for AI queries.';
+        this._controller.description = 'Standalone LLM controller for .llmnb notebooks';
+        this._controller.detail = 'For .ipynb files, select LLM Kernel from the Jupyter kernel picker instead.';
         this._controller.executeHandler = this._execute.bind(this);
-        // Make it appear as a lightweight option
         this._controller.label = 'Universal (Code + LLM)';
     }
     _execute(cells, notebook, controller) {
