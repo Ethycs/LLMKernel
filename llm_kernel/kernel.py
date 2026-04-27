@@ -158,6 +158,26 @@ class LLMKernel(IPythonKernel):
         self.log.info(f"Active model: {self.active_model}")
         self.log.info(f"Available models: {list(self.llm_clients.keys())}")
 
+        # Stage 2 Track B3 — opt-in paper-telephone subsystems.
+        self._init_llmnb_subsystems_if_enabled()
+
+    def _init_llmnb_subsystems_if_enabled(self):
+        """Wire B1 + B2 + B3 subsystems if ``LLMKERNEL_LLMNB_ENABLED=1``.
+
+        Defaults off so existing LLMKernel users are unaffected. When
+        enabled, attaches a :class:`CustomMessageDispatcher`, a
+        :class:`RunTracker`, and an :class:`OperatorBridgeServer` via
+        :func:`llm_kernel._kernel_hooks.attach_kernel_subsystems`.
+        """
+        if os.environ.get("LLMKERNEL_LLMNB_ENABLED", "0") != "1":
+            return
+        try:
+            from ._kernel_hooks import attach_kernel_subsystems
+            attach_kernel_subsystems(self)
+            self.log.info("LLMNB subsystems attached (dispatcher + run-tracker + bridge)")
+        except Exception as exc:  # pragma: no cover - defensive
+            self.log.warning(f"LLMNB subsystem init failed: {exc}")
+
     def setup_logging(self):
         """Configure logging for the kernel."""
         # Check if logging is disabled
@@ -636,6 +656,13 @@ class LLMKernel(IPythonKernel):
 
     def do_shutdown(self, restart):
         """Clean shutdown of kernel."""
+        # Stage 2 Track B3 dispatcher cleanup (no-op when not attached).
+        dispatcher = getattr(self, '_llmnb_dispatcher', None)
+        if dispatcher is not None:
+            try:
+                dispatcher.stop()
+            except Exception:
+                pass
         # Disconnect from MCP servers
         if hasattr(self, 'mcp_manager') and self.mcp_manager:
             try:
