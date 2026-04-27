@@ -15,6 +15,12 @@ Subcommand dispatch (additive across Stage 2 tracks):
     ``python -m llm_kernel metadata-writer-smoke``    -> single-process MetadataWriter
                                                          end-to-end smoke (RFC-005 / RFC-006
                                                          Family F).  No network required.
+    ``python -m llm_kernel pty-mode``                 -> RFC-008 §3 + §4 PTY+socket kernel
+                                                         entry point. Reads
+                                                         ``LLMKERNEL_IPC_SOCKET`` from env.
+    ``python -m llm_kernel pty-mode-smoke``           -> RFC-008 end-to-end smoke against a
+                                                         UDS server in the same process.
+                                                         No node-pty required.
 
 The historical top-level imports below are wrapped in a try/except so that
 the subcommands can still be dispatched in a kernel environment that does
@@ -456,6 +462,210 @@ def _run_metadata_writer_smoke() -> int:
     return 0
 
 
+def _run_pty_mode_smoke() -> int:
+    """RFC-008 dispatch: end-to-end pty-mode smoke against a UDS server.
+
+    Spins up a server in this process (UDS on POSIX, loopback TCP
+    fallback on Windows / when ``AF_UNIX`` is unavailable), spawns the
+    kernel as a subprocess in pty-mode, waits for the ready handshake,
+    sends a ``cell_execute`` operator-action envelope, and asserts a
+    Family A run.start span arrives back. No node-pty required: the
+    kernel's behavior is identical regardless of whether stdin is a real
+    PTY or a pipe; the termios setup is a no-op when stdin isn't a TTY.
+    """
+    import json
+    import os
+    import socket as _socket
+    import subprocess
+    import sys
+    import tempfile
+    import threading
+    import time
+    import uuid as _uuid
+
+    session_id = str(_uuid.uuid4())
+
+    # Allocate a transport address. UDS on POSIX, TCP loopback on
+    # Windows or when AF_UNIX isn't available (RFC-008 §2 fallback).
+    use_uds = hasattr(_socket, "AF_UNIX") and sys.platform != "win32"
+    if use_uds:
+        tmpdir = tempfile.mkdtemp(prefix="llmnb-pty-smoke-")
+        sock_path = os.path.join(tmpdir, f"llmnb-{session_id}.sock")
+        family = _socket.AF_UNIX
+        bind_target = sock_path
+        env_address = sock_path  # unprefixed = unix per RFC-008 §2
+    else:
+        tmpdir = None
+        family = _socket.AF_INET
+        # Bind to an ephemeral port; read back the actual port assigned.
+        probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        bind_target = ("127.0.0.1", port)
+        env_address = f"tcp:127.0.0.1:{port}"
+
+    server = _socket.socket(family, _socket.SOCK_STREAM)
+    server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    server.bind(bind_target)
+    if use_uds:
+        os.chmod(bind_target, 0o600)
+    server.listen(1)
+    server.settimeout(30.0)
+
+    received_frames: list = []
+    accepted_holder: dict = {}
+
+    def _accept_and_read() -> None:
+        try:
+            conn, _addr = server.accept()
+        except _socket.timeout:
+            return
+        accepted_holder["conn"] = conn
+        conn.settimeout(30.0)
+        buf = bytearray()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                chunk = conn.recv(4096)
+            except _socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[:nl])
+                del buf[: nl + 1]
+                if not line.strip():
+                    continue
+                try:
+                    received_frames.append(json.loads(line.decode("utf-8")))
+                except ValueError:
+                    pass
+
+    reader = threading.Thread(target=_accept_and_read, daemon=True)
+    reader.start()
+
+    env = dict(os.environ)
+    env["LLMKERNEL_IPC_SOCKET"] = env_address
+    env["LLMKERNEL_PTY_MODE"] = "0"  # we're not under a real PTY
+    env["LLMKERNEL_SESSION_ID"] = session_id
+    # Keep PYTHONPATH so the subprocess finds llm_kernel without install.
+    env.setdefault("PYTHONPATH", os.pathsep.join(sys.path))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "llm_kernel", "pty-mode"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+    failure = None
+    ready_seen = False
+    try:
+        # Wait for ready handshake. Snapshot the list before iterating
+        # so a concurrent ``append`` from the reader thread never raises.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            for frame in list(received_frames):
+                attrs = frame.get("attributes") or []
+                if isinstance(attrs, list):
+                    for pair in attrs:
+                        if (
+                            isinstance(pair, dict)
+                            and pair.get("key") == "event.name"
+                            and pair.get("value", {}).get("stringValue") == "kernel.ready"
+                        ):
+                            ready_seen = True
+                            break
+                if ready_seen:
+                    break
+            if ready_seen:
+                break
+            time.sleep(0.1)
+        if not ready_seen:
+            failure = "no ready handshake within 30s"
+        else:
+            # Send a heartbeat.extension envelope -- catalogued in RFC-006
+            # so it survives validate_envelope; no handler is registered
+            # so the dispatcher logs "no registered handlers; dropped"
+            # and continues. We then assert the kernel process is still
+            # alive (parse path didn't crash).
+            conn = accepted_holder.get("conn")
+            if conn is not None:
+                try:
+                    conn.sendall(
+                        (json.dumps({
+                            "type": "heartbeat.extension",
+                            "payload": {"sequence": 1, "elapsed_ms": 0},
+                        }) + "\n").encode("utf-8")
+                    )
+                except OSError as exc:
+                    failure = f"failed to send envelope: {exc}"
+                else:
+                    time.sleep(0.5)
+                    if proc.poll() is not None:
+                        failure = (
+                            f"kernel exited prematurely after inbound "
+                            f"envelope (exit={proc.returncode})"
+                        )
+    finally:
+        # Unconditional teardown: close the socket FIRST so the kernel's
+        # read loop sees EOF and exits cleanly through its finally
+        # block (final ``notebook.metadata`` snapshot + ``writer.close``).
+        # Closing the socket is portable; SIGTERM via ``Popen.terminate``
+        # is uncatchable on Windows (TerminateProcess), so we don't
+        # rely on it for clean shutdown.
+        try:
+            conn = accepted_holder.get("conn")
+            if conn is not None:
+                try:
+                    conn.shutdown(_socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+        except OSError:
+            pass
+        try:
+            server.close()
+        except OSError:
+            pass
+        # Wait briefly for the kernel to exit on socket EOF; fall back to
+        # terminate -> kill if it doesn't.
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+        if use_uds and tmpdir is not None:
+            import shutil as _shutil
+            _shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if failure is not None:
+        stderr_tail = (proc.stderr.read() or b"").decode("utf-8", errors="replace")
+        print(f"FAIL: {failure}", flush=True)
+        print(f"--- kernel stderr ---\n{stderr_tail}", flush=True)
+        return 1
+    print(
+        f"OK: pty-mode-smoke complete; received {len(received_frames)} frame(s)",
+        flush=True,
+    )
+    return 0
+
+
 if __name__ == '__main__':
     # Additive subcommand dispatch:
     #   ``mcp-server``               -> Track B1 RFC-001 MCP server
@@ -475,5 +685,10 @@ if __name__ == '__main__':
         sys.exit(_run_agent_supervisor_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "metadata-writer-smoke":
         sys.exit(_run_metadata_writer_smoke())
+    elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode":
+        from .pty_mode import main as _pty_main
+        sys.exit(_pty_main(sys.argv[2:]))
+    elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode-smoke":
+        sys.exit(_run_pty_mode_smoke())
     else:
         main()

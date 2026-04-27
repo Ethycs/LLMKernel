@@ -18,21 +18,26 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextvars
+import json as _json
 import logging
 import os
+import shutil
+import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
 from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 
-from ._rfc_schemas import TOOL_CATALOG
+from ._rfc_schemas import TOOL_CATALOG, validate_tool_input
 from .run_tracker import RunTracker
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -59,6 +64,33 @@ _active_run_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 #: Default timeout (seconds) for operator round-trip approvals; RFC-001
 #: §Failure modes prescribes -32002 on timeout.
 DEFAULT_APPROVAL_TIMEOUT_SEC: float = 30.0
+
+#: JSON-RPC error codes per RFC-001 §"Common conventions".
+JSONRPC_SCHEMA_VALIDATION: int = -32001
+JSONRPC_OPERATOR_TIMEOUT: int = -32002
+JSONRPC_OPERATOR_DENIED: int = -32003
+JSONRPC_EXTENSION_UNREACHABLE: int = -32004
+JSONRPC_PROXIED_REFUSED: int = -32005
+JSONRPC_PROXIED_IO_FAILURE: int = -32006
+
+#: RFC-001 §escalate flood threshold; >5 critical/60s rate-limits.
+ESCALATE_FLOOD_MAX: int = 5
+ESCALATE_FLOOD_WINDOW_SEC: float = 60.0
+
+#: RFC-001 §notify rate-limit; max 10 notify/zone/60s window.
+NOTIFY_RATE_LIMIT_MAX: int = 10
+NOTIFY_RATE_LIMIT_WINDOW_SEC: float = 60.0
+
+#: Default proxied-tool blob threshold (bytes).  Inline strings up to
+#: this size; blob-extract above it.  V1 returns inline up to the cap
+#: and truncates beyond -- blob extraction is a V1.1 deferral.
+DEFAULT_BLOB_THRESHOLD_BYTES: int = 65536
+
+#: Maximum subprocess stdout/stderr size returned inline.  Anything
+#: beyond is truncated -- per RFC-001 §run_command, the kernel MUST
+#: capture stdout/stderr verbatim, but V1 ships truncation since blob
+#: extraction is deferred to V1.1 (see TODO below).
+DEFAULT_RUN_COMMAND_OUTPUT_CAP_BYTES: int = 65536
 
 
 def _utc_now_iso() -> str:
@@ -132,6 +164,25 @@ class OperatorBridgeServer:
         # ``approval_response`` lands at the dispatcher.
         self._pending_lock: threading.Lock = threading.Lock()
         self._pending_responses: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+
+        # Rate-limit / flood-detection state per RFC-001 §"Failure modes".
+        # Keyed by (zone_id, tool_name) -> deque of monotonic timestamps.
+        # Engineering Guide §11.7: this is a non-reentrant Lock; we MUST
+        # NOT call logger.* inside ``with self._rate_lock:``; log AFTER
+        # releasing.  The non-reentrant choice is intentional: a deadlock
+        # under a stray re-entrance is louder than a silent corruption.
+        self._rate_lock: threading.Lock = threading.Lock()
+        self._rate_state: Dict[Tuple[str, str], Deque[float]] = {}
+        # Per-task report_completion guard: zone_id -> set of seen task_ids.
+        self._completion_seen: Dict[str, set] = {}
+        # Per-zone present idempotency cache: zone_id -> {artifact_id: result}.
+        self._present_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # Optional reference to a metadata writer (set externally by the
+        # kernel hook layer); used by ``drift_acknowledged``. Defaults to
+        # None; the operator-action handler also probes the kernel's
+        # ``user_ns`` per RFC-006 §6.
+        self.metadata_writer: Optional[Any] = None
+        self.kernel: Optional[Any] = None
         self._handlers: Dict[str, ToolHandler] = {
             "ask": self._handle_ask,
             "clarify": self._handle_clarify,
@@ -160,8 +211,9 @@ class OperatorBridgeServer:
 
         The ``call_tool`` handler is hand-rolled so unknown tool names
         raise :class:`McpError` with ``code = types.METHOD_NOT_FOUND``
-        per RFC-001 §Failure modes, and ``NotImplementedError`` from
-        proxied-tool stubs propagates for the contract test to assert.
+        per RFC-001 §Failure modes, malformed inputs raise -32001 from
+        :func:`validate_tool_input`, and proxied-tool failures raise
+        -32005 / -32006 directly.
         """
 
         @self.server.list_tools()
@@ -198,6 +250,24 @@ class OperatorBridgeServer:
                         data={"tool_name": tool_name, "agent_id": self.agent_id},
                     )
                 )
+            # RFC-001 §Common conventions: validate inputs against the
+            # tool's input schema BEFORE dispatching.  Surface -32001
+            # with a JSON-Pointer-shaped error string.  No run record
+            # beyond the synthesized run.start/run.error pair the
+            # tracker would emit on exception -- we raise McpError
+            # directly so the agent sees the JSON-RPC error code.
+            validation_error = validate_tool_input(tool_name, arguments)
+            if validation_error is not None:
+                raise McpError(
+                    types.ErrorData(
+                        code=JSONRPC_SCHEMA_VALIDATION,
+                        message=validation_error,
+                        data={
+                            "tool_name": tool_name,
+                            "agent_id": self.agent_id,
+                        },
+                    )
+                )
             # When a Track B2 run-tracker is wired in, route the run
             # lifecycle through it so the RFC-003 envelopes flow to the
             # extension via Track B3's sink (the
@@ -217,6 +287,24 @@ class OperatorBridgeServer:
                     metadata={"tool.name": tool_name},
                 )
                 token = _active_run_id.set(run_id)
+                # Per RFC-001 §"Native tools" the proxied trio emits a
+                # ``tool_call`` event between ``run.start`` and the
+                # handler's return.  We emit it for the three proxied
+                # tools as their lifecycle is the closest analogue to
+                # the wire-form RFC documents.
+                _is_proxied = tool_name in ("read_file", "write_file", "run_command")
+                if _is_proxied:
+                    try:
+                        self.run_tracker.event(
+                            run_id, "tool_call",
+                            {
+                                "tool.name": tool_name,
+                                "input.value": _json.dumps(arguments, default=str),
+                                "input.mime_type": "application/json",
+                            },
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("failed to emit tool_call event")
                 try:
                     result = await handler(arguments)
                 except Exception as exc:
@@ -236,6 +324,18 @@ class OperatorBridgeServer:
                     _active_run_id.reset(token)
                 result.setdefault("_rfc_version", RFC_001_VERSION)
                 result.setdefault("run_id", run_id)
+                if _is_proxied:
+                    try:
+                        self.run_tracker.event(
+                            run_id, "tool_result",
+                            {
+                                "tool.name": tool_name,
+                                "output.value": _json.dumps(result, default=str),
+                                "output.mime_type": "application/json",
+                            },
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("failed to emit tool_result event")
                 self.run_tracker.complete_run(run_id, outputs=dict(result))
             else:
                 # Track B1 fallback (no run_tracker): allocate an OTLP
@@ -359,32 +459,338 @@ class OperatorBridgeServer:
                 self._pending_responses.pop(run_id, None)
 
     def _route_operator_action(self, envelope: Dict[str, Any]) -> None:
-        """Inbound handler for ``operator.action``.
+        """Inbound handler for ``operator.action`` per RFC-006 §6.
 
-        Resolves the per-run pending future when the envelope's
-        ``action_type`` is ``approval_response`` and its
-        ``parameters.request_id`` matches an awaited run_id. Other
-        action types (``cell_edit``, ``branch_switch``, etc.) are
-        logged and ignored at this layer; future tracks add per-type
-        routing.
+        Dispatches on ``payload.action_type``:
+
+        * ``approval_response`` — resolve the per-run pending future.
+        * ``cell_edit`` — log INFO; V1 does not mutate kernel state.
+        * ``branch_switch`` — log INFO with the branch name.
+        * ``zone_select`` — log INFO; renderers may use this later.
+        * ``dismiss_notification`` — log INFO; mark the corresponding
+          span as ``llmnb.dismissed`` if traceable via correlation_id.
+        * ``drift_acknowledged`` — call
+          :meth:`MetadataWriter.acknowledge_drift`.
+        * Unknown action types — log warning, do not raise (V1.5+
+          forward-compat).
         """
         payload = envelope.get("payload") or {}
-        if payload.get("action_type") != "approval_response":
-            logger.debug(
-                "operator.action %s ignored at mcp_server layer",
-                payload.get("action_type"),
+        action_type = payload.get("action_type")
+        params = payload.get("parameters") or {}
+
+        if action_type == "approval_response":
+            request_id = params.get("request_id")
+            if not request_id:
+                return
+            with self._pending_lock:
+                future = self._pending_responses.pop(request_id, None)
+            if future is None or future.done():
+                return
+            loop = future.get_loop()
+            loop.call_soon_threadsafe(future.set_result, dict(params))
+            return
+
+        if action_type == "cell_edit":
+            logger.info(
+                "operator.cell_edit",
+                extra={
+                    "event.name": "operator.cell_edit",
+                    "rfc": "RFC-006",
+                    "parameters": params,
+                    "originating_cell_id": payload.get("originating_cell_id"),
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
             )
             return
-        params = payload.get("parameters") or {}
-        request_id = params.get("request_id")
-        if not request_id:
+
+        if action_type == "agent_spawn":
+            # RFC-006 §6 v2.0.3 additive: extension's parsed `/spawn` directive
+            # arrives here; we delegate to AgentSupervisor.spawn(...) so the
+            # agent runs and emits Family A spans back to the extension's
+            # executing cell. The cell_id flows through as part of the
+            # supervisor's spawn record so future per-cell correlation is
+            # possible (V1 relies on the controller's "only-inflight" cell
+            # fallback in findExecForCorrelation).
+            agent_id = params.get("agent_id")
+            task = params.get("task")
+            cell_id = params.get("cell_id") or payload.get("originating_cell_id")
+            if not agent_id or not task:
+                logger.warning(
+                    "agent_spawn missing required parameters; agent_id=%r task=%r",
+                    agent_id, task,
+                )
+                return
+            supervisor = self._resolve_agent_supervisor()
+            if supervisor is None:
+                logger.warning(
+                    "agent_spawn received but no AgentSupervisor is attached"
+                )
+                return
+            spawn_method = getattr(supervisor, "spawn", None)
+            if not callable(spawn_method):
+                logger.warning(
+                    "agent_spawn: attached AgentSupervisor does not implement spawn"
+                )
+                return
+            try:
+                spawn_method(
+                    zone_id=self.zone_id,
+                    agent_id=agent_id,
+                    task=task,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "agent_spawn: supervisor.spawn raised; agent_id=%s", agent_id,
+                )
+                # Emit a synthetic terminal Family A span so the
+                # extension's cell exec completes with STATUS_CODE_ERROR
+                # instead of hanging until the PtyKernelClient's 60s
+                # timeout. The error message is surfaced as the span's
+                # status.message and as an llmnb.emit_content attribute
+                # on a single-event agent_emit-shaped span.
+                self._emit_agent_spawn_error_span(
+                    agent_id=agent_id, cell_id=cell_id, error=str(exc),
+                )
+                return
+            logger.info(
+                "operator.agent_spawn",
+                extra={
+                    "event.name": "operator.agent_spawn",
+                    "rfc": "RFC-006",
+                    "llmnb.spawned_agent_id": agent_id,
+                    "llmnb.cell_id": cell_id,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
             return
-        with self._pending_lock:
-            future = self._pending_responses.pop(request_id, None)
-        if future is None or future.done():
+
+        if action_type == "branch_switch":
+            new_branch = params.get("new_branch") or params.get("branch")
+            logger.info(
+                "operator.branch_switch",
+                extra={
+                    "event.name": "operator.branch_switch",
+                    "rfc": "RFC-006",
+                    "new_branch": new_branch,
+                    "parameters": params,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
             return
-        loop = future.get_loop()
-        loop.call_soon_threadsafe(future.set_result, dict(params))
+
+        if action_type == "zone_select":
+            logger.info(
+                "operator.zone_select",
+                extra={
+                    "event.name": "operator.zone_select",
+                    "rfc": "RFC-006",
+                    "selected_zone_id": params.get("zone_id"),
+                    "parameters": params,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
+        if action_type == "dismiss_notification":
+            notification_id = params.get("notification_id") or params.get("id")
+            correlation_id = (
+                envelope.get("correlation_id")
+                or params.get("correlation_id")
+            )
+            logger.info(
+                "operator.dismiss_notification",
+                extra={
+                    "event.name": "operator.dismiss_notification",
+                    "rfc": "RFC-006",
+                    "notification_id": notification_id,
+                    "correlation_id": correlation_id,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            # Best-effort: if the span is still open, mark it dismissed
+            # so the operator surface can surface the dismissal in the
+            # cell output.  A closed span is left as-is (replay-safe).
+            if self.run_tracker is not None and correlation_id:
+                try:
+                    span = self.run_tracker.get_run(correlation_id)
+                except KeyError:
+                    span = None
+                if span is not None and span.endTimeUnixNano is None:
+                    try:
+                        from ._attrs import decode_attrs, encode_attrs
+                        attrs = decode_attrs(list(span.attributes))
+                        attrs["llmnb.dismissed"] = True
+                        span.attributes = encode_attrs(attrs)
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("failed to mark span dismissed")
+            return
+
+        if action_type == "drift_acknowledged":
+            field_path = params.get("field_path")
+            detected_at = params.get("detected_at")
+            writer = self._resolve_metadata_writer()
+            if writer is None:
+                logger.warning(
+                    "drift_acknowledged received but no MetadataWriter is attached "
+                    "(field_path=%s)", field_path,
+                )
+                return
+            ack = getattr(writer, "acknowledge_drift", None)
+            if not callable(ack):
+                logger.warning(
+                    "drift_acknowledged: attached MetadataWriter does not implement "
+                    "acknowledge_drift; field_path=%s", field_path,
+                )
+                return
+            try:
+                result = ack(field_path, detected_at)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "drift_acknowledged: acknowledge_drift raised; field_path=%s",
+                    field_path,
+                )
+                return
+            logger.info(
+                "operator.drift_acknowledged",
+                extra={
+                    "event.name": "operator.drift_acknowledged",
+                    "rfc": "RFC-005",
+                    "field_path": field_path,
+                    "detected_at": detected_at,
+                    "matched": bool(result),
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
+        # Unknown action_type: forward-compat log (V1.5+ may add new
+        # action types).  Per the brief: do not raise.
+        logger.warning(
+            "operator.action: unknown action_type %r; ignoring (forward-compat)",
+            action_type,
+        )
+
+    def _resolve_metadata_writer(self) -> Optional[Any]:
+        """Locate the kernel's MetadataWriter via the documented surfaces.
+
+        Searches in order:
+
+        1. :attr:`metadata_writer` set directly on this server.
+        2. ``self.kernel._llmnb_metadata_writer`` (the
+           ``ATTR_METADATA_WRITER`` slot from
+           :mod:`llm_kernel._kernel_hooks`).
+        3. ``self.kernel.shell.user_ns["__llmnb_metadata_writer__"]``
+           per the RFC-006 §6 contract referenced in the brief.
+
+        Returns ``None`` if none of the above resolve.
+        """
+        if self.metadata_writer is not None:
+            return self.metadata_writer
+        kernel = self.kernel
+        if kernel is None:
+            return None
+        attached = getattr(kernel, "_llmnb_metadata_writer", None)
+        if attached is not None:
+            return attached
+        shell = getattr(kernel, "shell", None)
+        if shell is not None:
+            user_ns = getattr(shell, "user_ns", None)
+            if isinstance(user_ns, dict):
+                return user_ns.get("__llmnb_metadata_writer__")
+        return None
+
+    def _emit_agent_spawn_error_span(
+        self, *, agent_id: str, cell_id: Optional[str], error: str,
+    ) -> None:
+        """Emit a synthetic terminal Family A span when agent_spawn fails.
+
+        The span is `llmnb.run_type: "agent_emit"` with `llmnb.emit_kind:
+        "spawn_error"`. The cell that triggered the spawn observes a
+        terminal span (`endTimeUnixNano` set, `status.code:
+        STATUS_CODE_ERROR`) and completes with error status, rather than
+        hanging until the PtyKernelClient's terminal-span timeout.
+        """
+        if self.run_tracker is None:
+            return
+        try:
+            run_id = self.run_tracker.start_run(
+                name="agent_spawn:error",
+                run_type="agent_emit",
+                inputs={"agent_id": agent_id, "task_cell_id": cell_id},
+                tags=[f"agent:{agent_id}", "spawn_error"],
+                metadata={
+                    "agent_id": self.agent_id,
+                    "zone_id": self.zone_id,
+                    "cell_id": cell_id,
+                    "emit_kind": "spawn_error",
+                    "emit_content": error,
+                },
+            )
+            self.run_tracker.fail_run(run_id, error={"message": error})
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "failed to emit synthetic agent_spawn error span; agent_id=%s",
+                agent_id,
+            )
+
+    def _resolve_agent_supervisor(self) -> Optional[Any]:
+        """Locate the kernel's AgentSupervisor via the documented surfaces.
+
+        Mirrors :meth:`_resolve_metadata_writer`'s probe order. Used by the
+        ``operator.action`` ``agent_spawn`` handler (RFC-006 §6 v2.0.3).
+        """
+        direct = getattr(self, "agent_supervisor", None)
+        if direct is not None:
+            return direct
+        kernel = self.kernel
+        if kernel is None:
+            return None
+        attached = getattr(kernel, "_llmnb_agent_supervisor", None)
+        if attached is not None:
+            return attached
+        shell = getattr(kernel, "shell", None)
+        if shell is not None:
+            user_ns = getattr(shell, "user_ns", None)
+            if isinstance(user_ns, dict):
+                return user_ns.get("__llmnb_agent_supervisor__")
+        return None
+
+    # -- Rate-limit / threshold helpers ----------------------------------
+
+    def _check_rate(
+        self,
+        zone_id: str,
+        tool_name: str,
+        max_count: int,
+        window_sec: float,
+    ) -> bool:
+        """Return True iff calling ``tool_name`` in ``zone_id`` is permitted.
+
+        Prunes stamps older than ``window_sec`` from the per-(zone,tool)
+        deque, then checks whether appending one more keeps the count
+        under ``max_count``.  Caller MUST log AFTER this returns False;
+        Engineering Guide §11.7 forbids logging inside ``self._rate_lock``.
+        """
+        now = time.monotonic()
+        cutoff = now - window_sec
+        with self._rate_lock:
+            key = (zone_id, tool_name)
+            stamps = self._rate_state.get(key)
+            if stamps is None:
+                stamps = collections.deque()
+                self._rate_state[key] = stamps
+            while stamps and stamps[0] < cutoff:
+                stamps.popleft()
+            if len(stamps) >= max_count:
+                return False
+            stamps.append(now)
+            return True
 
     async def _handle_ask(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Round-trip ``ask`` via the dispatcher.
@@ -445,7 +851,31 @@ class OperatorBridgeServer:
     async def _handle_report_completion(
         self, arguments: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Acknowledge a `report_completion` call; B2 emits ``run.complete``."""
+        """Acknowledge a `report_completion` call.
+
+        RFC-001 §report_completion semantic notes: idempotent at most
+        once per task; second call with the same ``task_id`` returns
+        -32004 with "task already reported complete".
+
+        The schema does not define ``task_id`` explicitly; we accept it
+        as an additive optional argument (per RFC's additive-class
+        evolution rule).  If absent we cannot enforce once-per-task and
+        accept the call.
+        """
+        task_id = arguments.get("task_id")
+        if task_id is not None:
+            seen = self._completion_seen.setdefault(self.zone_id, set())
+            if task_id in seen:
+                raise McpError(
+                    types.ErrorData(
+                        code=JSONRPC_OPERATOR_TIMEOUT,  # -32004 per the brief
+                        message=(
+                            f"task already reported complete (task_id={task_id!r})"
+                        ),
+                        data={"task_id": task_id, "zone_id": self.zone_id},
+                    )
+                )
+            seen.add(task_id)
         return {"acknowledged": True}
 
     async def _handle_report_problem(
@@ -455,45 +885,338 @@ class OperatorBridgeServer:
         return {"acknowledged": True}
 
     async def _handle_present(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Return a synthetic artifact id; payload rides the dispatcher."""
-        return {"artifact_id": f"artifact-{uuid.uuid4()}"}
+        """Return an artifact id; idempotent under repeated ``artifact_id``.
+
+        RFC-001 §present semantic notes mark ``present`` idempotent
+        under the ``(artifact.uri, body-hash)`` pair.  In practice the
+        agent supplies an explicit ``artifact_id`` in the arguments
+        envelope (additive); when present, repeated calls return the
+        same response from a per-zone cache rather than minting a
+        fresh id.
+        """
+        explicit_id = arguments.get("artifact_id")
+        cache = self._present_cache.setdefault(self.zone_id, {})
+        if explicit_id is not None and explicit_id in cache:
+            return dict(cache[explicit_id])
+        artifact_id = explicit_id or f"artifact-{uuid.uuid4()}"
+        result: Dict[str, Any] = {"artifact_id": artifact_id}
+        cache[artifact_id] = dict(result)
+        return result
 
     async def _handle_notify(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Acknowledge a `notify` call (fire-and-forget per RFC-001)."""
-        # TODO(B2): rate-limit per RFC-001 (return -32005 when policy refuses).
+        """Acknowledge a ``notify`` call; per-zone rate-limited per RFC-001.
+
+        RFC-001 §notify: per-zone policy MAY rate-limit ``notify``;
+        rate-limit responses MUST surface as -32005 rather than silent
+        drops.  V1 enforces a 10-call-per-60s ceiling.
+        """
+        permitted = self._check_rate(
+            self.zone_id, "notify",
+            NOTIFY_RATE_LIMIT_MAX, NOTIFY_RATE_LIMIT_WINDOW_SEC,
+        )
+        if not permitted:
+            # Log AFTER releasing the lock per Engineering Guide §11.7.
+            logger.warning(
+                "notify rate-limited", extra={
+                    "tool.name": "notify",
+                    "llmnb.zone_id": self.zone_id,
+                    "llmnb.agent_id": self.agent_id,
+                },
+            )
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_REFUSED,
+                    message="notify rate limit exceeded.",
+                    data={
+                        "zone_id": self.zone_id,
+                        "limit_per_60s": NOTIFY_RATE_LIMIT_MAX,
+                    },
+                )
+            )
         return {"acknowledged": True}
 
     async def _handle_escalate(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Acknowledge an `escalate` call. Unanswered escalates still ack
-        per RFC-001 to avoid agent deadlock; run-tracker carries severity
-        + reason to the dispatcher's IOPub stream."""
-        # TODO(B2): detect escalate floods (>5 critical/60s) and rate-limit.
+        """Acknowledge an `escalate` call.
+
+        Unanswered escalates still ack per RFC-001 to avoid agent
+        deadlock.  Per RFC-001 §escalate the kernel MUST detect
+        escalate floods (>5 ``severity=critical`` in 60s from one
+        agent) and rate-limit with -32005.  Non-critical escalates do
+        NOT count against the threshold (they're not the flood the
+        spec is preventing).
+        """
+        severity = arguments.get("severity")
+        if severity == "critical":
+            permitted = self._check_rate(
+                self.zone_id, "escalate.critical",
+                ESCALATE_FLOOD_MAX, ESCALATE_FLOOD_WINDOW_SEC,
+            )
+            if not permitted:
+                # Log AFTER releasing the lock per Engineering Guide §11.7.
+                logger.warning(
+                    "escalate flood detected", extra={
+                        "tool.name": "escalate",
+                        "severity": "critical",
+                        "llmnb.zone_id": self.zone_id,
+                        "llmnb.agent_id": self.agent_id,
+                    },
+                )
+                raise McpError(
+                    types.ErrorData(
+                        code=JSONRPC_PROXIED_REFUSED,
+                        message=(
+                            "escalate flood threshold exceeded; refusing additional "
+                            "critical escalations for 60s."
+                        ),
+                        data={
+                            "zone_id": self.zone_id,
+                            "limit_per_60s": ESCALATE_FLOOD_MAX,
+                        },
+                    )
+                )
         return {"acknowledged": True}
 
-    # -- Proxied tool handlers (B1 stubs raise NotImplementedError) ----
+    # -- Proxied tool handlers ----
+
+    def _workspace_root(self) -> Path:
+        """Resolve the workspace root used to anchor proxied filesystem ops.
+
+        Reads ``LLMKERNEL_WORKSPACE_ROOT`` from the environment; falls
+        back to the kernel process's ``os.getcwd()``.  The path is
+        normalized via ``Path.resolve()`` so traversal checks are
+        comparing absolute, symlink-resolved forms.
+        """
+        candidate = os.environ.get("LLMKERNEL_WORKSPACE_ROOT") or os.getcwd()
+        return Path(candidate).resolve()
+
+    def _resolve_workspace_path(self, raw_path: str) -> Path:
+        """Resolve ``raw_path`` against the workspace root.
+
+        Raises :class:`PermissionError` (the same exception type a host
+        kernel would raise on a denied path) if the resolved location
+        escapes the workspace root.  The caller maps that to JSON-RPC
+        -32005.
+        """
+        root = self._workspace_root()
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            target = candidate.resolve()
+        else:
+            target = (root / candidate).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise PermissionError(
+                f"path {raw_path!r} resolves outside workspace root {str(root)!r}"
+            ) from exc
+        return target
 
     async def _handle_read_file(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Read file contents from the zone workspace (proxied)."""
-        # TODO(B5): forward to the workspace I/O layer; honor max_bytes / encoding.
-        _path = Path(str(arguments.get("path", "")))
-        raise NotImplementedError(
-            "read_file: Track B1 stub; proxied implementation comes in B2/B5 wiring."
-        )
+        """Read file contents from the zone workspace (proxied; RFC-001 §read_file).
+
+        Resolves ``path`` against the workspace root
+        (``LLMKERNEL_WORKSPACE_ROOT``, fallback ``os.getcwd()``).
+        Refuses path traversal with -32005 and OS errors with -32006.
+        Files larger than ``DEFAULT_BLOB_THRESHOLD_BYTES`` are
+        returned truncated; blob extraction is deferred to V1.1.
+        """
+        raw_path = str(arguments.get("path", ""))
+        encoding = arguments.get("encoding", "utf-8")
+        try:
+            target = self._resolve_workspace_path(raw_path)
+        except PermissionError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_REFUSED,
+                    message=str(exc),
+                    data={"path": raw_path},
+                )
+            )
+        try:
+            size_bytes = target.stat().st_size
+            # TODO(V1.1): blob extract content > blob_threshold_bytes via
+            # MetadataWriter's blob table; V1 returns inline text up to
+            # the threshold and truncates beyond.
+            if encoding == "base64":
+                import base64 as _b64
+                raw = target.read_bytes()
+                truncated = False
+                if len(raw) > DEFAULT_BLOB_THRESHOLD_BYTES:
+                    raw = raw[:DEFAULT_BLOB_THRESHOLD_BYTES]
+                    truncated = True
+                content = _b64.b64encode(raw).decode("ascii")
+            else:
+                text = target.read_text(encoding="utf-8", errors="replace")
+                truncated = False
+                if len(text.encode("utf-8")) > DEFAULT_BLOB_THRESHOLD_BYTES:
+                    # truncate by codepoints conservatively
+                    text = text[:DEFAULT_BLOB_THRESHOLD_BYTES]
+                    truncated = True
+                content = text
+        except OSError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_IO_FAILURE,
+                    message=str(exc),
+                    data={"path": raw_path, "errno": getattr(exc, "errno", None)},
+                )
+            )
+        return {
+            "content": content,
+            "encoding": encoding,
+            "truncated": truncated,
+            "size_bytes": size_bytes,
+        }
 
     async def _handle_write_file(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Write file contents inside the zone workspace (proxied)."""
-        # TODO(B5): forward to the workspace I/O layer.
-        _path = Path(str(arguments.get("path", "")))
-        raise NotImplementedError(
-            "write_file: Track B1 stub; proxied implementation comes in B2/B5 wiring."
-        )
+        """Write content to a workspace file (proxied; RFC-001 §write_file).
+
+        Same workspace-root resolution / traversal refusal as
+        :meth:`_handle_read_file`.  Creates parent directories on
+        demand.  Returns -32006 on any OSError.  Mode ``create`` raises
+        -32006 if the file already exists; ``append`` opens with mode
+        ``'a'``; ``overwrite`` (default) writes verbatim.
+        """
+        raw_path = str(arguments.get("path", ""))
+        content = arguments.get("content", "")
+        encoding = arguments.get("encoding", "utf-8")
+        mode = arguments.get("mode", "overwrite")
+        try:
+            target = self._resolve_workspace_path(raw_path)
+        except PermissionError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_REFUSED,
+                    message=str(exc),
+                    data={"path": raw_path},
+                )
+            )
+        created: bool = not target.exists()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if encoding == "base64":
+                import base64 as _b64
+                payload = _b64.b64decode(str(content).encode("ascii"))
+            else:
+                payload = str(content).encode("utf-8")
+            if mode == "create":
+                if not created:
+                    raise FileExistsError(
+                        f"file exists and mode=create: {target}"
+                    )
+                target.write_bytes(payload)
+            elif mode == "append":
+                with target.open("ab") as fh:
+                    fh.write(payload)
+            else:  # overwrite
+                target.write_bytes(payload)
+            bytes_written = len(payload)
+        except OSError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_IO_FAILURE,
+                    message=str(exc),
+                    data={"path": raw_path, "errno": getattr(exc, "errno", None)},
+                )
+            )
+        return {"bytes_written": bytes_written, "created": created}
 
     async def _handle_run_command(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a shell command in the zone workspace (proxied)."""
-        # TODO(B5): forward to the command execution layer; honor timeout.
-        raise NotImplementedError(
-            "run_command: Track B1 stub; proxied implementation comes in B2/B5 wiring."
-        )
+        """Execute a shell command in the workspace (proxied; RFC-001 §run_command).
+
+        Uses :func:`subprocess.run` with ``shell=False``, ``cwd`` set
+        to the workspace root, and a timeout converted from
+        ``timeout_ms``.  Refuses with -32005 if the binary is not on
+        PATH.  Truncates stdout/stderr at
+        ``DEFAULT_RUN_COMMAND_OUTPUT_CAP_BYTES`` (V1.1: blob extract).
+        """
+        command = str(arguments.get("command", ""))
+        args_list: List[str] = list(arguments.get("args") or [])
+        timeout_ms = int(arguments.get("timeout_ms", 30000))
+        timeout_sec = max(timeout_ms / 1000.0, 0.001)
+        env_override = arguments.get("env") or None
+
+        # PATH presence check: per RFC-001 §run_command -32005 covers
+        # "command policy denial."  We treat "not on PATH" as a denial
+        # because the kernel cannot run an arbitrary path it can't
+        # locate.  Absolute paths are checked via Path.exists().
+        if "/" in command or "\\" in command:
+            if not Path(command).exists():
+                raise McpError(
+                    types.ErrorData(
+                        code=JSONRPC_PROXIED_REFUSED,
+                        message=f"command {command!r} not found at the given path",
+                        data={"command": command},
+                    )
+                )
+        else:
+            if shutil.which(command) is None:
+                raise McpError(
+                    types.ErrorData(
+                        code=JSONRPC_PROXIED_REFUSED,
+                        message=f"command {command!r} is not on PATH",
+                        data={"command": command},
+                    )
+                )
+
+        argv: List[str] = [command, *args_list]
+        cwd = self._workspace_root()
+        env_for_subprocess: Optional[Dict[str, str]] = None
+        if env_override:
+            env_for_subprocess = dict(os.environ)
+            env_for_subprocess.update({str(k): str(v) for k, v in env_override.items()})
+
+        start_ns = time.monotonic_ns()
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                timeout=timeout_sec,
+                capture_output=True,
+                text=True,
+                shell=False,
+                env=env_for_subprocess,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_IO_FAILURE,
+                    message=(
+                        f"run_command timed out after {timeout_sec:.3f}s "
+                        f"(timeout_ms={timeout_ms})"
+                    ),
+                    data={
+                        "command": command,
+                        "timeout_ms": timeout_ms,
+                        "stdout": (exc.stdout or "")[:DEFAULT_RUN_COMMAND_OUTPUT_CAP_BYTES]
+                        if isinstance(exc.stdout, str) else "",
+                        "stderr": (exc.stderr or "")[:DEFAULT_RUN_COMMAND_OUTPUT_CAP_BYTES]
+                        if isinstance(exc.stderr, str) else "",
+                    },
+                )
+            )
+        except OSError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_IO_FAILURE,
+                    message=str(exc),
+                    data={"command": command, "errno": getattr(exc, "errno", None)},
+                )
+            )
+
+        duration_ms = int((time.monotonic_ns() - start_ns) / 1_000_000)
+        # TODO(V1.1): blob extract stdout/stderr beyond the cap rather
+        # than truncating in place.
+        stdout = (completed.stdout or "")[:DEFAULT_RUN_COMMAND_OUTPUT_CAP_BYTES]
+        stderr = (completed.stderr or "")[:DEFAULT_RUN_COMMAND_OUTPUT_CAP_BYTES]
+        return {
+            "exit_code": int(completed.returncode),
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": False,
+            "duration_ms": duration_ms,
+        }
 
     async def run_stdio(self) -> None:
         """Serve the MCP protocol over stdio per RFC-002."""

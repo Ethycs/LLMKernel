@@ -22,6 +22,45 @@ import logging
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+# ==================== Parallel-safety isolation ====================
+
+@pytest.fixture(autouse=True)
+def _isolate_root_logger():
+    """Snapshot/restore root + ``llm_kernel`` logger state around every test.
+
+    Several tests install ``OtlpDataPlaneHandler`` (or similar) on the
+    root logger via :func:`llm_kernel.pty_mode._install_handler` or
+    directly. Without isolation a leaked handler from one test would
+    intercept :func:`caplog`-captured records in subsequent tests in
+    the same worker process, producing spurious failures or hangs.
+
+    Cheap (just two list snapshots) so applying autouse to every test
+    is fine; xdist's ``--dist=loadfile`` already gives one worker per
+    file, but combined sequential runs share state.
+    """
+    root = logging.getLogger()
+    saved_root_handlers = list(root.handlers)
+    saved_root_level = root.level
+    llm_logger = logging.getLogger("llm_kernel")
+    saved_llm_handlers = list(llm_logger.handlers)
+    saved_llm_level = llm_logger.level
+    saved_llm_propagate = llm_logger.propagate
+    try:
+        yield
+    finally:
+        root.handlers[:] = saved_root_handlers
+        root.setLevel(saved_root_level)
+        llm_logger.handlers[:] = saved_llm_handlers
+        llm_logger.setLevel(saved_llm_level)
+        llm_logger.propagate = saved_llm_propagate
+
+
+# Hypothesis profile (database/deadline) is configured in
+# ``tests/markov/test_invariants.py`` since that's the only file that
+# uses Hypothesis in the scoped suite. The InMemoryExampleDatabase
+# there avoids cross-worker contention on ``~/.hypothesis/examples/``.
+
+
 # ==================== Environment Setup ====================
 
 @pytest.fixture(scope="session", autouse=True)

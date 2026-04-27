@@ -24,11 +24,13 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Dict, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 
 from ._provisioning import (
+    EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION,
     PreSpawnValidationError, build_argv, build_env,
-    render_mcp_config, render_system_prompt, validate_pre_spawn,
+    extract_template_version, render_mcp_config, render_system_prompt,
+    _split_semver, validate_pre_spawn,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -42,6 +44,17 @@ _RESTART_BACKOFFS_SEC: tuple[float, ...] = (0.0, 5.0, 25.0)
 #: DR-0010 prose-violation flood threshold: >5 within 60s -> escalate.
 _VIOLATION_FLOOD_COUNT: int = 5
 _VIOLATION_FLOOD_WINDOW_SEC: float = 60.0
+#: Default stdout-silence threshold (RFC-002 §"Failure modes" — Hang).
+#: Configurable per-supervisor via the ``agent_silence_threshold_seconds``
+#: ctor kwarg (kernel config maps onto it via ``config.kernel``).
+DEFAULT_AGENT_SILENCE_THRESHOLD_SEC: float = 120.0
+#: Granularity at which the silence watchdog wakes to check the timer.
+_SILENCE_WATCHDOG_GRANULARITY_SEC: float = 5.0
+#: Per-agent restart-window per RFC-002 §"Process lifecycle" 5
+#: ("≤3 attempts in 5 minutes"). Sliding window of monotonic
+#: timestamps; on overflow the supervisor refuses further restarts.
+_RESTART_WINDOW_SEC: float = 300.0
+_RESTART_WINDOW_MAX: int = 3
 
 AgentState = str  # starting | running | restarting | failed | terminated
 
@@ -63,10 +76,26 @@ class AgentHandle:
     stdout_thread: threading.Thread
     stderr_thread: threading.Thread
     watchdog_thread: Optional[threading.Thread] = None
+    silence_watchdog_thread: Optional[threading.Thread] = None
     state: AgentState = "starting"
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _violation_times: Deque[float] = field(default_factory=lambda: deque(maxlen=64))
     _restart_attempts: int = 0
+    #: Sliding-window timestamps of restart attempts per RFC-002 §6.
+    #: Pruned to ``_RESTART_WINDOW_SEC``; >= ``_RESTART_WINDOW_MAX`` =>
+    #: refuse further restarts.
+    _restart_history: Deque[float] = field(default_factory=deque)
+    #: Monotonic timestamp of the most recent stdout byte. Updated by
+    #: every reader-thread iteration that observes a non-empty line;
+    #: read by :meth:`AgentSupervisor._silence_watchdog`. Defaults to
+    #: spawn time so a freshly-spawned agent has the full silence
+    #: budget to produce its first byte.
+    _last_stdout_ts: float = 0.0
+    #: Set whenever the silence watchdog has SIGTERMed the process so
+    #: the regular watchdog (which observes the resulting non-zero
+    #: exit) does not double-log; tag is plumbed into the restart
+    #: bookkeeping.
+    _hang_terminated: bool = False
 
     def poll(self) -> Optional[int]:
         """Return the process exit code if it has exited, else ``None``."""
@@ -118,6 +147,8 @@ class AgentSupervisor:
         dispatcher: "CustomMessageDispatcher",
         litellm_endpoint_url: str,
         kernel_python: str = sys.executable,
+        agent_silence_threshold_seconds: float = DEFAULT_AGENT_SILENCE_THRESHOLD_SEC,
+        silence_watchdog_granularity_seconds: float = _SILENCE_WATCHDOG_GRANULARITY_SEC,
     ) -> None:
         """Bind the supervisor to its B2/B3 collaborators.
 
@@ -125,11 +156,27 @@ class AgentSupervisor:
         agents and the URL the pre-spawn health check probes.
         ``kernel_python`` is the absolute path to the kernel's Python;
         the per-spawn MCP config's ``command`` field uses this.
+
+        ``agent_silence_threshold_seconds`` (RFC-002 §"Failure modes"
+        Hang row): when the agent emits no stdout for this many
+        seconds, the silence watchdog SIGTERMs the process and the
+        regular crash-restart machinery picks up the resulting exit.
+        Default 120s; tests pass a smaller value via the ctor.
+        ``silence_watchdog_granularity_seconds`` controls how often
+        the watchdog wakes to check the silence timer (default 5s);
+        tests reduce it for fast iteration.
         """
         self._run_tracker = run_tracker
         self._dispatcher = dispatcher
         self._litellm_endpoint_url: str = litellm_endpoint_url
         self._kernel_python: str = kernel_python
+        self._silence_threshold_sec: float = agent_silence_threshold_seconds
+        self._silence_granularity_sec: float = silence_watchdog_granularity_seconds
+        # Per Engineering Guide §11.7: this lock is acquired on the
+        # data path (spawn / restart bookkeeping) AND we may log inside
+        # the critical section; downstream loggers route through
+        # OtlpDataPlaneHandler -> SocketWriter (now an RLock) so the
+        # supervisor's own lock must also be reentrant.
         self._lock: threading.RLock = threading.RLock()
         self._agents: Dict[str, AgentHandle] = {}
 
@@ -179,7 +226,17 @@ class AgentSupervisor:
             pythonpath=abs_pp,
         )
         mcp_config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-        system_prompt_path.write_text(render_system_prompt(task), encoding="utf-8")
+        rendered_prompt = render_system_prompt(task)
+        # RFC-002 §"Failure modes": refuse spawn on system-prompt
+        # template major-version mismatch; warn-and-proceed on minor.
+        try:
+            self._validate_template_version(rendered_prompt)
+        except PreSpawnValidationError as exc:
+            self._record_synthetic_problem(
+                agent_id, zone_id, str(exc), exc.log_signature,
+            )
+            raise
+        system_prompt_path.write_text(rendered_prompt, encoding="utf-8")
         for p in (mcp_config_path, system_prompt_path):
             try:
                 p.chmod(0o600)
@@ -264,11 +321,13 @@ class AgentSupervisor:
         """Allocate the handle + start reader/watchdog threads."""
         spawn_dir = work_dir / ".run" / agent_id
         stderr_log = spawn_dir / f"kernel.stderr.{agent_id}.log"
+        now = time.monotonic()
         handle = AgentHandle(
             agent_id=agent_id, zone_id=zone_id, popen=popen,
-            started_at=time.monotonic(), work_dir=work_dir,
+            started_at=now, work_dir=work_dir,
             stdout_thread=threading.Thread(),  # placeholder
             stderr_thread=threading.Thread(),  # placeholder
+            _last_stdout_ts=now,
         )
         handle.stdout_thread = threading.Thread(
             target=self._read_stdout, args=(handle,),
@@ -285,6 +344,11 @@ class AgentSupervisor:
             name=f"agent-watchdog-{agent_id}", daemon=True,
         )
         handle.watchdog_thread.start()
+        handle.silence_watchdog_thread = threading.Thread(
+            target=self._silence_watchdog, args=(handle,),
+            name=f"agent-silence-{agent_id}", daemon=True,
+        )
+        handle.silence_watchdog_thread.start()
         handle.state = "running"
         return handle
 
@@ -314,6 +378,11 @@ class AgentSupervisor:
         for raw in handle.popen.stdout:
             if handle._stop_event.is_set():
                 break
+            # RFC-002 §"Failure modes" hang detection: every byte
+            # observed on stdout (even an empty line) resets the
+            # silence timer so the watchdog only fires on TRUE
+            # silence, not parser-rejection silence.
+            handle._last_stdout_ts = time.monotonic()
             line = raw.rstrip("\r\n")
             if debug_path is not None:
                 with debug_path.open("a", encoding="utf-8") as fh:
@@ -373,28 +442,53 @@ class AgentSupervisor:
     def _watchdog(self, handle: AgentHandle, task: str) -> None:
         """Monitor process exit; restart per RFC-002 §"Process lifecycle" 5.
 
-        Up to three restarts with the documented backoff; after
-        exhaustion emits a synthetic ``report_problem`` and leaves
-        ``state=failed``.
+        Up to three restarts in a 5-minute sliding window per agent;
+        after exhaustion emits a synthetic ``report_problem`` and
+        leaves ``state=failed``. Per-agent (not zone-wide) — see RFC
+        ambiguity note in the implementation report.
         """
         exit_code = handle.popen.wait()
-        if handle._stop_event.is_set() or exit_code == 0:
+        if handle._stop_event.is_set() or (
+            exit_code == 0 and not handle._hang_terminated
+        ):
             handle.state = "terminated"
             return
-        logger.warning(
-            "agent %s exited code=%s (attempt %d)",
-            handle.agent_id, exit_code, handle._restart_attempts + 1,
-        )
-        if handle._restart_attempts >= len(_RESTART_BACKOFFS_SEC) - 1:
-            self._record_synthetic_problem(
-                handle.agent_id, handle.zone_id,
-                f"agent process unrestartable after "
-                f"{handle._restart_attempts + 1} attempts (last exit={exit_code})",
-                "agent.unrestartable",
+        if handle._hang_terminated:
+            # The silence watchdog has already logged + recorded the
+            # hang event and SIGTERMed the process. Reset the flag so
+            # the next iteration of crash-restart can run cleanly.
+            handle._hang_terminated = False
+            logger.warning(
+                "agent %s SIGTERMed by silence watchdog; restart attempt %d",
+                handle.agent_id, len(handle._restart_history) + 1,
             )
-            handle.state = "failed"
-            return
-        backoff = _RESTART_BACKOFFS_SEC[handle._restart_attempts + 1]
+        else:
+            logger.warning(
+                "agent %s exited code=%s (attempt %d)",
+                handle.agent_id, exit_code,
+                len(handle._restart_history) + 1,
+            )
+        # RFC-002 §6 sliding-window check: prune entries older than
+        # _RESTART_WINDOW_SEC; if >= _RESTART_WINDOW_MAX, refuse.
+        now = time.monotonic()
+        cutoff = now - _RESTART_WINDOW_SEC
+        with self._lock:
+            while handle._restart_history and handle._restart_history[0] < cutoff:
+                handle._restart_history.popleft()
+            if len(handle._restart_history) >= _RESTART_WINDOW_MAX:
+                self._record_synthetic_problem(
+                    handle.agent_id, handle.zone_id,
+                    "agent unrestartable: 3 restart attempts in 5 minutes",
+                    "agent.unrestartable",
+                )
+                handle.state = "failed"
+                return
+            handle._restart_history.append(now)
+            attempt_idx = min(
+                len(handle._restart_history) - 1,
+                len(_RESTART_BACKOFFS_SEC) - 1,
+            )
+        backoff = _RESTART_BACKOFFS_SEC[attempt_idx]
         handle._restart_attempts += 1
         handle.state = "restarting"
         time.sleep(backoff)
@@ -426,6 +520,9 @@ class AgentSupervisor:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,
         )
+        # New popen -> reset silence timer so the just-spawned process
+        # has the full silence budget to produce output.
+        handle._last_stdout_ts = time.monotonic()
         handle.stdout_thread = threading.Thread(
             target=self._read_stdout, args=(handle,),
             name=f"agent-stdout-{handle.agent_id}", daemon=True,
@@ -437,7 +534,184 @@ class AgentSupervisor:
         )
         handle.stdout_thread.start()
         handle.stderr_thread.start()
+        # Restart the silence watchdog if the previous one exited.
+        existing_silence = handle.silence_watchdog_thread
+        if existing_silence is None or not existing_silence.is_alive():
+            handle.silence_watchdog_thread = threading.Thread(
+                target=self._silence_watchdog, args=(handle,),
+                name=f"agent-silence-{handle.agent_id}", daemon=True,
+            )
+            handle.silence_watchdog_thread.start()
         handle.state = "running"
+
+    def _silence_watchdog(self, handle: AgentHandle) -> None:
+        """Hang detection: SIGTERM if stdout is silent past the threshold.
+
+        RFC-002 §"Failure modes" Hang row: when the agent emits no
+        stdout for >threshold seconds AND the process is still running,
+        the supervisor SIGTERMs and lets the regular crash-restart
+        machinery in :meth:`_watchdog` pick up the resulting non-zero
+        exit (with ``handle._hang_terminated`` set so the log line
+        attributes the cause correctly).
+
+        Loops at ``self._silence_granularity_sec`` granularity and
+        exits when the popen has reaped (returncode is not None) or
+        the stop-event is set. Daemon thread: never prevents process
+        teardown.
+        """
+        threshold = self._silence_threshold_sec
+        granularity = self._silence_granularity_sec
+        # Defensive lower bound — granularity 0 would burn the CPU.
+        if granularity <= 0:
+            granularity = _SILENCE_WATCHDOG_GRANULARITY_SEC
+        while not handle._stop_event.is_set():
+            if handle._stop_event.wait(timeout=granularity):
+                return
+            if handle.popen.returncode is not None:
+                return
+            silence = time.monotonic() - handle._last_stdout_ts
+            if silence <= threshold:
+                continue
+            # Mark first so the regular watchdog sees the flag even if
+            # SIGTERM races. RFC-002 mandates one ERROR-level log
+            # event with the silence_seconds attribute.
+            handle._hang_terminated = True
+            logger.error(
+                "agent.hang_detected agent_id=%s silence_seconds=%.1f",
+                handle.agent_id, silence,
+                extra={
+                    "event.name": "agent.hang_detected",
+                    "llmnb.agent_id": handle.agent_id,
+                    "llmnb.silence_seconds": silence,
+                },
+            )
+            try:
+                handle.popen.terminate()
+            except (OSError, ProcessLookupError):  # pragma: no cover - defensive
+                pass
+            return
+
+    def _validate_template_version(self, rendered_prompt: str) -> None:
+        """Refuse spawn on system-prompt-template major-version mismatch.
+
+        RFC-002 §"Failure modes" Template-version-mismatch row.
+        Major mismatch -> :class:`PreSpawnValidationError` with
+        ``provisioning.template.version_mismatch`` log signature.
+        Minor mismatch -> log a warning and proceed. Patch differs
+        silently. Missing marker -> warn (we just rendered the
+        canonical template, so it is a developer bug not an attack).
+        """
+        seen = extract_template_version(rendered_prompt)
+        expected = EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION
+        if seen is None:
+            logger.warning(
+                "system prompt template missing version marker; "
+                "expected v%s embedded in trailing comment",
+                expected,
+            )
+            return
+        try:
+            seen_major, seen_minor, _ = _split_semver(seen)
+            exp_major, exp_minor, _ = _split_semver(expected)
+        except ValueError as exc:
+            raise PreSpawnValidationError(
+                f"system prompt template version unparseable: "
+                f"expected {expected}, got {seen!r} ({exc})",
+                log_signature="provisioning.template.version_mismatch",
+            ) from exc
+        if seen_major != exp_major:
+            raise PreSpawnValidationError(
+                f"system prompt template version mismatch: "
+                f"expected {expected}, got {seen}",
+                log_signature="provisioning.template.version_mismatch",
+            )
+        if seen_minor != exp_minor:
+            logger.warning(
+                "system prompt template minor version drift: "
+                "expected %s, got %s; proceeding",
+                expected, seen,
+            )
+
+    # -- Config-driven respawn (consumed by K-CM hydrate handler) ----
+
+    def respawn_from_config(
+        self, config_recoverable_agents: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """Spawn (or rebind) every agent in ``config.recoverable.agents[]``.
+
+        Round-1 G1 contract: K-CM's ``notebook.metadata mode:hydrate``
+        handler calls this with the recoverable agent list (each entry
+        carries ``agent_id``, ``zone_id``, ``tools_allowed`` and
+        optionally ``volatile`` keys ``model``,
+        ``system_prompt_template_id``, ``system_prompt_hash``, plus a
+        ``task`` string). Returns ``{agent_id: status}`` where status
+        is ``"spawned"`` | ``"failed"`` | ``"skipped"``.
+
+        Idempotency: agents with an ``agent_id`` already running are
+        skipped (no respawn). One bad entry MUST NOT block the rest;
+        each spawn is wrapped in its own try-block.
+
+        The recoverable schema (RFC-005 §"`metadata.rts.config.recoverable.agents`")
+        does NOT carry the task string. V1 callers pass the task as a
+        synthetic key inside each entry (``"task"``) until RFC-005 v2
+        decides whether ``task`` is recoverable; missing ``task`` is
+        an error for that entry only.
+        """
+        results: Dict[str, str] = {}
+        for entry in config_recoverable_agents:
+            agent_id = entry.get("agent_id") if isinstance(entry, dict) else None
+            if not isinstance(agent_id, str) or not agent_id:
+                # Cannot key by agent_id; surface a sentinel so the
+                # caller can correlate by index.
+                key = f"<malformed-{len(results)}>"
+                results[key] = "failed"
+                logger.error("respawn_from_config: malformed entry %r", entry)
+                continue
+            try:
+                with self._lock:
+                    already = self._agents.get(agent_id)
+                if already is not None and already.popen.poll() is None:
+                    results[agent_id] = "skipped"
+                    continue
+                self._spawn_from_config_entry(entry)
+                results[agent_id] = "spawned"
+            except Exception:  # noqa: BLE001 — RFC-002 mandates per-agent
+                logger.exception(
+                    "respawn_from_config: spawn failed for %s", agent_id,
+                )
+                results[agent_id] = "failed"
+        return results
+
+    def _spawn_from_config_entry(self, entry: Dict[str, Any]) -> AgentHandle:
+        """Resolve a recoverable+volatile config entry to a spawn(...) call.
+
+        Required keys: ``agent_id``, ``zone_id``, ``task``,
+        ``work_dir``. Optional volatile keys (per RFC-005
+        ``config.volatile.agents[]``): ``model``. Raises ValueError on
+        missing required key; the caller in
+        :meth:`respawn_from_config` translates that to ``'failed'``.
+        """
+        agent_id = entry["agent_id"]
+        zone_id = entry["zone_id"]
+        task = entry.get("task")
+        if not isinstance(task, str) or not task:
+            raise ValueError(
+                f"respawn entry for {agent_id!r} missing required 'task'"
+            )
+        work_dir_raw = entry.get("work_dir")
+        if not work_dir_raw:
+            raise ValueError(
+                f"respawn entry for {agent_id!r} missing 'work_dir'"
+            )
+        work_dir = Path(work_dir_raw)
+        model = entry.get("model")
+        api_key = entry.get("api_key")
+        use_bare = bool(entry.get("use_bare", False))
+        return self.spawn(
+            zone_id=zone_id, agent_id=agent_id, task=task,
+            work_dir=work_dir, api_key=api_key,
+            model=model, use_bare=use_bare,
+        )
 
     # -- Synthetic-run helpers ---------------------------------------
 

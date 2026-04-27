@@ -42,6 +42,10 @@ RFC003_MESSAGE_TYPES: FrozenSet[str] = frozenset(
         "operator.action",
         "heartbeat.kernel", "heartbeat.extension",
         "notebook.metadata",
+        # RFC-006 v2.0.x additive: graceful kernel shutdown request
+        # (extension→kernel) per RFC-008 §4 step 6. EOF remains the
+        # fallback when this message is not received.
+        "kernel.shutdown_request",
     }
 )
 

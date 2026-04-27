@@ -17,7 +17,7 @@ was lifted from.
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 JSONSchema = Dict[str, Any]
 
@@ -118,6 +118,8 @@ REPORT_PROGRESS_INPUT: JSONSchema = _obj(["status"], {
 REPORT_PROGRESS_OUTPUT: JSONSchema = _ack()
 
 # RFC-001 §report_completion
+# ``task_id`` is additive (V1 mega-round): the kernel uses it to enforce
+# RFC-001 §report_completion's "exactly one per task" invariant.
 REPORT_COMPLETION_INPUT: JSONSchema = _obj(["summary"], {
     "_rfc_version": _VER,
     "summary": {"type": "string", "minLength": 1},
@@ -126,7 +128,8 @@ REPORT_COMPLETION_INPUT: JSONSchema = _obj(["summary"], {
         "kind": {"type": "string", "enum": ["file", "diff", "plan", "url", "log"]},
         "title": _VS})},
     "outcome": {"type": "string",
-                "enum": ["success", "partial", "aborted"], "default": "success"}})
+                "enum": ["success", "partial", "aborted"], "default": "success"},
+    "task_id": _VS})
 REPORT_COMPLETION_OUTPUT: JSONSchema = _ack()
 
 # RFC-001 §report_problem
@@ -139,13 +142,17 @@ REPORT_PROBLEM_INPUT: JSONSchema = _obj(["severity", "description"], {
 REPORT_PROBLEM_OUTPUT: JSONSchema = _ack()
 
 # RFC-001 §present
+# ``artifact_id`` is additive (V1 mega-round): when supplied, the
+# kernel returns the cached response for that id instead of minting a
+# fresh one (RFC-001 §present idempotency).
 PRESENT_INPUT: JSONSchema = _obj(["artifact", "kind", "summary"], {
     "_rfc_version": _VER,
     "artifact": _obj(["body"], {
         "body": _VS, "uri": _VS, "language": _VS,
         "encoding": {"type": "string", "enum": ["utf-8", "base64"], "default": "utf-8"}}),
     "kind": {"type": "string", "enum": ["code", "plan", "diff", "doc", "json", "image"]},
-    "summary": {"type": "string", "minLength": 1}})
+    "summary": {"type": "string", "minLength": 1},
+    "artifact_id": _VS})
 PRESENT_OUTPUT: JSONSchema = _obj(["artifact_id", "run_id"], {
     "_rfc_version": _VS, "run_id": _RID, "artifact_id": _VS})
 
@@ -238,3 +245,134 @@ NATIVE_TOOLS: Tuple[str, ...] = (
 
 # Tools that are proxied; B1 leaves them unimplemented and raises NotImplementedError.
 PROXIED_TOOLS: Tuple[str, ...] = ("read_file", "write_file", "run_command")
+
+
+# ---- Input validation -----------------------------------------------------
+
+# JSON Schema -> Python type-check map.  Used by the hand-rolled fallback
+# checker if ``jsonschema`` is unavailable.  ``"integer"`` accepts ``bool``
+# rejection because Python booleans subclass ``int``.
+_TYPE_PY: Dict[str, Tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list,),
+    "object": (dict,),
+}
+
+
+def _hand_validate(schema: JSONSchema, value: Any, path: str = "$") -> Optional[str]:
+    """Tiny hand-rolled checker covering the subset RFC-001 schemas use.
+
+    Validates: ``type``, ``required``, ``additionalProperties`` (bool),
+    ``minLength``, ``minItems``, ``minimum``, ``maximum``, ``enum``,
+    ``items``, nested ``properties``.  Returns ``None`` on success or a
+    human-readable error string on first failure.  The structure matches
+    Draft-2020-12's behavior closely enough for the RFC-001 schemas, but
+    falls short of full conformance — which is why ``validate_tool_input``
+    prefers ``jsonschema`` when available.
+    """
+    expected = schema.get("type")
+    if expected:
+        py_types = _TYPE_PY.get(expected)
+        if py_types is not None:
+            # ``bool`` is a subclass of ``int``; reject it for "integer"
+            # / "number" to match JSON Schema semantics.
+            if expected in ("integer", "number") and isinstance(value, bool):
+                return f"{path}: expected {expected}, got boolean"
+            if not isinstance(value, py_types):
+                got = type(value).__name__
+                return f"{path}: expected {expected}, got {got}"
+
+    if expected == "object" and isinstance(value, dict):
+        required = schema.get("required") or []
+        for key in required:
+            if key not in value:
+                return f"{path}: missing required property {key!r}"
+        props: Dict[str, Any] = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            for key in value:
+                if key not in props:
+                    return f"{path}: unexpected property {key!r}"
+        for key, sub_value in value.items():
+            sub_schema = props.get(key)
+            if sub_schema is None:
+                continue
+            err = _hand_validate(sub_schema, sub_value, f"{path}.{key}")
+            if err is not None:
+                return err
+
+    if expected == "array" and isinstance(value, list):
+        min_items = schema.get("minItems")
+        if min_items is not None and len(value) < min_items:
+            return f"{path}: expected at least {min_items} items, got {len(value)}"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(value):
+                err = _hand_validate(item_schema, item, f"{path}[{idx}]")
+                if err is not None:
+                    return err
+
+    if expected == "string" and isinstance(value, str):
+        min_len = schema.get("minLength")
+        if min_len is not None and len(value) < min_len:
+            return f"{path}: string shorter than minLength={min_len}"
+
+    if expected in ("integer", "number") and isinstance(value, (int, float)) \
+            and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        if minimum is not None and value < minimum:
+            return f"{path}: {value} < minimum {minimum}"
+        maximum = schema.get("maximum")
+        if maximum is not None and value > maximum:
+            return f"{path}: {value} > maximum {maximum}"
+
+    enum = schema.get("enum")
+    if enum is not None and value not in enum:
+        return f"{path}: {value!r} not in enum {enum}"
+
+    return None
+
+
+def validate_tool_input(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Validate ``args`` against the RFC-001 input schema for ``tool_name``.
+
+    Returns ``None`` if validation passes (or the tool is unknown — the
+    caller is responsible for routing unknown tools).  Returns a
+    human-readable error string when validation fails: the JSON Pointer
+    of the failing field plus the expected vs received shape.
+
+    Prefers the standard-library-grade ``jsonschema`` validator when
+    available; falls back to :func:`_hand_validate`, a small
+    hand-rolled subset that covers ``type`` / ``required`` /
+    ``additionalProperties`` / ``minLength`` / ``minItems`` /
+    ``minimum`` / ``maximum`` / ``enum`` / ``items`` / nested
+    ``properties`` — sufficient for the RFC-001 schemas this module
+    publishes.
+    """
+    entry = TOOL_CATALOG.get(tool_name)
+    if entry is None:
+        return None  # Unknown tool: routed elsewhere (-32601).
+    input_schema, _output_schema, _description = entry
+    if not isinstance(args, dict):
+        return f"$: expected object, got {type(args).__name__}"
+
+    try:
+        import jsonschema  # type: ignore[import-untyped]
+    except ImportError:
+        return _hand_validate(input_schema, args)
+
+    try:
+        jsonschema.validate(instance=args, schema=input_schema)
+    except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
+        path_parts = list(exc.absolute_path)
+        path = "$" + "".join(
+            f"[{p}]" if isinstance(p, int) else f".{p}" for p in path_parts
+        )
+        return f"{path}: {exc.message}"
+    except jsonschema.SchemaError as exc:  # type: ignore[attr-defined]
+        # The schema itself is malformed -- this is a kernel bug, not a
+        # client error.  Surface it but don't crash.
+        return f"$: schema error ({exc.message})"
+    return None

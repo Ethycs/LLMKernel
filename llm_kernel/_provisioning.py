@@ -17,6 +17,22 @@ import httpx
 
 logger: logging.Logger = logging.getLogger("llm_kernel._provisioning")
 
+#: Canonical embedded marker on the system-prompt template. Format:
+#: ``<!-- system-prompt-template vMAJOR.MINOR.PATCH; rfc=RFC-002 -->``.
+#: The supervisor (RFC-002 §"Failure modes") parses this with
+#: :func:`extract_template_version` and refuses spawn on major mismatch
+#: against :data:`EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION`.
+SYSTEM_PROMPT_TEMPLATE_VERSION_RE: re.Pattern[str] = re.compile(
+    r"<!--\s*system-prompt-template\s+v(\d+\.\d+\.\d+)\s*;\s*rfc=RFC-002\s*-->"
+)
+
+#: Version the supervisor expects to see embedded in the rendered template.
+#: Mismatch handling per RFC-002 §"Failure modes":
+#:   - major differs -> refuse spawn (``provisioning.template.version_mismatch``)
+#:   - minor differs -> warn-and-proceed
+#:   - patch differs -> proceed silently
+EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION: str = "1.0.0"
+
 #: RFC-001 v1.0.0 13-tool catalog in the canonical order RFC-002
 #: §"MCP config JSON layout" mandates.
 RFC001_ALLOWED_TOOLS: Tuple[str, ...] = (
@@ -143,6 +159,33 @@ def render_system_prompt(task: str) -> str:
     "MUST be replaced by the operator's task verbatim").
     """
     return CANONICAL_SYSTEM_PROMPT_TEMPLATE.replace("[TASK_BLOCK]", task)
+
+
+def extract_template_version(rendered_or_template: str) -> Optional[str]:
+    """Return the ``MAJOR.MINOR.PATCH`` version embedded in the template marker.
+
+    Parses the trailing comment ``<!-- system-prompt-template vX.Y.Z;
+    rfc=RFC-002 -->`` per :data:`SYSTEM_PROMPT_TEMPLATE_VERSION_RE`.
+    Returns ``None`` if no marker is present so the caller can decide
+    whether absence is fatal.
+    """
+    match = SYSTEM_PROMPT_TEMPLATE_VERSION_RE.search(rendered_or_template)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _split_semver(version: str) -> Tuple[int, int, int]:
+    """Split a ``MAJOR.MINOR.PATCH`` string into a 3-tuple of ints.
+
+    Raises :class:`ValueError` on malformed input. The supervisor wraps
+    any failure into a :class:`PreSpawnValidationError` with log
+    signature ``provisioning.template.version_mismatch``.
+    """
+    parts = version.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"not MAJOR.MINOR.PATCH: {version!r}")
+    return (int(parts[0]), int(parts[1]), int(parts[2]))
 
 
 def render_mcp_config(
@@ -350,7 +393,9 @@ def validate_pre_spawn(
 
 __all__ = [
     "ALLOWED_TOOLS", "CANONICAL_SYSTEM_PROMPT_TEMPLATE", "DISABLED_TOOLS",
-    "MCP_SERVER_NAME", "PreSpawnValidationError", "RFC001_ALLOWED_TOOLS",
-    "build_argv", "build_env", "is_secret_var",
+    "EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION", "MCP_SERVER_NAME",
+    "PreSpawnValidationError", "RFC001_ALLOWED_TOOLS",
+    "SYSTEM_PROMPT_TEMPLATE_VERSION_RE",
+    "build_argv", "build_env", "extract_template_version", "is_secret_var",
     "render_mcp_config", "render_system_prompt", "validate_pre_spawn",
 ]

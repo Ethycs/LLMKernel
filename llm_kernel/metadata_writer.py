@@ -44,12 +44,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from io import StringIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -466,6 +468,7 @@ class MetadataWriter:
         blob_threshold_bytes: int = DEFAULT_BLOB_THRESHOLD_BYTES,
         autosave_interval_sec: float = DEFAULT_AUTOSAVE_INTERVAL_SEC,
         event_log_queue_cap: int = DEFAULT_EVENT_LOG_QUEUE_CAP,
+        workspace_root: Optional[Path] = None,
     ) -> None:
         """Construct an unstarted writer.
 
@@ -475,6 +478,10 @@ class MetadataWriter:
         writer relies entirely on :meth:`record_run`.  ``session_id``
         defaults to a fresh UUIDv4; reopening an existing file would
         pass the persisted UUID through.
+
+        ``workspace_root`` is the directory the queue-overflow disk
+        fallback (RFC-005 §F13) writes into.  Defaults to the current
+        working directory; tests usually pass ``tmp_path``.
         """
         self._dispatcher = dispatcher
         self._run_tracker = run_tracker
@@ -485,6 +492,9 @@ class MetadataWriter:
         self._blob_threshold_bytes: int = blob_threshold_bytes
         self._autosave_interval_sec: float = autosave_interval_sec
         self._event_log_queue_cap: int = event_log_queue_cap
+        self._workspace_root: Path = (
+            Path(workspace_root) if workspace_root is not None else Path.cwd()
+        )
 
         self._layout: Dict[str, Any] = {
             "version": 1,
@@ -493,7 +503,7 @@ class MetadataWriter:
                 "render_hints": {}, "children": [],
             },
         }
-        self._agents: Dict[str, Any] = {
+        self._agent_graph: Dict[str, Any] = {
             "version": 1, "nodes": [], "edges": [],
         }
         self._config: Dict[str, Any] = {
@@ -538,8 +548,8 @@ class MetadataWriter:
     ) -> None:
         """Replace the agent graph (last-writer-wins)."""
         with self._lock:
-            self._agents["nodes"] = list(nodes)
-            self._agents["edges"] = list(edges)
+            self._agent_graph["nodes"] = list(nodes)
+            self._agent_graph["edges"] = list(edges)
             self._dirty = True
 
     def update_config(
@@ -570,24 +580,102 @@ class MetadataWriter:
         """Append one OTLP/JSON span to the event-log queue.
 
         Bounded per RFC-005 §"When no extension is attached".  On
-        overflow (>``event_log_queue_cap`` entries with no extension
-        attached AND no successful emission yet) the writer logs a
-        checkpoint marker and continues; the operator-facing direct-
-        write tool (RFC-005 §F13) is queued for V1.5.
+        overflow (>``event_log_queue_cap`` entries) the writer drops a
+        checkpoint marker file and direct-writes the snapshot per
+        RFC-005 §F13, then drains the in-memory queue so subsequent
+        ``record_run`` calls have headroom.
+
+        Threading note: the disk write happens inside the lock (so the
+        snapshot is consistent), but the post-overflow ``logger.warning``
+        is deliberately moved OUTSIDE the lock per the Engineering
+        Guide §11.7 RLock-on-logging anti-pattern.
         """
+        overflow_log_args: Optional[Tuple[int, int]] = None
+        marker: Optional[Dict[str, Any]] = None
+        snapshot_to_write: Optional[Dict[str, Any]] = None
         with self._lock:
             self._extra_runs.append(span)
-            if len(self._extra_runs) > self._event_log_queue_cap:
-                # Trim the oldest entries to keep memory bounded.
-                drop = len(self._extra_runs) - self._event_log_queue_cap
-                self._extra_runs = self._extra_runs[drop:]
-                self._overflow_checkpoint_count += 1
-                logger.warning(
-                    "event_log queue overflow; dropped %d oldest spans "
-                    "(checkpoints=%d).  TODO(V1.5): direct-write fallback "
-                    "per RFC-005 F13.", drop, self._overflow_checkpoint_count,
-                )
             self._dirty = True
+            if len(self._extra_runs) > self._event_log_queue_cap:
+                queue_size = len(self._extra_runs)
+                # Build the snapshot UNDER the RLock (re-entrant; safe
+                # per Engineering Guide §11.7).  The
+                # _build_snapshot call increments _snapshot_version, so
+                # the marker carries the post-build version (the
+                # version of the on-disk overflow snapshot).
+                snapshot_to_write = self._build_snapshot()
+                marker = {
+                    "kernel_session_id": self._session_id,
+                    "overflow_at": _utc_now_iso(),
+                    "snapshot_version": snapshot_to_write["snapshot_version"],
+                    "queue_size_at_overflow": queue_size,
+                }
+                # Drain the in-memory queue so subsequent record_run
+                # calls have headroom.  We do this BEFORE releasing the
+                # lock to keep the queue/version state coherent.
+                self._extra_runs = []
+                self._overflow_checkpoint_count += 1
+                overflow_log_args = (
+                    self._overflow_checkpoint_count, queue_size,
+                )
+        # Disk write + log MUST happen AFTER releasing the lock.  The
+        # disk write because §F13 specifies the helper runs outside
+        # the lock; the log because Engineering Guide §11.7 forbids
+        # logger calls inside a lock that a logging handler may
+        # re-enter.
+        if marker is not None and snapshot_to_write is not None:
+            try:
+                self._write_overflow_fallback(marker, snapshot_to_write)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "metadata writer: overflow disk fallback raised; "
+                    "queue already drained, continuing"
+                )
+        if overflow_log_args is not None:
+            checkpoint_count, queue_size = overflow_log_args
+            logger.warning(
+                "event_log queue overflow: queue=%d cap=%d checkpoints=%d; "
+                "checkpoint marker + direct-write per RFC-005 §F13",
+                queue_size, self._event_log_queue_cap, checkpoint_count,
+                extra={
+                    "event.name": "metadata.queue_overflow",
+                    "llmnb.checkpoint_count": checkpoint_count,
+                    "llmnb.queue_size_at_overflow": queue_size,
+                },
+            )
+
+    def _write_overflow_fallback(
+        self, marker: Dict[str, Any], snapshot: Dict[str, Any],
+    ) -> None:
+        """Direct-write the queue-overflow marker + snapshot to disk.
+
+        Per RFC-005 §F13 the fallback path lives sibling to the
+        ``.llmnb`` file at ``<workspace_root>/.llmnb-overflow-marker.json``
+        and ``<workspace_root>/.llmnb-overflow-snapshot.json``.  The
+        operator/extension may merge or discard on next file-open.
+
+        Implementation note: writes are done with ``json.dumps`` +
+        atomic-style "write to .tmp, then os.replace" so a crash mid-
+        write does not leave a half-written marker that the next open
+        would interpret as a successful overflow.
+        """
+        self._workspace_root.mkdir(parents=True, exist_ok=True)
+        marker_path = self._workspace_root / ".llmnb-overflow-marker.json"
+        snapshot_path = self._workspace_root / ".llmnb-overflow-snapshot.json"
+        marker_tmp = marker_path.with_name(marker_path.name + ".tmp")
+        snapshot_tmp = snapshot_path.with_name(snapshot_path.name + ".tmp")
+        # Snapshot first so the marker, when present, points at a
+        # fully written snapshot.
+        snapshot_tmp.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(snapshot_tmp, snapshot_path)
+        marker_tmp.write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(marker_tmp, marker_path)
 
     def append_drift_event(
         self, *, field_path: str, previous_value: Any, current_value: Any,
@@ -611,6 +699,701 @@ class MetadataWriter:
             self._drift_log.append(event)
             self._dirty = True
         return event
+
+    def acknowledge_drift(
+        self, field_path: str, detected_at: str,
+    ) -> bool:
+        """Mark one drift_log entry as operator-acknowledged.
+
+        Locates the entry whose ``field_path`` AND ``detected_at`` BOTH
+        equal the arguments and sets ``operator_acknowledged = True``.
+        Returns ``True`` on a hit, ``False`` when no entry matches
+        (idempotent: this method NEVER raises on miss; the caller -- e.g.
+        the MCP ``drift_acknowledged`` operator action -- is allowed to
+        send the request twice without causing an error).
+
+        Threadsafe: takes the writer's RLock for the duration of the
+        scan + mutate so a concurrent ``append_drift_event`` cannot
+        interleave a partial state.
+        """
+        with self._lock:
+            for entry in self._drift_log:
+                if (
+                    entry.get("field_path") == field_path
+                    and entry.get("detected_at") == detected_at
+                ):
+                    entry["operator_acknowledged"] = True
+                    self._dirty = True
+                    return True
+        return False
+
+    # -- Family B (layout) state machine -----------------------------
+
+    def apply_layout_edit(
+        self, operation: str, parameters: Dict[str, Any],
+    ) -> int:
+        """Apply one ``layout.edit`` operation to the in-memory tree.
+
+        ``operation`` ∈ ``add_zone | remove_node | move_node |
+        rename_node | update_render_hints`` per RFC-006 §"Family B".
+        On success the writer's ``_layout`` is mutated in place,
+        ``_snapshot_version`` is incremented, ``_dirty`` is set, and
+        the new ``_snapshot_version`` is returned.
+
+        On invalid operation (unknown op, missing required parameters,
+        target node not found, duplicate ID) the call leaves state
+        unchanged and returns the CURRENT (un-incremented)
+        ``_snapshot_version``.  Per the K-CM brief: this method does
+        NOT raise; the dispatcher's RFC-006 W4 fail-closed behavior
+        relies on the no-op path being silent at this level.
+        """
+        if not isinstance(parameters, dict):
+            parameters = {}
+        with self._lock:
+            tree = self._layout.get("tree")
+            if not isinstance(tree, dict):
+                return self._snapshot_version
+            ok = False
+            try:
+                if operation == "add_zone":
+                    ok = self._layout_add_zone(tree, parameters)
+                elif operation == "remove_node":
+                    ok = self._layout_remove_node(tree, parameters)
+                elif operation == "move_node":
+                    ok = self._layout_move_node(tree, parameters)
+                elif operation == "rename_node":
+                    ok = self._layout_rename_node(tree, parameters)
+                elif operation == "update_render_hints":
+                    ok = self._layout_update_render_hints(tree, parameters)
+                else:
+                    ok = False
+            except Exception:  # pragma: no cover - defensive
+                ok = False
+            if ok:
+                self._snapshot_version += 1
+                self._dirty = True
+            return self._snapshot_version
+
+    def emit_layout_update(self) -> Dict[str, Any]:
+        """Return the ``layout.update`` payload per RFC-006 §"Family B".
+
+        Shape: ``{"snapshot_version": int, "tree": <tree>}`` -- a
+        DEEP COPY of the current layout tree so callers can mutate
+        the returned object without touching writer state.
+        """
+        with self._lock:
+            return {
+                "snapshot_version": self._snapshot_version,
+                "tree": _deepcopy_json(self._layout.get("tree", {})),
+            }
+
+    # -- Layout helpers (called under self._lock) --------------------
+
+    @staticmethod
+    def _layout_collect_ids(node: Dict[str, Any]) -> List[str]:
+        """Return all node IDs in the subtree rooted at ``node``."""
+        out: List[str] = []
+        stack: List[Dict[str, Any]] = [node]
+        while stack:
+            cur = stack.pop()
+            nid = cur.get("id")
+            if isinstance(nid, str):
+                out.append(nid)
+            for child in cur.get("children", []) or []:
+                if isinstance(child, dict):
+                    stack.append(child)
+        return out
+
+    @staticmethod
+    def _layout_find(
+        node: Dict[str, Any], target_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the node with ``id == target_id`` or ``None``."""
+        if node.get("id") == target_id:
+            return node
+        for child in node.get("children", []) or []:
+            if isinstance(child, dict):
+                hit = MetadataWriter._layout_find(child, target_id)
+                if hit is not None:
+                    return hit
+        return None
+
+    @staticmethod
+    def _layout_find_parent(
+        node: Dict[str, Any], target_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the parent of the node with ``id == target_id``."""
+        for child in node.get("children", []) or []:
+            if isinstance(child, dict):
+                if child.get("id") == target_id:
+                    return node
+                hit = MetadataWriter._layout_find_parent(child, target_id)
+                if hit is not None:
+                    return hit
+        return None
+
+    def _layout_add_zone(
+        self, tree: Dict[str, Any], params: Dict[str, Any],
+    ) -> bool:
+        """Add a zone (or any non-root node) under a named parent."""
+        spec = params.get("node_spec")
+        parent_id = params.get("new_parent_id") or params.get("parent_id")
+        if not isinstance(spec, dict):
+            return False
+        node_id = spec.get("id")
+        if not isinstance(node_id, str) or not node_id:
+            return False
+        # ID uniqueness across the tree.
+        if node_id in self._layout_collect_ids(tree):
+            return False
+        new_node: Dict[str, Any] = {
+            "id": node_id,
+            "type": spec.get("type", "zone"),
+            "render_hints": dict(spec.get("render_hints", {})),
+            "children": list(spec.get("children", [])),
+        }
+        if parent_id is None:
+            parent = tree
+        else:
+            parent = self._layout_find(tree, parent_id)
+            if parent is None:
+                return False
+        children = parent.setdefault("children", [])
+        if not isinstance(children, list):
+            return False
+        children.append(new_node)
+        return True
+
+    def _layout_remove_node(
+        self, tree: Dict[str, Any], params: Dict[str, Any],
+    ) -> bool:
+        node_id = params.get("node_id")
+        if not isinstance(node_id, str) or not node_id:
+            return False
+        if node_id == tree.get("id"):
+            return False  # cannot remove the root
+        parent = self._layout_find_parent(tree, node_id)
+        if parent is None:
+            return False
+        children = parent.get("children", [])
+        if not isinstance(children, list):
+            return False
+        new_children = [
+            c for c in children
+            if not (isinstance(c, dict) and c.get("id") == node_id)
+        ]
+        if len(new_children) == len(children):
+            return False
+        parent["children"] = new_children
+        return True
+
+    def _layout_move_node(
+        self, tree: Dict[str, Any], params: Dict[str, Any],
+    ) -> bool:
+        node_id = params.get("node_id")
+        new_parent_id = params.get("new_parent_id")
+        if not isinstance(node_id, str) or not isinstance(new_parent_id, str):
+            return False
+        if node_id == tree.get("id"):
+            return False  # cannot move root
+        if node_id == new_parent_id:
+            return False  # cannot parent self
+        node = self._layout_find(tree, node_id)
+        if node is None:
+            return False
+        new_parent = self._layout_find(tree, new_parent_id)
+        if new_parent is None:
+            return False
+        # Descendant check: cannot move a node under one of its own
+        # descendants without breaking the tree invariant.
+        if MetadataWriter._layout_find(node, new_parent_id) is not None:
+            return False
+        old_parent = self._layout_find_parent(tree, node_id)
+        if old_parent is None:
+            return False
+        old_children = old_parent.get("children", [])
+        if not isinstance(old_children, list):
+            return False
+        old_parent["children"] = [
+            c for c in old_children
+            if not (isinstance(c, dict) and c.get("id") == node_id)
+        ]
+        new_children = new_parent.setdefault("children", [])
+        if not isinstance(new_children, list):
+            return False
+        new_children.append(node)
+        return True
+
+    def _layout_rename_node(
+        self, tree: Dict[str, Any], params: Dict[str, Any],
+    ) -> bool:
+        node_id = params.get("node_id")
+        new_name = params.get("new_name") or params.get("new_id")
+        if not isinstance(node_id, str) or not isinstance(new_name, str):
+            return False
+        if not new_name:
+            return False
+        if new_name == node_id:
+            return True  # no-op
+        node = self._layout_find(tree, node_id)
+        if node is None:
+            return False
+        if new_name in self._layout_collect_ids(tree):
+            return False
+        node["id"] = new_name
+        return True
+
+    def _layout_update_render_hints(
+        self, tree: Dict[str, Any], params: Dict[str, Any],
+    ) -> bool:
+        node_id = params.get("node_id")
+        hints = params.get("render_hints")
+        if not isinstance(node_id, str) or not isinstance(hints, dict):
+            return False
+        node = self._layout_find(tree, node_id)
+        if node is None:
+            return False
+        existing = node.get("render_hints")
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(hints)
+        node["render_hints"] = existing
+        return True
+
+    # -- Family C (agent graph) state machine ------------------------
+
+    def apply_agent_graph_command(
+        self, command: str, parameters: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply one Family C command and return the response payload.
+
+        ``command`` enumerates BOTH the RFC-006 §"Family C" query types
+        (``neighbors | paths | subgraph | full_snapshot``) AND a minimal
+        CRUD set the kernel needs internally to maintain the graph
+        (``upsert_node | remove_node | upsert_edge | remove_edge``).
+        See the slice's ambiguity flag in the report -- RFC-006 is
+        silent on the mutation set; this is the recommended minimal
+        union and may be tightened by an RFC-006 erratum.
+
+        Returned payload shape:
+
+        * Mutation commands -- ``{"ok": bool, "snapshot_version": int}``.
+        * ``neighbors`` / ``paths`` / ``subgraph`` -- ``{"nodes": [...],
+          "edges": [...], "truncated": bool}``.
+        * ``full_snapshot`` -- ``{"nodes": [...], "edges": [...],
+          "truncated": False}`` containing the entire graph.
+
+        Unknown commands return ``{"ok": false, "snapshot_version": <current>}``
+        (no exception per the dispatcher contract).
+        """
+        if not isinstance(parameters, dict):
+            parameters = {}
+        with self._lock:
+            mutators = {
+                "upsert_node": self._graph_upsert_node,
+                "remove_node": self._graph_remove_node,
+                "upsert_edge": self._graph_upsert_edge,
+                "remove_edge": self._graph_remove_edge,
+            }
+            if command in mutators:
+                ok = False
+                try:
+                    ok = mutators[command](parameters)
+                except Exception:  # pragma: no cover - defensive
+                    ok = False
+                if ok:
+                    self._snapshot_version += 1
+                    self._dirty = True
+                return {
+                    "ok": bool(ok),
+                    "snapshot_version": self._snapshot_version,
+                }
+            if command == "full_snapshot":
+                return {
+                    "nodes": _deepcopy_json(
+                        self._agent_graph.get("nodes", []),
+                    ),
+                    "edges": _deepcopy_json(
+                        self._agent_graph.get("edges", []),
+                    ),
+                    "truncated": False,
+                }
+            if command == "neighbors":
+                return self._graph_neighbors(parameters)
+            if command == "paths":
+                return self._graph_paths(parameters)
+            if command == "subgraph":
+                return self._graph_subgraph(parameters)
+            # Unknown -- mutation-style response with ok=False so the
+            # caller can detect the no-op.
+            return {
+                "ok": False,
+                "snapshot_version": self._snapshot_version,
+            }
+
+    # -- Agent-graph helpers (called under self._lock) ---------------
+
+    def _graph_upsert_node(self, params: Dict[str, Any]) -> bool:
+        node = params.get("node") if isinstance(params.get("node"), dict) else params
+        nid = node.get("id") if isinstance(node, dict) else None
+        if not isinstance(nid, str) or not nid:
+            return False
+        ntype = node.get("type")
+        if not isinstance(ntype, str):
+            return False
+        properties = node.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
+        nodes = self._agent_graph.setdefault("nodes", [])
+        for existing in nodes:
+            if isinstance(existing, dict) and existing.get("id") == nid:
+                existing["type"] = ntype
+                existing["properties"] = dict(properties)
+                return True
+        nodes.append({"id": nid, "type": ntype, "properties": dict(properties)})
+        return True
+
+    def _graph_remove_node(self, params: Dict[str, Any]) -> bool:
+        nid = params.get("node_id") or params.get("id")
+        if not isinstance(nid, str) or not nid:
+            return False
+        nodes = self._agent_graph.get("nodes", [])
+        if not any(isinstance(n, dict) and n.get("id") == nid for n in nodes):
+            return False
+        self._agent_graph["nodes"] = [
+            n for n in nodes
+            if not (isinstance(n, dict) and n.get("id") == nid)
+        ]
+        # Remove edges incident to the removed node.
+        edges = self._agent_graph.get("edges", [])
+        self._agent_graph["edges"] = [
+            e for e in edges
+            if not (
+                isinstance(e, dict)
+                and (e.get("source") == nid or e.get("target") == nid)
+            )
+        ]
+        return True
+
+    def _graph_upsert_edge(self, params: Dict[str, Any]) -> bool:
+        edge = params.get("edge") if isinstance(params.get("edge"), dict) else params
+        if not isinstance(edge, dict):
+            return False
+        source = edge.get("source")
+        target = edge.get("target")
+        kind = edge.get("kind")
+        if not (
+            isinstance(source, str) and isinstance(target, str)
+            and isinstance(kind, str) and source and target and kind
+        ):
+            return False
+        # RFC-005 §`metadata.rts.agents`: edge endpoints MUST exist
+        # in nodes[].
+        node_ids = {
+            n.get("id") for n in self._agent_graph.get("nodes", [])
+            if isinstance(n, dict)
+        }
+        if source not in node_ids or target not in node_ids:
+            return False
+        properties = edge.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
+        edges = self._agent_graph.setdefault("edges", [])
+        for existing in edges:
+            if (
+                isinstance(existing, dict)
+                and existing.get("source") == source
+                and existing.get("target") == target
+                and existing.get("kind") == kind
+            ):
+                existing["properties"] = dict(properties)
+                return True
+        edges.append({
+            "source": source, "target": target,
+            "kind": kind, "properties": dict(properties),
+        })
+        return True
+
+    def _graph_remove_edge(self, params: Dict[str, Any]) -> bool:
+        source = params.get("source")
+        target = params.get("target")
+        kind = params.get("kind")
+        if not (
+            isinstance(source, str) and isinstance(target, str)
+            and isinstance(kind, str)
+        ):
+            return False
+        edges = self._agent_graph.get("edges", [])
+        new_edges = [
+            e for e in edges
+            if not (
+                isinstance(e, dict)
+                and e.get("source") == source
+                and e.get("target") == target
+                and e.get("kind") == kind
+            )
+        ]
+        if len(new_edges) == len(edges):
+            return False
+        self._agent_graph["edges"] = new_edges
+        return True
+
+    def _graph_neighbors(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        nid = params.get("node_id")
+        if not isinstance(nid, str) or not nid:
+            return {"nodes": [], "edges": [], "truncated": False}
+        try:
+            hops = int(params.get("hops", 1) or 1)
+        except (TypeError, ValueError):
+            hops = 1
+        hops = max(1, min(hops, 16))
+        edge_filters = params.get("edge_filters")
+        if isinstance(edge_filters, list):
+            allowed_kinds = {k for k in edge_filters if isinstance(k, str)}
+        else:
+            allowed_kinds = None
+        nodes_by_id = {
+            n.get("id"): n for n in self._agent_graph.get("nodes", [])
+            if isinstance(n, dict)
+        }
+        edges = [
+            e for e in self._agent_graph.get("edges", [])
+            if isinstance(e, dict)
+        ]
+        if allowed_kinds is not None:
+            edges = [e for e in edges if e.get("kind") in allowed_kinds]
+        visited = {nid}
+        frontier = {nid}
+        included_edges: List[Dict[str, Any]] = []
+        for _ in range(hops):
+            next_frontier: set = set()
+            for edge in edges:
+                src = edge.get("source")
+                dst = edge.get("target")
+                if src in frontier and dst not in visited:
+                    next_frontier.add(dst)
+                    included_edges.append(edge)
+                elif dst in frontier and src not in visited:
+                    next_frontier.add(src)
+                    included_edges.append(edge)
+            visited |= next_frontier
+            frontier = next_frontier
+            if not frontier:
+                break
+        result_nodes = [
+            nodes_by_id[n] for n in visited if n in nodes_by_id
+        ]
+        return {
+            "nodes": _deepcopy_json(result_nodes),
+            "edges": _deepcopy_json(included_edges),
+            "truncated": False,
+        }
+
+    def _graph_paths(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        source = params.get("node_id") or params.get("source")
+        target = params.get("target_node_id") or params.get("target")
+        if not (isinstance(source, str) and isinstance(target, str)):
+            return {"nodes": [], "edges": [], "truncated": False}
+        try:
+            hops = int(params.get("hops", 4) or 4)
+        except (TypeError, ValueError):
+            hops = 4
+        hops = max(1, min(hops, 16))
+        # Simple BFS from source to target up to ``hops`` edges, return
+        # the union of nodes and edges on the discovered path (one
+        # shortest path).
+        edges = [
+            e for e in self._agent_graph.get("edges", [])
+            if isinstance(e, dict)
+        ]
+        adj: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        for e in edges:
+            s = e.get("source")
+            t = e.get("target")
+            if isinstance(s, str) and isinstance(t, str):
+                adj.setdefault(s, []).append((t, e))
+                adj.setdefault(t, []).append((s, e))  # undirected for V1
+        prev: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        seen = {source}
+        frontier = [source]
+        depth = 0
+        found = source == target
+        while frontier and depth < hops and not found:
+            next_frontier: List[str] = []
+            for cur in frontier:
+                for nbr, edge in adj.get(cur, []):
+                    if nbr in seen:
+                        continue
+                    seen.add(nbr)
+                    prev[nbr] = (cur, edge)
+                    if nbr == target:
+                        found = True
+                        break
+                    next_frontier.append(nbr)
+                if found:
+                    break
+            frontier = next_frontier
+            depth += 1
+        if not found:
+            return {"nodes": [], "edges": [], "truncated": False}
+        # Reconstruct path.
+        path_node_ids: List[str] = [target]
+        path_edges: List[Dict[str, Any]] = []
+        cur = target
+        while cur != source:
+            parent, edge = prev[cur]
+            path_node_ids.append(parent)
+            path_edges.append(edge)
+            cur = parent
+        nodes_by_id = {
+            n.get("id"): n for n in self._agent_graph.get("nodes", [])
+            if isinstance(n, dict)
+        }
+        path_nodes = [
+            nodes_by_id[n] for n in path_node_ids if n in nodes_by_id
+        ]
+        return {
+            "nodes": _deepcopy_json(path_nodes),
+            "edges": _deepcopy_json(path_edges),
+            "truncated": False,
+        }
+
+    def _graph_subgraph(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        ids = params.get("node_ids")
+        if not isinstance(ids, list):
+            return {"nodes": [], "edges": [], "truncated": False}
+        wanted = {n for n in ids if isinstance(n, str)}
+        nodes = [
+            n for n in self._agent_graph.get("nodes", [])
+            if isinstance(n, dict) and n.get("id") in wanted
+        ]
+        edges = [
+            e for e in self._agent_graph.get("edges", [])
+            if isinstance(e, dict)
+            and e.get("source") in wanted and e.get("target") in wanted
+        ]
+        return {
+            "nodes": _deepcopy_json(nodes),
+            "edges": _deepcopy_json(edges),
+            "truncated": False,
+        }
+
+    # -- Hydration ---------------------------------------------------
+
+    def hydrate(self, snapshot: Dict[str, Any]) -> None:
+        """Reset in-memory state from a persisted ``metadata.rts`` snapshot.
+
+        Idempotent: hydrating with the same snapshot twice leaves the
+        writer in the same observable state (``snapshot_version``,
+        ``_layout``, ``_agent_graph``, etc. all match).
+
+        Steps:
+
+        1. Validate ``schema_version`` major equals RFC-005 v1
+           (``"1"``).  Mismatch raises :class:`ValueError`.
+        2. Validate the inner ``config`` block contains no forbidden
+           secret fields (RFC-005 §F2).  Forbidden field raises
+           :class:`ValueError("forbidden secret in config")`.
+        3. Replace ``_layout``, ``_agent_graph``, ``_extra_runs``,
+           ``_blobs``, ``_drift_log``, ``_config``, and
+           ``_snapshot_version`` with values from the snapshot.
+
+        ``snapshot_version`` semantics: the writer stores the
+        persisted value verbatim.  The next call to
+        :meth:`_build_snapshot` (via :meth:`snapshot`,
+        :meth:`apply_layout_edit` follow-up emission, etc.) will
+        increment so the kernel emits the next version (per RFC-006
+        §"hydrate request/response semantics": "the kernel resumes its
+        counter from this value + 1").  Writers MUST NOT decrement
+        ``snapshot_version`` -- this method is the only legitimate way
+        to assign a smaller value, and it does so only at session
+        start.
+
+        This method does NOT call :class:`DriftDetector.compare` (the
+        K-CM dispatcher does that against current-environment values
+        K-MW does not have access to) and does NOT respawn agents
+        (K-AS / K-CM do that via ``AgentSupervisor.respawn_from_config``).
+        """
+        if not isinstance(snapshot, dict):
+            raise ValueError("hydrate: snapshot must be a dict")
+        # Validate schema_version major matches.
+        sv = snapshot.get("schema_version", "")
+        if not isinstance(sv, str):
+            raise ValueError(
+                "hydrate: schema_version must be a string"
+            )
+        major = sv.split(".", 1)[0] if sv else ""
+        expected_major = SCHEMA_VERSION.split(".", 1)[0]
+        if major != expected_major:
+            raise ValueError(
+                f"hydrate: schema_version major {major!r} does not match "
+                f"this writer's RFC-005 major {expected_major!r}"
+            )
+        # Validate forbidden-secret fields in config.  We use a
+        # ValueError with the brief-mandated message rather than the
+        # in-process ``SecretRejected`` because the brief locks the
+        # exception type to ``ValueError("forbidden secret in config")``.
+        config = snapshot.get("config")
+        if isinstance(config, dict):
+            try:
+                reject_secrets(config, path="config")
+            except SecretRejected as exc:
+                raise ValueError("forbidden secret in config") from exc
+        # Apply.  All state under the writer's RLock so a concurrent
+        # ``snapshot()`` does not see a partial hydrate.
+        with self._lock:
+            layout = snapshot.get("layout")
+            if isinstance(layout, dict):
+                self._layout = _deepcopy_json(layout)
+            else:
+                self._layout = {
+                    "version": 1,
+                    "tree": {
+                        "id": "root", "type": "workspace",
+                        "render_hints": {}, "children": [],
+                    },
+                }
+            # RFC-005's snapshot key is "agents"; the writer's
+            # in-memory name is _agent_graph (per the K-MW slice
+            # rename for clarity against the brief).
+            agents = snapshot.get("agents")
+            if isinstance(agents, dict):
+                self._agent_graph = _deepcopy_json(agents)
+            else:
+                self._agent_graph = {
+                    "version": 1, "nodes": [], "edges": [],
+                }
+            event_log = snapshot.get("event_log") or {}
+            runs = event_log.get("runs") if isinstance(event_log, dict) else None
+            if isinstance(runs, list):
+                self._extra_runs = [_deepcopy_json(r) for r in runs]
+            else:
+                self._extra_runs = []
+            blobs = snapshot.get("blobs")
+            if isinstance(blobs, dict):
+                self._blobs = _deepcopy_json(blobs)
+            else:
+                self._blobs = {}
+            drift_log = snapshot.get("drift_log")
+            if isinstance(drift_log, list):
+                self._drift_log = [_deepcopy_json(d) for d in drift_log]
+            else:
+                self._drift_log = []
+            cfg = snapshot.get("config")
+            if isinstance(cfg, dict):
+                self._config = _deepcopy_json(cfg)
+            persisted_version = snapshot.get("snapshot_version", 0)
+            try:
+                self._snapshot_version = int(persisted_version)
+            except (TypeError, ValueError):
+                self._snapshot_version = 0
+            persisted_session = snapshot.get("session_id")
+            if isinstance(persisted_session, str) and persisted_session:
+                self._session_id = persisted_session
+            persisted_created_at = snapshot.get("created_at")
+            if isinstance(persisted_created_at, str) and persisted_created_at:
+                self._created_at = persisted_created_at
+            self._dirty = False
 
     # -- Snapshot triggers -------------------------------------------
 
@@ -754,7 +1537,7 @@ class MetadataWriter:
                 "created_at": self._created_at,
                 "snapshot_version": self._snapshot_version,
                 "layout": dict(self._layout),
-                "agents": dict(self._agents),
+                "agents": dict(self._agent_graph),
                 "config": _deepcopy_json(self._config),
                 "event_log": {"version": 1, "runs": runs},
                 "blobs": dict(self._blobs),

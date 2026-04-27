@@ -18,6 +18,7 @@ from typing import Any, Dict, List
 
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
+from hypothesis.database import InMemoryExampleDatabase
 
 from .harness import EventSequencer, FaultInjector, FaultMatrix, ReplayHarness, ReplayMode
 from .invariants import (
@@ -30,10 +31,16 @@ from .invariants import (
 from .scenarios import SCENARIOS, ScenarioFactory
 
 # Hypothesis profiles: fast (CI default) and nightly (slow suite).
+# Use an InMemoryExampleDatabase so xdist workers don't contend on the
+# shared on-disk ``~/.hypothesis/examples/`` directory; the parallel
+# suite is short-running and gains nothing from cross-run example reuse.
+_HYP_DB = InMemoryExampleDatabase()
 settings.register_profile("ci", max_examples=100, deadline=None,
+                          database=_HYP_DB,
                           suppress_health_check=[HealthCheck.too_slow,
                                                  HealthCheck.function_scoped_fixture])
 settings.register_profile("nightly", max_examples=1000, deadline=None,
+                          database=_HYP_DB,
                           suppress_health_check=[HealthCheck.too_slow,
                                                  HealthCheck.function_scoped_fixture])
 settings.load_profile("ci")

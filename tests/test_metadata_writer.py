@@ -284,10 +284,16 @@ def test_writer_blob_extraction_in_snapshot() -> None:
     assert snap["blobs"][blob_key]["data"] == big
 
 
-def test_writer_event_log_bounded_queue_overflow(caplog: pytest.LogCaptureFixture) -> None:
+def test_writer_event_log_bounded_queue_overflow(
+    caplog: pytest.LogCaptureFixture, tmp_path,
+) -> None:
     """Event-log queue caps at 10 000; overflow logs a checkpoint warning."""
     cap = 8  # tiny cap to keep the test fast
-    writer = MetadataWriter(autosave_interval_sec=999.0, event_log_queue_cap=cap)
+    writer = MetadataWriter(
+        autosave_interval_sec=999.0,
+        event_log_queue_cap=cap,
+        workspace_root=tmp_path,
+    )
     import logging as _logging
     with caplog.at_level(_logging.WARNING, logger="llm_kernel.metadata_writer"):
         for i in range(cap + 5):

@@ -130,10 +130,25 @@ async def test_report_completion_round_trip(
 
 
 @pytest.mark.asyncio
-async def test_read_file_is_unimplemented(bridge: OperatorBridgeServer) -> None:
-    """Proxied read_file MUST raise NotImplementedError until B2/B5 land."""
-    with pytest.raises(NotImplementedError, match="Track B1 stub"):
-        await _invoke(bridge, "read_file", {"path": "anything.txt"})
+async def test_read_file_round_trip(
+    bridge: OperatorBridgeServer, tmp_path, monkeypatch,
+) -> None:
+    """Proxied read_file returns workspace-rooted file contents.
+
+    Per RFC-001 §read_file the proxied handler returns the file's
+    contents as a string with the encoding, byte size, and a
+    truncation flag.  The B1 ``NotImplementedError`` stub was
+    replaced by K-MCP under the V1 mega-round.
+    """
+    monkeypatch.setenv("LLMKERNEL_WORKSPACE_ROOT", str(tmp_path))
+    target = tmp_path / "hello.txt"
+    target.write_text("hello round-trip", encoding="utf-8")
+    result = await _invoke(bridge, "read_file", {"path": "hello.txt"})
+    payload = _structured(result)
+    assert payload["content"] == "hello round-trip"
+    assert payload["encoding"] == "utf-8"
+    assert payload["truncated"] is False
+    assert payload["size_bytes"] == len("hello round-trip")
 
 
 @pytest.mark.asyncio
