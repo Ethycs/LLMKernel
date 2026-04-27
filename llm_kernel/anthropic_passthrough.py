@@ -183,9 +183,13 @@ class AnthropicPassthroughServer:
         """Read the addon's JSONL log; emit RunTracker events; return rows.
 
         Pairs ``request``/``response`` records by ``correlation_id`` and
-        opens one ``run_type=llm`` run per pair. Errors (connection /
-        TLS) close the run as ``status="error"``. Returns the raw list
-        of records read for the smoke harness's own assertions.
+        opens one OTLP span per pair (``llmnb.run_type = "llm"``).  The
+        request URL/method/auth surface as inputs (folded into
+        ``input.value``); ``gen_ai.system = "anthropic"`` and the model
+        name when it can be parsed from the request path.  Errors
+        (connection / TLS) close the span with
+        ``status.code = STATUS_CODE_ERROR``.  Returns the raw list of
+        rows read for the smoke harness's own assertions.
         """
         target = tracker or self.run_tracker
         rows: List[Dict[str, Any]] = []
@@ -202,7 +206,8 @@ class AnthropicPassthroughServer:
                     continue
         if target is None:
             return rows
-        # Pair request + response by correlation_id.
+        # Pair request + response by correlation_id (mitm addon's
+        # per-flow id; distinct from the OTLP spanId we allocate).
         pending: Dict[str, str] = {}
         for row in rows:
             cid = row.get("correlation_id")
@@ -221,7 +226,13 @@ class AnthropicPassthroughServer:
                         "body_bytes": row.get("body_bytes"),
                         "stream": row.get("stream"),
                     },
-                    metadata={"correlation_id": cid, "ts": row.get("ts")},
+                    metadata={
+                        "gen_ai.system": "anthropic",
+                        "http.method": row.get("method"),
+                        "http.url": row.get("url"),
+                        "mitm.correlation_id": cid,
+                        "mitm.ts": row.get("ts"),
+                    },
                 )
                 pending[cid] = run_id
             elif row["kind"] == "response":
@@ -237,13 +248,19 @@ class AnthropicPassthroughServer:
                         "content_type": row.get("content_type"),
                         "duration_ms": row.get("duration_ms"),
                     },
-                    status="success" if ok else "error",
+                    status="STATUS_CODE_OK" if ok else "STATUS_CODE_ERROR",
                 )
             elif row["kind"] == "error":
                 run_id = pending.pop(cid, None)
                 if run_id is None:
                     continue
-                target.fail_run(run_id, error={"message": row.get("message")})
+                target.fail_run(
+                    run_id,
+                    error={
+                        "exception.type": "AnthropicPassthroughError",
+                        "exception.message": str(row.get("message", "")),
+                    },
+                )
         return rows
 
 

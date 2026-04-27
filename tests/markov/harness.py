@@ -71,22 +71,30 @@ class CapturingSink:
 def fold_state(envelopes: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Reconstruct kernel-visible state from an append-only envelope log.
 
-    RFC-004 §I3: ``fold(initial_state, e)`` — runs map ``run_id`` to
+    RFC-004 §I3: ``fold(initial_state, e)`` — runs map spanId to
     ``"open"`` after ``run.start`` and to the ``run.complete``
-    ``status`` once closed.
+    ``status.code`` once closed.
+
+    Post-OTLP refactor (R1-K): payload identity is ``spanId`` (16-hex)
+    and status is the OTel object ``{code, message}``.  The reduced
+    state stores the OTel ``status.code`` string for I3 fold parity.
     """
     runs: Dict[str, str] = {}
     for env in envelopes:
         mt = env.get("message_type")
         payload = env.get("payload") or {}
         if mt == "run.start":
-            run_id = payload.get("id") or env.get("correlation_id")
+            run_id = payload.get("spanId") or env.get("correlation_id")
             if isinstance(run_id, str):
                 runs[run_id] = "open"
         elif mt == "run.complete":
-            run_id = payload.get("run_id") or env.get("correlation_id")
+            run_id = payload.get("spanId") or env.get("correlation_id")
             if isinstance(run_id, str):
-                runs[run_id] = str(payload.get("status", "success"))
+                status = payload.get("status") or {}
+                if isinstance(status, dict):
+                    runs[run_id] = str(status.get("code", "STATUS_CODE_OK"))
+                else:
+                    runs[run_id] = str(status)
     return {"runs": runs}
 
 
@@ -246,14 +254,30 @@ class EventSequencer:
                     entry["end_ts"] = env["timestamp"]
 
     def _stamp_timeout(self, run_id: str) -> None:
-        """Append a synthetic run.complete(status=error) for a timed-out run."""
+        """Append a synthetic run.complete(status=ERROR) for a timed-out run.
+
+        Post-OTLP refactor (R1-K): the payload now carries OTLP shape —
+        ``spanId``, ``endTimeUnixNano`` (decimal-nanoseconds string),
+        OTel ``status`` object, and OTel exception attributes
+        (``exception.type`` / ``exception.message``).
+        """
+        import time as _time
+        from llm_kernel._attrs import encode_attrs
         envelope = make_envelope(
             "run.complete",
-            {"run_id": run_id, "end_time": utc_now_iso(),
-             "outputs": {}, "error": {"kind": "TimeoutError",
-                                       "message": "approval_timeout",
-                                       "traceback": ""},
-             "status": "error"},
+            {
+                "spanId": run_id,
+                "endTimeUnixNano": str(_time.time_ns()),
+                "status": {
+                    "code": "STATUS_CODE_ERROR",
+                    "message": "approval_timeout",
+                },
+                "attributes": encode_attrs({
+                    "exception.type": "TimeoutError",
+                    "exception.message": "approval_timeout",
+                    "exception.stacktrace": "",
+                }),
+            },
             correlation_id=run_id,
         )
         self.sink.envelopes.append(envelope)

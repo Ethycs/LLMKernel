@@ -94,7 +94,9 @@ class OperatorBridgeServer:
         Args:
             agent_id: ``LLMKERNEL_AGENT_ID`` from RFC-002.
             zone_id: ``LLMKERNEL_ZONE_ID`` from RFC-002.
-            trace_id: ``LLMKERNEL_RUN_TRACE_ID``; defaults to a fresh UUIDv4.
+            trace_id: ``LLMKERNEL_RUN_TRACE_ID``; defaults to a fresh
+                32-lowercase-hex OTLP traceId.  UUID input is accepted
+                and dashes are stripped for env-var continuity.
             run_tracker: Optional Track B2 :class:`RunTracker` shared
                 across kernel-mediated producers. When set, every native
                 tool invocation registers a ``run.start`` /
@@ -111,7 +113,17 @@ class OperatorBridgeServer:
         """
         self.agent_id: str = agent_id
         self.zone_id: str = zone_id
-        self.trace_id: str = trace_id or str(uuid.uuid4())
+        # OTLP traceId is 16 random bytes as 32-lowercase-hex.  Accept
+        # legacy UUID input (strip dashes) for env-var continuity with
+        # ``LLMKERNEL_RUN_TRACE_ID`` set by older callers.
+        if trace_id:
+            try:
+                self.trace_id: str = uuid.UUID(trace_id).hex
+            except (ValueError, AttributeError):
+                self.trace_id = trace_id.lower()
+        else:
+            import secrets as _secrets
+            self.trace_id = _secrets.token_hex(16)
         self.run_tracker: Optional[RunTracker] = run_tracker
         self.dispatcher: Optional["CustomMessageDispatcher"] = dispatcher
         self.server: Server = Server(SERVER_NAME)
@@ -171,6 +183,12 @@ class OperatorBridgeServer:
             arguments: Dict[str, Any] = request.params.arguments or {}
             handler = self._handlers.get(tool_name)
             if handler is None:
+                # RFC-002 §"Failure modes" allowed-tools-bypass row:
+                # in addition to the JSON-RPC -32601 the spec already
+                # mandates, emit an ``agent_emit`` span with kind
+                # ``invalid_tool_use`` so the operator surface sees
+                # the attempt rather than just the silent denial.
+                self._emit_invalid_tool_use(tool_name, arguments)
                 raise McpError(
                     types.ErrorData(
                         code=types.METHOD_NOT_FOUND,
@@ -196,17 +214,21 @@ class OperatorBridgeServer:
                         f"zone:{self.zone_id}",
                         f"tool:{tool_name}",
                     ],
+                    metadata={"tool.name": tool_name},
                 )
                 token = _active_run_id.set(run_id)
                 try:
                     result = await handler(arguments)
                 except Exception as exc:
+                    # OTel exception semconv: surface the type / message
+                    # / stacktrace as ``exception.*`` attributes via the
+                    # tracker's ``fail_run`` -> OTLP normalization.
                     self.run_tracker.fail_run(
                         run_id,
                         error={
-                            "kind": type(exc).__name__,
-                            "message": str(exc),
-                            "traceback": "",
+                            "exception.type": type(exc).__name__,
+                            "exception.message": str(exc),
+                            "exception.stacktrace": "",
                         },
                     )
                     raise
@@ -216,7 +238,11 @@ class OperatorBridgeServer:
                 result.setdefault("run_id", run_id)
                 self.run_tracker.complete_run(run_id, outputs=dict(result))
             else:
-                run_id = str(uuid.uuid4())
+                # Track B1 fallback (no run_tracker): allocate an OTLP
+                # spanId directly so the log line shape matches the
+                # production envelope's payload.spanId.
+                import secrets as _secrets
+                run_id = _secrets.token_hex(8)
                 self._log_run("run.start", tool_name, run_id, inputs=arguments)
                 token = _active_run_id.set(run_id)
                 try:
@@ -236,6 +262,44 @@ class OperatorBridgeServer:
 
         self.server.request_handlers[types.CallToolRequest] = _call_tool_handler
 
+    def _emit_invalid_tool_use(
+        self, tool_name: str, arguments: Dict[str, Any],
+    ) -> None:
+        """Emit an ``agent_emit`` span with kind ``invalid_tool_use``.
+
+        Per RFC-005 §"`agent_emit` runs" / RFC-002 §"Failure modes"
+        the kernel surfaces tool-call attempts that fail the
+        allowed-tools restriction so the operator can see the
+        bypass attempt, not just the silent JSON-RPC denial.  The
+        diagnostic carries the tool name and a short reason string;
+        the arguments are dropped (could carry sensitive data the
+        operator did not opt to share with the audit log).
+        """
+        if self.run_tracker is None:
+            return
+        import json as _json
+        try:
+            content = _json.dumps(
+                {"tool_name": tool_name, "arguments": arguments},
+                default=str, ensure_ascii=False,
+            )
+        except (TypeError, ValueError):
+            content = f"tool_name={tool_name!r}"
+        rid = self.run_tracker.start_run(
+            name=f"agent_emit:invalid_tool_use",
+            run_type="agent_emit", inputs={},
+            tags=[f"agent:{self.agent_id}", f"zone:{self.zone_id}",
+                  "agent_emit:invalid_tool_use"],
+            metadata={
+                "emit_kind": "invalid_tool_use",
+                "emit_content": content,
+                "parser_diagnostic": (
+                    f"tool {tool_name!r} not in RFC-001 catalog"
+                ),
+            },
+        )
+        self.run_tracker.complete_run(rid, outputs={})
+
     def _log_run(
         self,
         message_type: str,
@@ -252,15 +316,22 @@ class OperatorBridgeServer:
         :class:`CustomMessageDispatcher`, which serializes onto Jupyter
         messaging as a real ``run.start`` / ``run.complete`` envelope.
         """
+        # OTLP semconv shape: ``llmnb.run_type`` lives in attributes,
+        # not as a top-level field.  This log-only fallback mirrors
+        # the production envelope's keys for grep parity.
         extra: Dict[str, Any] = {
             "rfc": "RFC-003",
             "message_type": message_type,
-            "run_id": run_id,
-            "trace_id": self.trace_id,
+            "spanId": run_id,
+            "traceId": self.trace_id,
             "name": tool_name,
-            "run_type": "tool",
+            "kind": "SPAN_KIND_INTERNAL",
             "timestamp": _utc_now_iso(),
-            "metadata": {"agent_id": self.agent_id, "zone_id": self.zone_id},
+            "attributes": {
+                "llmnb.run_type": "tool",
+                "llmnb.agent_id": self.agent_id,
+                "llmnb.zone_id": self.zone_id,
+            },
         }
         extra.update(fields)
         logger.info(message_type, extra=extra)
@@ -432,7 +503,7 @@ class OperatorBridgeServer:
                 "server_name": SERVER_NAME,
                 "agent_id": self.agent_id,
                 "zone_id": self.zone_id,
-                "trace_id": self.trace_id,
+                "traceId": self.trace_id,
                 "rfc_001_version": RFC_001_VERSION,
             },
         )

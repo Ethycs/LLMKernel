@@ -16,7 +16,6 @@ import logging
 import socket
 import threading
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -122,7 +121,6 @@ class LiteLLMProxyServer:
         if not model:
             raise HTTPException(status_code=400, detail="'model' is required")
 
-        run_id: str = str(uuid.uuid4())
         stream: bool = bool(body.get("stream"))
 
         # TODO(V1.5): validate HMAC bearer (RFC-002 § "Authentication"); V1
@@ -131,9 +129,20 @@ class LiteLLMProxyServer:
         # calls run_tracker.start_run / event / complete_run, and the
         # run-tracker's sink (the Track B3 CustomMessageDispatcher in
         # production, a list-sink in tests) does the IOPub emission.
-        self._tracker_call(
-            "start_run", run_id=run_id, name=f"litellm:{model}", run_type="llm",
-            inputs=body, metadata={"endpoint": "v1/messages", "stream": stream},
+        # Post-OTLP refactor (R1-K): run_tracker.start_run allocates
+        # the OTLP spanId internally and returns it; we no longer mint
+        # a UUID up-front.  ``gen_ai.*`` semantic-conventions land on
+        # the span via the ``metadata`` -> ``llmnb.metadata.*`` and
+        # the explicit ``llmnb.run_type = "llm"`` path.
+        run_id: str = self._tracker_start(
+            name=f"litellm:{model}", run_type="llm",
+            inputs=body,
+            metadata={
+                "gen_ai.system": "anthropic",
+                "gen_ai.request.model": model,
+                "endpoint": "v1/messages",
+                "stream": stream,
+            },
         )
         logger.info("messages run_id=%s model=%s stream=%s", run_id, model, stream)
 
@@ -152,7 +161,7 @@ class LiteLLMProxyServer:
             )
 
         outputs = _to_dict(result)
-        self._complete(run_id, outputs, status="success")
+        self._complete(run_id, outputs, status="STATUS_CODE_OK")
         logger.info("messages run_id=%s complete", run_id)
         return JSONResponse(content=outputs)
 
@@ -164,8 +173,13 @@ class LiteLLMProxyServer:
             async for chunk in result:
                 data = _to_dict(chunk)
                 logger.debug("stream chunk run_id=%s", run_id)
+                # ``token`` is the OTel/OTLP ``SpanEvent.name`` for an
+                # LLM streaming chunk; ``gen_ai.choice`` is the GenAI
+                # semconv counterpart but we keep ``token`` for
+                # operator-surface continuity with chapter 06.
                 self._tracker_call(
-                    "event", run_id=run_id, event_type="token", data={"chunk": data}
+                    "event", run_id=run_id, event_type="token",
+                    data={"chunk": data},
                 )
                 yield (b"data: " + json.dumps(data).encode("utf-8") + b"\n\n")
         except Exception as exc:
@@ -173,7 +187,7 @@ class LiteLLMProxyServer:
             err = {"type": type(exc).__name__, "message": str(exc)}
             yield (b"data: " + json.dumps({"type": "error", "error": err}).encode("utf-8") + b"\n\n")
             return
-        self._complete(run_id, {"streamed": True}, status="success")
+        self._complete(run_id, {"streamed": True}, status="STATUS_CODE_OK")
         logger.info("messages run_id=%s stream complete", run_id)
 
     def _tracker_call(self, method: str, **kwargs: Any) -> None:
@@ -185,12 +199,37 @@ class LiteLLMProxyServer:
         except Exception:  # pragma: no cover
             logger.exception("run_tracker.%s raised; continuing", method)
 
+    def _tracker_start(self, **kwargs: Any) -> str:
+        """Allocate a span via :meth:`RunTracker.start_run`.
+
+        Returns the span id (16-hex OTLP ``spanId``).  When no tracker
+        is wired (e.g. the proxy is hosting a smoke without B2), a
+        synthetic spanId is allocated locally so the proxy's logs
+        still carry a stable identifier.
+        """
+        if self._run_tracker is None:
+            import secrets as _secrets
+            return _secrets.token_hex(8)
+        try:
+            return self._run_tracker.start_run(**kwargs)  # type: ignore[no-any-return]
+        except Exception:  # pragma: no cover
+            logger.exception("run_tracker.start_run raised; continuing")
+            import secrets as _secrets
+            return _secrets.token_hex(8)
+
     def _complete(self, run_id: str, outputs: Dict[str, Any], status: str) -> None:
         """Forward run completion to the run-tracker."""
         self._tracker_call("complete_run", run_id=run_id, outputs=outputs, status=status)
 
     def _fail(self, run_id: str, exc: BaseException) -> JSONResponse:
-        """Close the run with status=error and return an Anthropic-shaped body."""
+        """Close the run with status=error and return an Anthropic-shaped body.
+
+        The legacy ``error={"type", "message", "code"}`` envelope was
+        flattened: the OTel exception semconv keys
+        (``exception.type`` / ``exception.message``) carry the failure
+        on the span, while ``code`` continues to drive the HTTP status
+        of the JSONResponse the operator's HTTP client receives.
+        """
         err = {
             "type": type(exc).__name__,
             "message": str(exc),
@@ -198,7 +237,11 @@ class LiteLLMProxyServer:
         }
         logger.warning("messages run_id=%s error=%s", run_id, err)
         self._tracker_call(
-            "complete_run", run_id=run_id, outputs={}, status="error", error=err
+            "fail_run", run_id=run_id,
+            error={
+                "exception.type": err["type"],
+                "exception.message": err["message"],
+            },
         )
         body = {"type": "error", "error": {"type": err["type"], "message": err["message"]}}
         status = err["code"] if isinstance(err["code"], int) else 502

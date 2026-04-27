@@ -8,7 +8,7 @@ runs the agent loop *inside* the kernel process: each turn calls the
 Anthropic Messages API (routed through our LiteLLM proxy so the layer-2
 invariant from DR-0016 holds), inspects ``tool_use`` content blocks,
 dispatches them through the live :class:`OperatorBridgeServer`'s native
-handlers (which already wire run-records via the run-tracker, B2), and
+handlers (which already wire OTLP spans via the run-tracker, B2), and
 feeds ``tool_result`` blocks back to the model until it emits
 ``report_completion`` or stops calling tools.
 

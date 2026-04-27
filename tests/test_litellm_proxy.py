@@ -21,19 +21,28 @@ class StubRunTracker:
 
     Records every method invocation as ``(method_name, kwargs_dict)`` so
     tests can assert on the RFC-003 envelope sequence the proxy emits.
+    Post-OTLP refactor (R1-K) ``start_run`` returns a 16-lowercase-hex
+    span id (the same shape :class:`RunTracker.start_run` returns).
     """
 
     def __init__(self) -> None:
         self.calls: List[Dict[str, Any]] = []
+        self._next_id = 0
 
-    def start_run(self, **kwargs: Any) -> None:
-        self.calls.append({"method": "start_run", **kwargs})
+    def start_run(self, **kwargs: Any) -> str:
+        self._next_id += 1
+        span_id = f"{self._next_id:016x}"
+        self.calls.append({"method": "start_run", "span_id": span_id, **kwargs})
+        return span_id
 
     def event(self, **kwargs: Any) -> None:
         self.calls.append({"method": "event", **kwargs})
 
     def complete_run(self, **kwargs: Any) -> None:
         self.calls.append({"method": "complete_run", **kwargs})
+
+    def fail_run(self, **kwargs: Any) -> None:
+        self.calls.append({"method": "fail_run", **kwargs})
 
     def methods(self) -> List[str]:
         return [c["method"] for c in self.calls]
@@ -119,9 +128,14 @@ def test_messages_endpoint_emits_run_start_and_complete(monkeypatch: pytest.Monk
     start = tracker.calls[0]
     end = tracker.calls[1]
     assert start["name"] == "litellm:claude-sonnet-4-6"
+    # OTLP refactor: run_type rides on the metadata dict so it lands on
+    # the span as ``llmnb.run_type``; the legacy top-level field is gone.
     assert start["run_type"] == "llm"
-    assert end["status"] == "success"
-    assert end["run_id"] == start["run_id"]
+    # OTel canonical status codes per OTLP/JSON spec.
+    assert end["status"] == "STATUS_CODE_OK"
+    # ``run_id`` arg the proxy forwards to ``complete_run`` MUST equal
+    # the spanId start_run returned (same OTLP span across the lifecycle).
+    assert end["run_id"] == start["span_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +183,8 @@ def test_streaming_response_passes_through(monkeypatch: pytest.MonkeyPatch) -> N
     assert methods[0] == "start_run"
     assert methods.count("event") == 3
     assert methods[-1] == "complete_run"
-    assert tracker.calls[-1]["status"] == "success"
+    # OTel canonical status code for a clean stream completion.
+    assert tracker.calls[-1]["status"] == "STATUS_CODE_OK"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +222,10 @@ def test_litellm_error_emits_run_error_envelope(monkeypatch: pytest.MonkeyPatch)
     assert body["error"]["type"] == "FakeAPIError"
     assert "upstream provider down" in body["error"]["message"]
 
+    # The proxy now closes errored runs via fail_run (which emits the
+    # OTel exception semconv attributes) instead of complete_run with
+    # an error envelope.
     methods = tracker.methods()
-    assert methods == ["start_run", "complete_run"]
-    assert tracker.calls[-1]["status"] == "error"
-    assert tracker.calls[-1]["error"]["type"] == "FakeAPIError"
+    assert methods == ["start_run", "fail_run"]
+    assert tracker.calls[-1]["error"]["exception.type"] == "FakeAPIError"
+    assert "upstream provider down" in tracker.calls[-1]["error"]["exception.message"]

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from .agent_supervisor import AgentSupervisor
 from .custom_messages import CustomMessageDispatcher
 from .mcp_server import OperatorBridgeServer
+from .metadata_writer import MetadataWriter
 from .run_tracker import RunTracker
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -29,6 +30,7 @@ ATTR_DISPATCHER: str = "_llmnb_dispatcher"
 ATTR_RUN_TRACKER: str = "_llmnb_run_tracker"
 ATTR_OPERATOR_BRIDGE: str = "_llmnb_operator_bridge"
 ATTR_AGENT_SUPERVISOR: str = "_llmnb_agent_supervisor"
+ATTR_METADATA_WRITER: str = "_llmnb_metadata_writer"
 
 #: Default URL the supervisor's spawned agents point ANTHROPIC_BASE_URL at
 #: when no ``LLMKERNEL_LITELLM_ENDPOINT_URL`` env override is set. The
@@ -104,16 +106,43 @@ def attach_agent_supervisor(
     return supervisor
 
 
+def attach_metadata_writer(
+    kernel: "IPythonKernel",
+    dispatcher: CustomMessageDispatcher,
+    run_tracker: RunTracker,
+) -> MetadataWriter:
+    """Instantiate a :class:`MetadataWriter` wired to dispatcher + tracker.
+
+    Stashes on ``kernel._llmnb_metadata_writer``. Idempotent. Starts
+    the 30-second autosave timer per RFC-005 §"Snapshot triggers"
+    case 3.
+    """
+    existing = getattr(kernel, ATTR_METADATA_WRITER, None)
+    if existing is not None:
+        return existing  # type: ignore[no-any-return]
+    writer = MetadataWriter(
+        dispatcher=dispatcher, run_tracker=run_tracker,
+    )
+    writer.start()
+    setattr(kernel, ATTR_METADATA_WRITER, writer)
+    logger.info("attached MetadataWriter; 30s autosave running")
+    return writer
+
+
 def attach_kernel_subsystems(
     kernel: "IPythonKernel",
-) -> Tuple[CustomMessageDispatcher, RunTracker, OperatorBridgeServer, AgentSupervisor]:
+) -> Tuple[
+    CustomMessageDispatcher, RunTracker, OperatorBridgeServer,
+    AgentSupervisor, MetadataWriter,
+]:
     """One-call paper-telephone bootstrap.
 
     Reads ``LLMKERNEL_AGENT_ID`` / ``LLMKERNEL_ZONE_ID`` /
     ``LLMKERNEL_RUN_TRACE_ID`` / ``LLMKERNEL_LITELLM_ENDPOINT_URL`` from
-    the environment with defaults; wires the dispatcher, run-tracker, an
-    :class:`OperatorBridgeServer` pointed at the same run-tracker, and
-    the :class:`AgentSupervisor` (Track B4). Returns the four-tuple.
+    the environment with defaults; wires the dispatcher, run-tracker,
+    an :class:`OperatorBridgeServer` pointed at the same run-tracker,
+    the :class:`AgentSupervisor` (Track B4), and the new
+    :class:`MetadataWriter` (RFC-005). Returns the five-tuple.
     """
     agent_id = os.environ.get("LLMKERNEL_AGENT_ID", "kernel")
     zone_id = os.environ.get("LLMKERNEL_ZONE_ID", "default")
@@ -128,12 +157,14 @@ def attach_kernel_subsystems(
         )
         setattr(kernel, ATTR_OPERATOR_BRIDGE, bridge)
     supervisor = attach_agent_supervisor(kernel, tracker, dispatcher)
-    return dispatcher, tracker, bridge, supervisor
+    metadata_writer = attach_metadata_writer(kernel, dispatcher, tracker)
+    return dispatcher, tracker, bridge, supervisor, metadata_writer
 
 
 __all__ = [
-    "ATTR_AGENT_SUPERVISOR", "ATTR_DISPATCHER", "ATTR_OPERATOR_BRIDGE",
-    "ATTR_RUN_TRACKER",
+    "ATTR_AGENT_SUPERVISOR", "ATTR_DISPATCHER", "ATTR_METADATA_WRITER",
+    "ATTR_OPERATOR_BRIDGE", "ATTR_RUN_TRACKER",
     "attach_agent_supervisor", "attach_dispatcher",
-    "attach_kernel_subsystems", "attach_run_tracker",
+    "attach_kernel_subsystems", "attach_metadata_writer",
+    "attach_run_tracker",
 ]

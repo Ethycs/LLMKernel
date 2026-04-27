@@ -8,9 +8,16 @@ the run-tracker's stateful class.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Optional
+
+#: Lowercase-hex regex used to recognize OTLP span ids (16 hex chars,
+#: 8 bytes) and trace ids (32 hex chars, 16 bytes).  ``correlation_id``
+#: accepts either of these or a UUIDv4 string for backward-compat with
+#: receivers that still produce UUIDs.
+_HEX_ID_RE: re.Pattern[str] = re.compile(r"^[0-9a-f]{16}$|^[0-9a-f]{32}$")
 
 #: RFC-003 semver this module emits and accepts; receivers MUST reject
 #: envelopes whose major version differs.
@@ -21,9 +28,12 @@ DIRECTION_KERNEL_TO_EXTENSION: str = "kernel→extension"
 #: Direction string for extension-emitted envelopes.
 DIRECTION_EXTENSION_TO_KERNEL: str = "extension→kernel"
 
-#: All ten ``message_type`` values RFC-003 v1.0.0 enumerates across
-#: Families A (run lifecycle), B (layout), C (agent graph), D (operator
-#: action), and E (heartbeat / liveness).
+#: Every ``message_type`` the kernel emits or accepts.  Spans Families
+#: A (run lifecycle), B (layout), C (agent graph), D (operator action),
+#: E (heartbeat / liveness), and the RFC-006 v2 addition F (notebook
+#: metadata persistence).  The internal envelope contract still uses
+#: the wider v1 shape; ``CustomMessageDispatcher`` flattens to the
+#: RFC-006 thin v2 envelope on egress.
 RFC003_MESSAGE_TYPES: FrozenSet[str] = frozenset(
     {
         "run.start", "run.event", "run.complete",
@@ -31,6 +41,7 @@ RFC003_MESSAGE_TYPES: FrozenSet[str] = frozenset(
         "agent_graph.query", "agent_graph.response",
         "operator.action",
         "heartbeat.kernel", "heartbeat.extension",
+        "notebook.metadata",
     }
 )
 
@@ -40,6 +51,15 @@ _REQUIRED_ENVELOPE_KEYS: FrozenSet[str] = frozenset(
 _VALID_DIRECTIONS: FrozenSet[str] = frozenset(
     {DIRECTION_KERNEL_TO_EXTENSION, DIRECTION_EXTENSION_TO_KERNEL}
 )
+
+
+def _is_uuid(value: str) -> bool:
+    """Return True iff ``value`` parses as a UUID."""
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return True
 
 
 def _utc_now_iso() -> str:
@@ -94,14 +114,22 @@ def validate_envelope(envelope: Dict[str, Any]) -> None:
         raise ValueError(f"envelope.direction {direction!r} is not a valid RFC-003 direction")
 
     correlation_id = envelope["correlation_id"]
-    if not isinstance(correlation_id, str):
-        raise ValueError("envelope.correlation_id MUST be a string (UUIDv4)")
-    try:
-        uuid.UUID(correlation_id)
-    except (ValueError, AttributeError) as exc:
+    if not isinstance(correlation_id, str) or not correlation_id:
         raise ValueError(
-            f"envelope.correlation_id {correlation_id!r} is not a valid UUID"
-        ) from exc
+            "envelope.correlation_id MUST be a non-empty string"
+        )
+    # Family A (run lifecycle) MUST use the OTLP spanId or traceId.
+    # Other families MAY use any non-empty correlation string -- the
+    # metadata writer uses ``<session_id>:<snapshot_version>`` for
+    # log correlation, the agent_graph pair uses UUIDv4 per RFC-006
+    # §5, and the legacy heartbeats UUID4 per RFC-006 §7.  We only
+    # enforce the OTLP shape on Family A.
+    if message_type in {"run.start", "run.event", "run.complete"}:
+        if not (_HEX_ID_RE.match(correlation_id) or _is_uuid(correlation_id)):
+            raise ValueError(
+                f"envelope.correlation_id {correlation_id!r} is not a "
+                "valid OTLP spanId/traceId or UUID for Family A"
+            )
 
     timestamp = envelope["timestamp"]
     if not isinstance(timestamp, str) or not timestamp:

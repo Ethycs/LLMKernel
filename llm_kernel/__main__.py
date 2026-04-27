@@ -12,6 +12,9 @@ Subcommand dispatch (additive across Stage 2 tracks):
     ``python -m llm_kernel agent-supervisor-smoke``   -> spawn one Claude Code agent
                                                          end-to-end (Track B4); requires
                                                          ANTHROPIC_API_KEY in env
+    ``python -m llm_kernel metadata-writer-smoke``    -> single-process MetadataWriter
+                                                         end-to-end smoke (RFC-005 / RFC-006
+                                                         Family F).  No network required.
 
 The historical top-level imports below are wrapped in a try/except so that
 the subcommands can still be dispatched in a kernel environment that does
@@ -345,12 +348,121 @@ def _dump_debug_artifacts(work_dir, agent_id: str) -> None:  # noqa: ANN001
                 print(f"(read failed: {exc})", flush=True)
 
 
+def _run_metadata_writer_smoke() -> int:
+    """RFC-005 / RFC-006 dispatch: the metadata writer end-to-end smoke.
+
+    Spins up a tracker + dispatcher + ``MetadataWriter`` against a stub
+    kernel and:
+
+    1. Emits a few runs (open + close, simulating real activity).
+    2. Triggers a manual ``snapshot`` and prints the captured Family F
+       envelope.
+    3. Verifies forbidden-secret rejection by feeding a config with an
+       ``api_key`` field and asserting :class:`SecretRejected` raises.
+
+    Exits 0 on PASS, 1 on any failure.  No network, no subprocess.
+    """
+    import json
+    import uuid as _uuid
+    from typing import Any, Dict, List
+    from unittest.mock import MagicMock
+
+    from .custom_messages import CustomMessageDispatcher
+    from .metadata_writer import MetadataWriter, SecretRejected
+    from .run_tracker import RunTracker
+
+    # Stub kernel mirroring the IPython surface the dispatcher uses.
+    sent: List[tuple] = []
+
+    class _Session:
+        def send(self, _sock: Any, msg_type: str, **kwargs: Any) -> None:
+            sent.append((msg_type, kwargs))
+
+    class _CommMgr:
+        def register_target(self, _n: str, _cb: Any) -> None: ...
+        def unregister_target(self, _n: str, _cb: Any) -> None: ...
+
+    kernel = MagicMock()
+    kernel.session = _Session()
+    kernel.iopub_socket = MagicMock()
+    kernel.shell.comm_manager = _CommMgr()
+    kernel._parent_header = {}
+
+    dispatcher = CustomMessageDispatcher(kernel)
+    dispatcher.start()
+    tracker = RunTracker(
+        trace_id=str(_uuid.uuid4()), sink=dispatcher,
+        agent_id="smoke", zone_id="smoke",
+    )
+    writer = MetadataWriter(
+        dispatcher=dispatcher, run_tracker=tracker,
+        autosave_interval_sec=999.0,
+        session_id="smoke-session",
+    )
+
+    # Step 1: emit a few runs simulating real activity.
+    for _ in range(3):
+        rid = tracker.start_run(
+            name="notify", run_type="tool",
+            inputs={"observation": "smoke", "importance": "info"},
+        )
+        tracker.complete_run(rid, outputs={"acknowledged": True})
+
+    # Step 2: trigger a snapshot manually.
+    snapshot = writer.snapshot(trigger="save")
+    envelope = writer.take_last_envelope()
+    if envelope is None or envelope["message_type"] != "notebook.metadata":
+        print(
+            "FAIL: writer did not emit notebook.metadata; "
+            f"last_envelope={envelope}",
+            flush=True,
+        )
+        return 1
+    print("metadata-writer-smoke: captured Family F envelope:", flush=True)
+    print(json.dumps({
+        "type": envelope["message_type"],
+        "snapshot_version": envelope["payload"]["snapshot_version"],
+        "trigger": envelope["payload"]["trigger"],
+        "schema_version": envelope["payload"]["snapshot"]["schema_version"],
+        "session_id": envelope["payload"]["snapshot"]["session_id"],
+        "run_count": len(envelope["payload"]["snapshot"]["event_log"]["runs"]),
+    }, indent=2), flush=True)
+
+    # Step 3: forbidden-secret rejection.  Crafted config carries
+    # ``api_key`` (case-insensitive forbidden); the writer MUST raise
+    # ``SecretRejected`` and MUST NOT log the value.
+    rejected = False
+    try:
+        writer.update_config(
+            recoverable={"kernel": {"api_key": "DO_NOT_LOG"}},
+            volatile={},
+        )
+    except SecretRejected as exc:
+        if "DO_NOT_LOG" in str(exc):
+            print(
+                "FAIL: SecretRejected leaked the offending VALUE",
+                flush=True,
+            )
+            return 1
+        rejected = True
+    if not rejected:
+        print(
+            "FAIL: forbidden api_key was NOT rejected by metadata writer",
+            flush=True,
+        )
+        return 1
+
+    print("OK: metadata-writer-smoke complete", flush=True)
+    return 0
+
+
 if __name__ == '__main__':
     # Additive subcommand dispatch:
     #   ``mcp-server``               -> Track B1 RFC-001 MCP server
     #   ``litellm-proxy``            -> Track B5 RFC-002 LiteLLM proxy
     #   ``paper-telephone-smoke``    -> Track B3 kernel-only smoke
     #   ``agent-supervisor-smoke``   -> Track B4 single-agent end-to-end smoke
+    #   ``metadata-writer-smoke``    -> RFC-005 / RFC-006 Family F smoke
     if len(sys.argv) > 1 and sys.argv[1] == "mcp-server":
         from . import mcp_server as _mcp_server
 
@@ -361,5 +473,7 @@ if __name__ == '__main__':
         sys.exit(_run_paper_telephone_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "agent-supervisor-smoke":
         sys.exit(_run_agent_supervisor_smoke())
+    elif len(sys.argv) > 1 and sys.argv[1] == "metadata-writer-smoke":
+        sys.exit(_run_metadata_writer_smoke())
     else:
         main()

@@ -21,7 +21,7 @@ from hypothesis import HealthCheck, given, settings, strategies as st
 
 from .harness import EventSequencer, FaultInjector, FaultMatrix, ReplayHarness, ReplayMode
 from .invariants import (
-    UUIDV4_RE,
+    SPAN_ID_RE,
     i1_run_lifecycle_closed,
     i3_state_reconstructable,
     i5_one_run_per_tool_call,
@@ -145,11 +145,11 @@ def test_fault_injection_corrupt_correlation_id_is_caught(seed: int) -> None:
     matrix = FaultMatrix(p_drop=0.0, p_delay=0.0, p_corrupt=0.10,
                          p_disconnect=0.0)
     result = FaultInjector(sequencer, matrix=matrix, seed=seed).run()
-    # Run-tracker MUST hold only UUIDv4 ids — corruptions did not poison it.
+    # Run-tracker MUST hold only OTLP spanIds — corruptions did not poison it.
     assert result.run_tracker is not None
     for record in result.run_tracker.iter_runs():
-        assert UUIDV4_RE.match(record.id), (
-            f"corrupt id leaked into run-tracker: {record.id!r}"
+        assert SPAN_ID_RE.match(record.spanId), (
+            f"corrupt id leaked into run-tracker: {record.spanId!r}"
         )
 
 

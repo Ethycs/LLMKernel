@@ -8,9 +8,9 @@ the matrix).
 
 V1 fault posture: corruptions are injected into the captured log
 directly, never through the run-tracker's sink. That way
-``RunTracker.iter_runs()`` stays UUIDv4-clean and RFC-004 §I6 holds
-even under p_corrupt > 0 — the receiver's invariant is "log and
-drop", not "trust and crash" (RFC-003 §F1).
+``RunTracker.iter_runs()`` stays OTLP-spanId-clean and RFC-004 §I6
+holds even under p_corrupt > 0 — the receiver's invariant is "log
+and drop", not "trust and crash" (RFC-003 §F1).
 """
 
 from __future__ import annotations
@@ -84,8 +84,11 @@ class FaultInjector:
             if (self.rng.random() < m.p_corrupt
                     and env.get("message_type") == "run.start"):
                 corrupt = dict(env)
+                # OTLP spanIds are 16 lowercase hex chars; this synthesizes
+                # a malformed correlation_id that the receiver MUST log
+                # and drop per RFC-003 §F1.
                 corrupt["correlation_id"] = (
-                    f"NOT-A-UUID-{self.rng.randrange(10**6)}"
+                    f"NOT-A-SPANID-{self.rng.randrange(10**6)}"
                 )
                 kept.append(corrupt)
             if self.rng.random() < m.p_disconnect:

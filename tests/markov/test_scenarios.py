@@ -46,11 +46,16 @@ _INVARIANT_FNS: Dict[str, object] = {
 
 
 def _expected_tool_call_count(factory: ScenarioFactory) -> int:
-    """Count tool_calls that should produce a run record."""
-    return sum(
-        1 for e in factory.build()
-        if e.kind == "tool_call" and e.expected_outcome != "method_not_found"
-    )
+    """Count tool_calls that should produce a run record.
+
+    Per RFC-002 §"Failure modes" / RFC-005 §"`agent_emit` runs", the
+    ``method_not_found`` outcome NOW produces ONE ``agent_emit:
+    invalid_tool_use`` span (not zero spans as RFC-001 v1.0.0
+    originally said).  The scenario's ``expected_run_count`` is the
+    authoritative number; this helper mirrors that by counting all
+    tool_calls regardless of outcome.
+    """
+    return sum(1 for e in factory.build() if e.kind == "tool_call")
 
 
 def _expected_model_call_count(factory: ScenarioFactory) -> int:
@@ -73,6 +78,17 @@ def test_scenario_run_count_matches_outcome(scenario_id: str) -> None:
     )
 
 
+#: Map LangSmith-style ``ScenarioOutcome.expected_status_for_each``
+#: values onto the OTel canonical status codes the run-tracker now
+#: emits (R1-K refactor).  Test fixtures are kept LangSmith-flavored
+#: so scenario authors can read them at a glance.
+_LANGSMITH_TO_OTEL_STATUS: Dict[str, str] = {
+    "success": "STATUS_CODE_OK",
+    "error": "STATUS_CODE_ERROR",
+    "timeout": "STATUS_CODE_ERROR",
+}
+
+
 @pytest.mark.parametrize(
     "scenario_id", sorted(SCENARIOS.keys()),
     ids=sorted(SCENARIOS.keys()),
@@ -91,14 +107,24 @@ def test_scenario_terminal_statuses_match(scenario_id: str) -> None:
         if env["message_type"] != "run.complete":
             continue
         cid = env["correlation_id"]
-        status = env["payload"]["status"]
+        # Post-OTLP refactor (R1-K): payload.status is the OTel object
+        # ``{code, message}``; the legacy flat string lives only in the
+        # scenario fixtures and is mapped here for back-compat.
+        status_obj = env["payload"]["status"]
+        if isinstance(status_obj, dict):
+            status = status_obj.get("code", "")
+        else:
+            status = str(status_obj)
         if cid not in status_by_run:
             insertion_order.append(cid)
         status_by_run[cid] = status
     observed = [status_by_run[cid] for cid in insertion_order]
-    assert observed == factory.outcome.expected_status_for_each, (
-        f"{scenario_id}: expected {factory.outcome.expected_status_for_each}, "
-        f"observed {observed}"
+    expected = [
+        _LANGSMITH_TO_OTEL_STATUS.get(s, s)
+        for s in factory.outcome.expected_status_for_each
+    ]
+    assert observed == expected, (
+        f"{scenario_id}: expected {expected}, observed {observed}"
     )
 
 
@@ -127,38 +153,69 @@ def test_scenario_validates_its_documented_invariants(scenario_id: str) -> None:
     )
 
 
-def test_unknown_tool_yields_no_run_record() -> None:
-    """RFC-001 §Failure modes — unknown tool ⇒ -32601, no run record."""
+def test_unknown_tool_yields_agent_emit_invalid_tool_use() -> None:
+    """RFC-002 §"Failure modes" amends RFC-001's "no run record" rule.
+
+    The kernel still returns JSON-RPC -32601 for unknown tools, BUT
+    additionally emits ONE ``agent_emit:invalid_tool_use`` span so
+    the operator surface sees the bypass attempt rather than just the
+    silent denial.  The wire trace contains exactly one
+    ``run.start`` + one ``run.complete`` for that agent_emit span;
+    no tool-typed run.
+    """
+    from llm_kernel._attrs import decode_attrs
+
     factory = SCENARIOS["unknown_tool_rejected"]
     result = EventSequencer(factory.build()).run()
     starts = [e for e in result.events if e["message_type"] == "run.start"]
-    assert starts == [], f"unknown tool should NOT create a run.start, got {len(starts)}"
-    # The errors list MAY contain the McpError if the harness re-raised
-    # it, but the sequencer swallows -32601 specifically; assert nothing
-    # else escaped.
+    assert len(starts) == 1, (
+        f"unknown tool MUST emit ONE agent_emit span, got {len(starts)}"
+    )
+    payload = starts[0]["payload"]
+    attrs = decode_attrs(payload["attributes"])
+    assert attrs["llmnb.run_type"] == "agent_emit"
+    assert attrs["llmnb.emit_kind"] == "invalid_tool_use"
+    # The originating tool name is preserved in emit_content for the
+    # operator's diagnostic surface.
+    assert "totally_fake_tool" in attrs["llmnb.emit_content"]
     assert result.errors == []
 
 
 def test_request_approval_timeout_marks_error() -> None:
-    """RFC-001 §-32002 — approval timeout MUST close the run as error."""
+    """RFC-001 §-32002 — approval timeout MUST close the run as error.
+
+    Post-OTLP refactor (R1-K): the timeout details ride OTel exception
+    semconv attributes (``exception.type`` /
+    ``exception.message``) on the span; the legacy flat
+    ``payload.error`` envelope is gone.  The status is the OTel
+    canonical ``STATUS_CODE_ERROR``.
+    """
+    from llm_kernel._attrs import decode_attrs
+
     factory = SCENARIOS["request_approval_timeout"]
     result = EventSequencer(factory.build()).run()
     completes = [e for e in result.events if e["message_type"] == "run.complete"]
     assert completes, "timeout scenario should emit run.complete"
-    # Final status across the run lifecycle MUST be error.
     terminal = completes[-1]
-    assert terminal["payload"]["status"] == "error"
-    assert terminal["payload"]["error"]["message"] == "approval_timeout"
+    payload = terminal["payload"]
+    assert payload["status"]["code"] == "STATUS_CODE_ERROR"
+    attrs = decode_attrs(payload.get("attributes") or [])
+    assert attrs.get("exception.message") == "approval_timeout"
 
 
 def test_streaming_model_call_emits_token_events() -> None:
-    """RFC-003 §run.event(token) — five chunks ⇒ five token events."""
+    """RFC-003 §run.event(token) — five chunks ⇒ five token events.
+
+    Post-OTLP refactor (R1-K): each ``run.event`` payload carries one
+    OTLP ``SpanEvent`` under ``payload.event``; the OTel ``name``
+    field is ``"token"`` (formerly ``payload.event_type``).
+    """
     factory = SCENARIOS["litellm_streaming_call"]
     result = EventSequencer(factory.build()).run()
     token_events = [
         e for e in result.events
         if e["message_type"] == "run.event"
-        and e["payload"]["event_type"] == "token"
+        and e["payload"]["event"]["name"] == "token"
     ]
     assert len(token_events) == 5, f"expected 5 token events, got {len(token_events)}"
     completes = [e for e in result.events if e["message_type"] == "run.complete"]

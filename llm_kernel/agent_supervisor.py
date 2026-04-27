@@ -320,10 +320,18 @@ class AgentSupervisor:
                     fh.write(raw)
             if not line:
                 continue
-            parsed = self._try_parse_json(line)
+            parsed, parse_error = self._try_parse_json_with_error(line)
             if pretty_path is not None and parsed is not None:
                 _append_pretty(pretty_path, parsed)
             if parsed is None:
+                # RFC-002 §"Process lifecycle" 3: lines that fail both
+                # parsers become ``agent_emit`` spans of kind
+                # ``malformed_json`` with ``llmnb.parser_diagnostic``
+                # carrying the short error string.
+                self._emit_agent_emit(
+                    handle, emit_kind="malformed_json",
+                    emit_content=line, parser_diagnostic=parse_error,
+                )
                 self._handle_violation(handle, line)
                 continue
             if self._is_mcp_jsonrpc(parsed):
@@ -335,7 +343,16 @@ class AgentSupervisor:
             self._handle_violation(handle, line)
 
     def _read_stderr(self, handle: AgentHandle, log_path: Path) -> None:
-        """Append stderr to a per-agent log; never operator-surface (RFC-002 §4)."""
+        """Append stderr to a per-agent log AND emit ``agent_emit`` spans per line.
+
+        Per RFC-002 §"Process lifecycle" 4: stderr is captured line by
+        line and emitted as ``agent_emit`` spans with
+        ``llmnb.emit_kind: "stderr"``; the kernel additionally writes
+        the raw stream to a per-agent log file (indexed by agent_id)
+        for debugging.  Renderers MAY collapse stderr by default but
+        the data MUST reach the operator surface -- silent drops are
+        forbidden.
+        """
         assert handle.popen.stderr is not None
         try:
             with log_path.open("a", encoding="utf-8") as fh:
@@ -344,6 +361,12 @@ class AgentSupervisor:
                         break
                     fh.write(raw)
                     fh.flush()
+                    line = raw.rstrip("\r\n")
+                    if not line:
+                        continue
+                    self._emit_agent_emit(
+                        handle, emit_kind="stderr", emit_content=line,
+                    )
         except OSError:  # pragma: no cover - defensive
             logger.exception("agent %s stderr log write failed", handle.agent_id)
 
@@ -419,17 +442,19 @@ class AgentSupervisor:
     # -- Synthetic-run helpers ---------------------------------------
 
     def _handle_violation(self, handle: AgentHandle, line: str) -> None:
-        """DR-0010 prose violation: synthetic ``notify`` + flood-check."""
-        truncated = line if len(line) <= 240 else line[:237] + "..."
-        rid = self._run_tracker.start_run(
-            name="notify", run_type="tool",
-            inputs={"observation": f"agent emitted prose: {truncated}",
-                    "importance": "info"},
-            tags=[f"agent:{handle.agent_id}", f"zone:{handle.zone_id}",
-                  "tool:notify", "synthetic:dr0010_violation"],
-            metadata={"log_signature": "dr0010.violation"},
+        """DR-0010 prose violation: ``agent_emit`` (prose) + flood-check.
+
+        Per RFC-002 §"Process lifecycle" 3 / RFC-005 §"`agent_emit`
+        runs", free-form prose despite the suppression prompt becomes
+        an ``agent_emit`` span with ``llmnb.emit_kind: "prose"``
+        rather than a synthetic ``notify`` (which conflated agent
+        output with kernel-issued tool calls).  On flood (>5/min),
+        the supervisor additionally emits a synthetic ``escalate``
+        run for operator attention.
+        """
+        self._emit_agent_emit(
+            handle, emit_kind="prose", emit_content=line,
         )
-        self._run_tracker.complete_run(rid, outputs={"acknowledged": True})
         now = time.monotonic()
         handle._violation_times.append(now)
         cutoff = now - _VIOLATION_FLOOD_WINDOW_SEC
@@ -451,34 +476,87 @@ class AgentSupervisor:
             inputs={"arguments": params.get("arguments", {})},
             tags=[f"agent:{handle.agent_id}", f"zone:{handle.zone_id}",
                   f"tool:{tool_name}", "synthetic:agent_emit"],
-            metadata={"jsonrpc_id": parsed.get("id")},
+            metadata={"tool.name": tool_name,
+                      "jsonrpc_id": parsed.get("id")},
         )
         self._run_tracker.complete_run(rid, outputs={"acknowledged": True})
 
     def _record_stream_json(self, handle: AgentHandle, parsed: Dict[str, Any]) -> None:
-        """Surface tool_use blocks from a Claude stream-json assistant event.
+        """Dispatch a Claude stream-json record per RFC-002 §"Process lifecycle" 3.
 
-        Claude Code's ``--output-format=stream-json`` emits assistant
-        messages with content arrays; ``tool_use`` blocks indicate the
-        agent invoked a tool. We strip the MCP-namespaced prefix
-        ``mcp__llmkernel-operator-bridge__`` (Claude Code's convention
-        for MCP tools) and emit a synthetic run record so the operator
-        surface sees ``notify`` etc. by their RFC-001 names. The actual
-        tool result is executed by the spawned MCP-server subprocess and
-        is not visible from the supervisor's run-tracker — V1 records
-        the *attempt* here, not the result.
+        Stream-json record types and their handling:
+
+        * ``assistant`` -- iterate the content array.  ``tool_use``
+          blocks become tool spans (existing behavior).  ``text``
+          blocks become ``agent_emit`` spans with
+          ``llmnb.emit_kind: "reasoning"`` (text preceding a tool
+          call) or ``llmnb.emit_kind: "prose"`` (text in an
+          assistant message with no companion tool_use).
+        * ``system`` -- ``agent_emit`` with kind ``system_message``.
+        * ``result`` -- ``agent_emit`` with kind ``result``.
+        * ``error`` -- ``agent_emit`` with kind ``error``.
+
+        The MCP-namespaced prefix ``mcp__llmkernel-operator-bridge__``
+        (Claude Code's convention for MCP tools) is stripped from
+        tool names so the operator surface sees them by their RFC-001
+        names.  The supervisor cannot observe the MCP server's
+        completion of the tool run -- V1 records the ATTEMPT here,
+        not the result; RFC-002 v1.0.1 amendment captures this.
         """
-        if parsed.get("type") != "assistant":
+        record_type = parsed.get("type")
+        if record_type == "system":
+            self._emit_agent_emit(
+                handle, emit_kind="system_message",
+                emit_content=_stringify_payload(parsed),
+            )
+            return
+        if record_type == "result":
+            self._emit_agent_emit(
+                handle, emit_kind="result",
+                emit_content=_stringify_payload(parsed),
+            )
+            return
+        if record_type == "error":
+            self._emit_agent_emit(
+                handle, emit_kind="error",
+                emit_content=_stringify_payload(parsed),
+            )
+            return
+        if record_type != "assistant":
             return
         message = parsed.get("message") or {}
         content = message.get("content") or []
         if not isinstance(content, list):
             return
         prefix = "mcp__llmkernel-operator-bridge__"
+        # Pre-scan to decide whether text blocks are reasoning (paired
+        # with a tool_use later in the array) or stand-alone prose.
+        has_tool_use = any(
+            isinstance(b, dict) and b.get("type") == "tool_use"
+            for b in content
+        )
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") != "tool_use":
+            block_type = block.get("type")
+            if block_type == "text":
+                text_value = str(block.get("text", ""))
+                if not text_value:
+                    continue
+                # Reasoning if this assistant message also contains a
+                # tool_use block (the text precedes the tool call);
+                # prose otherwise (text-only assistant message in spite
+                # of the suppression prompt -- DR-0010 violation).
+                emit_kind = "reasoning" if has_tool_use else "prose"
+                self._emit_agent_emit(
+                    handle, emit_kind=emit_kind, emit_content=text_value,
+                )
+                if emit_kind == "prose":
+                    # Track flood threshold for prose-only assistant
+                    # messages too, not just unparseable lines.
+                    self._track_prose_flood(handle)
+                continue
+            if block_type != "tool_use":
                 continue
             raw_name = str(block.get("name", "<unknown>"))
             tool_name = raw_name[len(prefix):] if raw_name.startswith(prefix) else raw_name
@@ -487,12 +565,10 @@ class AgentSupervisor:
                 inputs=block.get("input") or {},
                 tags=[f"agent:{handle.agent_id}", f"zone:{handle.zone_id}",
                       f"tool:{tool_name}", "via:stream-json"],
-                metadata={"tool_use_id": block.get("id"),
+                metadata={"tool.name": tool_name,
+                          "tool_use_id": block.get("id"),
                           "raw_name": raw_name},
             )
-            # The supervisor cannot observe the MCP-server subprocess's
-            # run completion; mark this as success so I1 (every start has
-            # a complete) holds. RFC-002 v1.0.1 amendment captures this.
             self._run_tracker.complete_run(rid, outputs={"observed_via": "stream-json"})
 
     def _record_synthetic_problem(
@@ -504,7 +580,8 @@ class AgentSupervisor:
             inputs={"severity": "error", "description": description},
             tags=[f"agent:{agent_id}", f"zone:{zone_id}",
                   "tool:report_problem", "synthetic:supervisor"],
-            metadata={"log_signature": log_signature},
+            metadata={"tool.name": "report_problem",
+                      "log_signature": log_signature},
         )
         self._run_tracker.complete_run(
             rid, outputs={"acknowledged": True}, status="error",
@@ -519,7 +596,8 @@ class AgentSupervisor:
             inputs={"reason": reason, "severity": severity},
             tags=[f"agent:{agent_id}", f"zone:{zone_id}",
                   "tool:escalate", "synthetic:dr0010_flood"],
-            metadata={"log_signature": "dr0010.flood"},
+            metadata={"tool.name": "escalate",
+                      "log_signature": "dr0010.flood"},
         )
         self._run_tracker.complete_run(rid, outputs={"acknowledged": True})
 
@@ -533,6 +611,82 @@ class AgentSupervisor:
         return obj if isinstance(obj, dict) else None
 
     @staticmethod
+    def _try_parse_json_with_error(
+        line: str,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Like :meth:`_try_parse_json` but also surfaces the decode error.
+
+        Returns ``(parsed_obj_or_None, short_error_string_or_None)``.
+        The short error string is suitable for
+        ``llmnb.parser_diagnostic`` per RFC-005 §"`agent_emit` runs"
+        on a malformed-json span; it captures the decoder's message
+        plus position so the operator can locate the failing byte.
+        """
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return None, f"{exc.msg} at position {exc.pos}"
+        if not isinstance(obj, dict):
+            return None, "top-level JSON is not an object"
+        return obj, None
+
+    def _emit_agent_emit(
+        self,
+        handle: AgentHandle,
+        *,
+        emit_kind: str,
+        emit_content: str,
+        parser_diagnostic: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+    ) -> str:
+        """Emit one ``agent_emit`` span per RFC-005 §"`agent_emit` runs".
+
+        Records ``llmnb.run_type: "agent_emit"``, ``llmnb.agent_id``,
+        ``llmnb.emit_kind`` (the categorical attribute the renderer
+        dispatches on), and ``llmnb.emit_content`` (the verbatim
+        agent output).  Wire emission is verbatim per the RFC's
+        guidance -- contents above the blob threshold are blob-
+        extracted by ``metadata_writer.py`` on persistence; the wire
+        carries the full content for in-cell rendering.
+        """
+        metadata: Dict[str, Any] = {
+            "emit_kind": emit_kind,
+            "emit_content": emit_content,
+        }
+        if parser_diagnostic:
+            metadata["parser_diagnostic"] = parser_diagnostic
+        rid = self._run_tracker.start_run(
+            name=f"agent_emit:{emit_kind}", run_type="agent_emit",
+            inputs={},
+            parent_run_id=parent_span_id,
+            tags=[f"agent:{handle.agent_id}", f"zone:{handle.zone_id}",
+                  f"agent_emit:{emit_kind}"],
+            metadata=metadata,
+        )
+        # Open + immediately close: agent_emit captures point-in-time
+        # output, not a duration.  The renderer keys on the closed
+        # span; receivers that need the open/closed lifecycle still
+        # see ``run.start`` then ``run.complete`` for I1 compliance.
+        self._run_tracker.complete_run(rid, outputs={})
+        return rid
+
+    def _track_prose_flood(self, handle: AgentHandle) -> None:
+        """Track DR-0010 prose-flood threshold (>5 / 60s -> escalate).
+
+        Used by the assistant-content text path so flood detection
+        also covers stream-json prose, not just unparseable lines.
+        """
+        now = time.monotonic()
+        handle._violation_times.append(now)
+        cutoff = now - _VIOLATION_FLOOD_WINDOW_SEC
+        recent = [t for t in handle._violation_times if t >= cutoff]
+        if len(recent) > _VIOLATION_FLOOD_COUNT:
+            self._record_synthetic_escalate(
+                handle.agent_id, handle.zone_id, "DR-0010 flood", "medium",
+            )
+            handle._violation_times.clear()
+
+    @staticmethod
     def _is_mcp_jsonrpc(obj: Dict[str, Any]) -> bool:
         """Return True for an MCP JSON-RPC frame."""
         return obj.get("jsonrpc") == "2.0" and (
@@ -543,6 +697,21 @@ class AgentSupervisor:
     def _is_stream_json(obj: Dict[str, Any]) -> bool:
         """Return True for a Claude stream-json record (``type``/``event``)."""
         return "type" in obj or "event" in obj
+
+
+def _stringify_payload(parsed: Dict[str, Any]) -> str:
+    """Serialize a stream-json record as a single-line JSON string.
+
+    Used as the ``llmnb.emit_content`` value for ``agent_emit`` spans
+    of kind ``system_message`` / ``result`` / ``error``.  The full
+    record is preserved verbatim so the operator surface can show
+    the raw stream-json content; the metadata writer applies the
+    blob-extraction pass on persistence if it exceeds the threshold.
+    """
+    try:
+        return json.dumps(parsed, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(parsed)
 
 
 def _append_pretty(path: Path, parsed: Dict[str, Any]) -> None:

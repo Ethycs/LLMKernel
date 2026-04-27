@@ -12,6 +12,10 @@ V1 status (per the prompt's "REQUIRED INPUTS" §"For V1"):
   layout/agent-graph mutations for I8 / I9).
 * I7 — n/a in the V1 markov suite (the harness does not synthesize
   heartbeats; RFC-004 §"Property-based invariants" — I7 footnote).
+
+Post-OTLP refactor (R1-K): correlation_ids are OTLP spanIds (16
+lowercase hex chars) rather than UUIDv4; status is an OTel
+``{code, message}`` object rather than a flat string.
 """
 
 from __future__ import annotations
@@ -24,11 +28,11 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from .harness import RunResult
 
-#: UUIDv4 regex per RFC-003 §Envelope.correlation_id and RFC-004 §I6.
-UUIDV4_RE: re.Pattern[str] = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
+#: 16-lowercase-hex regex (OTLP spanId per RFC-003 §Envelope.correlation_id
+#: and RFC-004 §I6, post R1-K refactor).
+SPAN_ID_RE: re.Pattern[str] = re.compile(r"^[0-9a-f]{16}$")
+#: Backward-compat alias kept for callers that still import this name.
+UUIDV4_RE: re.Pattern[str] = SPAN_ID_RE
 
 #: Default I1 timeout — RFC-004 §I1 ``T = 300s``.
 DEFAULT_TIMEOUT_SEC: float = 300.0
@@ -84,6 +88,19 @@ def i1_run_lifecycle_closed(
     return InvariantResult("I1", True, f"all {len(starts)} run.start envelopes closed within {timeout_sec}s")
 
 
+_OTEL_STATUS_CODES = {
+    "STATUS_CODE_OK", "STATUS_CODE_ERROR", "STATUS_CODE_UNSET",
+}
+
+
+def _payload_status_code(payload: Dict[str, Any]) -> str:
+    """Return the OTel ``status.code`` string for a run.complete payload."""
+    status = payload.get("status")
+    if isinstance(status, dict):
+        return str(status.get("code", ""))
+    return str(status or "")
+
+
 def i2_request_approval_resolved(
     result: RunResult, timeout_sec: float = DEFAULT_TIMEOUT_SEC,
 ) -> InvariantResult:
@@ -98,8 +115,8 @@ def i2_request_approval_resolved(
                 approval_runs.append(cid)
     if not approval_runs:
         return InvariantResult("I2", True, "no request_approval calls to validate")
-    # Each approval run MUST close as success (operator responded) or
-    # error (documented approval_timeout per RFC-001 §-32002).
+    # Each approval run MUST close as STATUS_CODE_OK (operator responded)
+    # or STATUS_CODE_ERROR (documented approval_timeout per RFC-001 §-32002).
     for run_id in approval_runs:
         completions = [
             e for e in result.events
@@ -109,10 +126,10 @@ def i2_request_approval_resolved(
         if not completions:
             return InvariantResult("I2", False, f"approval run {run_id} has no completion")
         terminal = completions[-1]
-        status = terminal.get("payload", {}).get("status")
-        if status not in {"success", "error", "timeout"}:
+        code = _payload_status_code(terminal.get("payload", {}))
+        if code not in _OTEL_STATUS_CODES:
             return InvariantResult(
-                "I2", False, f"approval run {run_id} status={status!r} unrecognized",
+                "I2", False, f"approval run {run_id} status.code={code!r} unrecognized",
             )
     return InvariantResult(
         "I2", True, f"all {len(approval_runs)} request_approval calls resolved",
@@ -176,7 +193,13 @@ def i5_one_run_per_tool_call(
 
 
 def i6_correlation_ids_unique_uuid4(result: RunResult) -> InvariantResult:
-    """RFC-004 §I6 — correlation_ids are UUIDv4 and unique within a session."""
+    """RFC-004 §I6 — correlation_ids are OTLP spanIds and unique within a session.
+
+    Post-OTLP refactor (R1-K): the per-run identifier is the 16-byte
+    OTLP ``spanId`` (16 lowercase hex chars).  Function name kept as
+    ``..._uuid4`` for callsite continuity; the witness predicate is
+    "16-hex spanId" rather than UUIDv4.
+    """
     cids: List[str] = [str(e.get("correlation_id", "")) for e in result.events]
     if not cids:
         return InvariantResult("I6", True, "no envelopes to validate")
@@ -188,15 +211,15 @@ def i6_correlation_ids_unique_uuid4(result: RunResult) -> InvariantResult:
         if e.get("message_type") == "run.start"
     ]
     for cid in start_cids:
-        if not UUIDV4_RE.match(cid):
+        if not SPAN_ID_RE.match(cid):
             return InvariantResult(
-                "I6", False, f"correlation_id {cid!r} is not a UUIDv4",
+                "I6", False, f"correlation_id {cid!r} is not a 16-hex OTLP spanId",
             )
     if len(set(start_cids)) != len(start_cids):
         dups = {c for c in start_cids if start_cids.count(c) > 1}
         return InvariantResult("I6", False, f"duplicate correlation_ids: {sorted(dups)}")
     return InvariantResult(
-        "I6", True, f"{len(start_cids)} run.start correlation_ids all UUIDv4 + unique",
+        "I6", True, f"{len(start_cids)} run.start correlation_ids all spanId + unique",
     )
 
 

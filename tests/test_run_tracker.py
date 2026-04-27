@@ -1,12 +1,15 @@
-"""Stage 2 Track B2 contract tests for the run-tracker.
+"""Stage 2 Track B2 contract tests for the run-tracker (OTLP/JSON form).
 
 These pytest tests exercise :class:`llm_kernel.run_tracker.RunTracker`
 through an in-memory list-sink, asserting:
 
-* RFC-003 envelope shapes for ``run.start`` / ``run.event`` / ``run.complete``
-* LangSmith run-record updates (events list, end_time, outputs, error)
-* Thread safety of concurrent ``start_run`` calls
-* Round-trippability of the JSONL event log
+* RFC-003 envelope shapes for ``run.start`` / ``run.event`` /
+  ``run.complete`` after the R1-K refactor (payloads now ride OTLP
+  ``Span`` / ``SpanEvent`` shape).
+* OTLP span updates (events list, ``endTimeUnixNano``, status codes,
+  exception attributes).
+* Thread safety of concurrent ``start_run`` calls.
+* Round-trippability of the JSONL event log (one OTLP span per line).
 
 The run-tracker is sync; we use :mod:`threading` for the concurrency case
 and avoid pulling in pytest-asyncio for this module.
@@ -19,18 +22,26 @@ Run with::
 from __future__ import annotations
 
 import json
+import re
+import secrets
 import threading
 import uuid
 from typing import Any, Dict, List
 
 import pytest
 
+from llm_kernel._attrs import decode_attrs
 from llm_kernel.run_envelope import (
     DIRECTION_KERNEL_TO_EXTENSION,
     RFC003_VERSION,
     validate_envelope,
 )
-from llm_kernel.run_tracker import RunRecord, RunTracker
+from llm_kernel.run_tracker import RunRecord, RunTracker, Span
+
+#: 16-lowercase-hex regex (OTLP spanId).
+_SPAN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+#: 32-lowercase-hex regex (OTLP traceId).
+_TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class ListSink:
@@ -48,6 +59,7 @@ class ListSink:
 def _new_tracker() -> tuple[RunTracker, ListSink]:
     sink = ListSink()
     tracker = RunTracker(
+        # Tracker accepts UUID input and coerces to 32-hex traceId.
         trace_id=str(uuid.uuid4()),
         sink=sink,
         agent_id="alpha",
@@ -66,6 +78,9 @@ def test_start_emits_run_start_envelope() -> None:
         tags=["agent:alpha"],
     )
 
+    # start_run returns the OTLP spanId (16 lowercase hex chars).
+    assert _SPAN_ID_RE.match(run_id), f"expected 16-hex spanId, got {run_id!r}"
+
     assert len(sink.envelopes) == 1
     envelope = sink.envelopes[0]
     validate_envelope(envelope)
@@ -76,22 +91,35 @@ def test_start_emits_run_start_envelope() -> None:
     assert envelope["rfc_version"] == RFC003_VERSION
 
     payload = envelope["payload"]
-    assert payload["id"] == run_id
+    # OTLP span shape:
+    assert payload["spanId"] == run_id
+    assert _TRACE_ID_RE.match(payload["traceId"])
     assert payload["name"] == "notify"
-    assert payload["run_type"] == "tool"
-    assert payload["inputs"] == {"observation": "ok", "importance": "info"}
-    assert payload["parent_run_id"] is None
-    assert payload["tags"] == ["agent:alpha"]
-    # agent_id / zone_id from the tracker MUST appear in metadata.
-    assert payload["metadata"]["agent_id"] == "alpha"
-    assert payload["metadata"]["zone_id"] == "refactor"
-    # Run-start payload MUST NOT carry end_time / outputs.
-    assert "end_time" not in payload
-    assert "outputs" not in payload
+    assert payload["parentSpanId"] is None
+    assert payload["kind"] == "SPAN_KIND_INTERNAL"
+    # In-progress spans carry null endTimeUnixNano + UNSET status.
+    assert payload["endTimeUnixNano"] is None
+    assert payload["status"]["code"] == "STATUS_CODE_UNSET"
+    # startTimeUnixNano MUST be a JSON-string of decimal nanos
+    # (preserves 64-bit precision per OTLP/JSON spec).
+    assert isinstance(payload["startTimeUnixNano"], str)
+    assert payload["startTimeUnixNano"].isdigit()
+
+    # Decode attributes back to a plain dict to assert semconv keys.
+    attrs = decode_attrs(payload["attributes"])
+    assert attrs["llmnb.run_type"] == "tool"
+    assert attrs["llmnb.agent_id"] == "alpha"
+    assert attrs["llmnb.zone_id"] == "refactor"
+    # ``inputs`` rides as input.value (JSON string) + input.mime_type.
+    assert attrs["input.mime_type"] == "application/json"
+    assert json.loads(attrs["input.value"]) == {
+        "observation": "ok", "importance": "info",
+    }
+    assert attrs["llmnb.tags"] == ["agent:alpha"]
 
 
 def test_event_appends_to_run_record_and_emits() -> None:
-    """Two ``run.event`` envelopes MUST land and the record MUST grow."""
+    """Two ``run.event`` envelopes MUST land and the span MUST grow."""
     tracker, sink = _new_tracker()
     run_id = tracker.start_run(
         name="notify", run_type="tool", inputs={"observation": "x", "importance": "info"}
@@ -108,18 +136,19 @@ def test_event_appends_to_run_record_and_emits() -> None:
     event_envs = [e for e in sink.envelopes if e["message_type"] == "run.event"]
     assert len(event_envs) == 2
     assert all(e["correlation_id"] == run_id for e in event_envs)
-    assert event_envs[0]["payload"]["event_type"] == "tool_call"
-    assert event_envs[1]["payload"]["event_type"] == "tool_result"
+    # Each run.event payload carries one OTLP SpanEvent under ``event``.
+    assert event_envs[0]["payload"]["event"]["name"] == "tool_call"
+    assert event_envs[1]["payload"]["event"]["name"] == "tool_result"
 
-    record = tracker.get_run(run_id)
-    assert isinstance(record, RunRecord)
-    assert len(record.events) == 2
-    # Timestamps MUST be monotonic (string-ordered ISO 8601).
-    assert record.events[0].timestamp <= record.events[1].timestamp
+    span = tracker.get_run(run_id)
+    assert isinstance(span, Span)
+    assert len(span.events) == 2
+    # timeUnixNano is a numeric string; monotonic ordering compares as int.
+    assert int(span.events[0].timeUnixNano) <= int(span.events[1].timeUnixNano)
 
 
 def test_complete_run_sets_end_time_and_outputs() -> None:
-    """``complete_run`` MUST stamp end_time/outputs and emit run.complete."""
+    """``complete_run`` MUST stamp endTimeUnixNano + status and emit run.complete."""
     tracker, sink = _new_tracker()
     run_id = tracker.start_run(name="notify", run_type="tool", inputs={})
     tracker.complete_run(run_id, outputs={"acknowledged": True})
@@ -129,38 +158,70 @@ def test_complete_run_sets_end_time_and_outputs() -> None:
     assert final["message_type"] == "run.complete"
     assert final["correlation_id"] == run_id
     payload = final["payload"]
-    assert payload["status"] == "success"
-    assert payload["outputs"] == {"acknowledged": True}
-    assert payload["end_time"] is not None
-    assert payload["error"] is None
+    # OTel canonical status code (the legacy ``"success"`` is mapped).
+    assert payload["status"]["code"] == "STATUS_CODE_OK"
+    assert payload["spanId"] == run_id
+    assert isinstance(payload["endTimeUnixNano"], str)
+    assert payload["endTimeUnixNano"].isdigit()
+    # ``outputs`` rides as output.value / output.mime_type attributes.
+    attrs = decode_attrs(payload["attributes"])
+    assert attrs["output.mime_type"] == "application/json"
+    assert json.loads(attrs["output.value"]) == {"acknowledged": True}
 
-    record = tracker.get_run(run_id)
-    assert record.end_time is not None
-    assert record.outputs == {"acknowledged": True}
-    assert record.error is None
+    span = tracker.get_run(run_id)
+    assert span.endTimeUnixNano is not None
+    assert span.status["code"] == "STATUS_CODE_OK"
 
 
 def test_fail_run_emits_complete_with_error_status() -> None:
-    """``fail_run`` MUST flag status=error and carry the error dict."""
+    """``fail_run`` MUST flag status=ERROR and surface OTel exception attrs."""
     tracker, sink = _new_tracker()
     run_id = tracker.start_run(name="ask", run_type="tool", inputs={"question": "?"})
-    err = {"kind": "TimeoutError", "message": "operator did not respond", "traceback": ""}
+    err = {
+        "exception.type": "TimeoutError",
+        "exception.message": "operator did not respond",
+        "exception.stacktrace": "",
+    }
     tracker.fail_run(run_id, error=err)
 
     final = sink.envelopes[-1]
     validate_envelope(final)
     assert final["message_type"] == "run.complete"
     payload = final["payload"]
-    assert payload["status"] == "error"
-    assert payload["error"] == err
+    assert payload["status"]["code"] == "STATUS_CODE_ERROR"
+    # status.message echoes the exception message per OTel semconv.
+    assert "operator did not respond" in payload["status"]["message"]
 
-    record = tracker.get_run(run_id)
-    assert record.error == err
-    assert record.end_time is not None
+    span = tracker.get_run(run_id)
+    attrs = decode_attrs(span.attributes)
+    assert attrs["exception.type"] == "TimeoutError"
+    assert attrs["exception.message"] == "operator did not respond"
+    assert span.endTimeUnixNano is not None
+
+
+def test_fail_run_accepts_legacy_kind_message_keys() -> None:
+    """fail_run MUST also accept the legacy ``kind`` / ``message`` schema.
+
+    Production callers such as the agent supervisor still pass the
+    LangSmith-shaped error envelope; the tracker normalizes onto OTel
+    ``exception.*`` attribute keys per the R1-K migration table.
+    """
+    tracker, sink = _new_tracker()
+    run_id = tracker.start_run(name="ask", run_type="tool", inputs={})
+    tracker.fail_run(
+        run_id,
+        error={"kind": "Cancelled", "message": "interrupted", "traceback": "frames"},
+    )
+    span = tracker.get_run(run_id)
+    attrs = decode_attrs(span.attributes)
+    assert attrs["exception.type"] == "Cancelled"
+    assert attrs["exception.message"] == "interrupted"
+    assert attrs["exception.stacktrace"] == "frames"
+    assert span.status["code"] == "STATUS_CODE_ERROR"
 
 
 def test_concurrent_starts_get_unique_ids() -> None:
-    """Threaded ``start_run`` MUST allocate distinct UUIDv4 ids."""
+    """Threaded ``start_run`` MUST allocate distinct OTLP spanIds."""
     tracker, sink = _new_tracker()
     barrier = threading.Barrier(8)
     ids: List[str] = []
@@ -189,18 +250,24 @@ def test_concurrent_starts_get_unique_ids() -> None:
     for env in sink.envelopes:
         validate_envelope(env)
         assert env["message_type"] == "run.start"
-        uuid.UUID(env["correlation_id"])
+        # correlation_id is the OTLP spanId (16 lowercase hex chars).
+        assert _SPAN_ID_RE.match(env["correlation_id"])
 
 
 def test_event_log_jsonl_is_round_trippable() -> None:
-    """Each line of ``event_log_jsonl`` MUST parse as a RunRecord-shaped JSON."""
+    """Each line of ``event_log_jsonl`` MUST parse as a Span-shaped JSON."""
     tracker, _sink = _new_tracker()
     rid_a = tracker.start_run(name="notify", run_type="tool", inputs={"x": 1})
     tracker.event(rid_a, "log", {"message": "midway"})
     tracker.complete_run(rid_a, outputs={"acknowledged": True})
 
     rid_b = tracker.start_run(name="ask", run_type="tool", inputs={"q": "?"})
-    tracker.fail_run(rid_b, error={"kind": "Cancelled", "message": "interrupted", "traceback": ""})
+    tracker.fail_run(
+        rid_b,
+        error={"exception.type": "Cancelled",
+               "exception.message": "interrupted",
+               "exception.stacktrace": ""},
+    )
 
     log = tracker.event_log_jsonl()
     lines = [ln for ln in log.splitlines() if ln.strip()]
@@ -208,25 +275,28 @@ def test_event_log_jsonl_is_round_trippable() -> None:
 
     parsed = [json.loads(ln) for ln in lines]
     # Round-trip via the pydantic model to assert the on-disk shape.
-    records = [RunRecord.model_validate(obj) for obj in parsed]
-    assert {r.id for r in records} == {rid_a, rid_b}
+    spans = [RunRecord.model_validate(obj) for obj in parsed]
+    assert {s.spanId for s in spans} == {rid_a, rid_b}
 
-    finished = next(r for r in records if r.id == rid_a)
-    assert finished.outputs == {"acknowledged": True}
-    assert finished.end_time is not None
+    finished = next(s for s in spans if s.spanId == rid_a)
+    finished_attrs = decode_attrs(finished.attributes)
+    assert finished_attrs["output.mime_type"] == "application/json"
+    assert json.loads(finished_attrs["output.value"]) == {"acknowledged": True}
+    assert finished.endTimeUnixNano is not None
     assert len(finished.events) == 1
-    assert finished.events[0].event_type == "log"
+    assert finished.events[0].name == "log"
 
-    failed = next(r for r in records if r.id == rid_b)
-    assert failed.error is not None
-    assert failed.error["kind"] == "Cancelled"
+    failed = next(s for s in spans if s.spanId == rid_b)
+    failed_attrs = decode_attrs(failed.attributes)
+    assert failed_attrs["exception.type"] == "Cancelled"
+    assert failed.status["code"] == "STATUS_CODE_ERROR"
 
 
 def test_event_against_unknown_run_raises() -> None:
     """``event`` against an unknown id MUST raise KeyError."""
     tracker, _ = _new_tracker()
     with pytest.raises(KeyError):
-        tracker.event(str(uuid.uuid4()), "log", {})
+        tracker.event(secrets.token_hex(8), "log", {})
 
 
 def test_run_tracker_with_dispatcher_sink() -> None:
@@ -269,4 +339,5 @@ def test_run_tracker_with_dispatcher_sink() -> None:
         "display_data", "update_display_data", "update_display_data",
     ]
     for _msg, kwargs in sent:
+        # display_id is the OTLP spanId, consistent across the lifecycle.
         assert kwargs["content"]["transient"] == {"display_id": rid}

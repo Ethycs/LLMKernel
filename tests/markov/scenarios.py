@@ -54,11 +54,13 @@ class ScenarioOutcome:
     Attributes:
         scenario_id: Stable string identifier the harness emits in
             reproducer blocks (RFC-004 §"Fault-injection scheduler").
-        expected_run_count: Number of LangSmith run records the run
-            tracker MUST hold after replay.
+        expected_run_count: Number of OTLP spans the run-tracker MUST
+            hold after replay.
         expected_status_for_each: One status per run record, in run
-            insertion order. Values are the RFC-003 ``run.complete``
-            status enum (``"success"`` / ``"error"`` / ``"timeout"``).
+            insertion order. Values are the LangSmith-flavored aliases
+            (``"success"`` / ``"error"`` / ``"timeout"``); the scenario
+            test maps them onto OTel canonical codes
+            (``STATUS_CODE_OK`` / ``STATUS_CODE_ERROR``).
             Empty list when the scenario produces *no* run records (e.g.
             the unknown-tool scenario where -32601 short-circuits).
         expected_invariants_pass: Subset of ``"I1".."I9"`` this
@@ -305,9 +307,17 @@ _register(
     ["success"],
     ["I1", "I3", "I6"],
 )
-# Unknown tool: zero run records — RFC-001 §Failure modes line "-32601;
-# no run record; kernel emits a run.policy audit event".
-_register("unknown_tool_rejected", unknown_tool_rejected, 0, [], ["I5", "I6"])
+# Unknown tool: one run record (the ``agent_emit:invalid_tool_use``
+# span) per RFC-002 §"Failure modes" allowed-tools-bypass row /
+# RFC-005 §"`agent_emit` runs".  The kernel surfaces the bypass
+# attempt to the operator instead of silently denying it; the
+# JSON-RPC -32601 still rides over the wire.  Earlier RFC-001 v1.0.0
+# said "no run record" but the v1.0.1 errata flips this to one
+# ``agent_emit`` run with severity surfaced via the renderer.
+_register(
+    "unknown_tool_rejected", unknown_tool_rejected,
+    1, ["success"], ["I1", "I5", "I6"],
+)
 
 
 __all__ = [

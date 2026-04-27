@@ -337,7 +337,7 @@ def test_supervisor_stdout_jsonrpc_frame_records_run(tmp_path: Path) -> None:
 
 
 def test_supervisor_stdout_prose_logs_violation(tmp_path: Path) -> None:
-    """Plain-prose stdout MUST be flagged as a DR-0010 violation."""
+    """Plain-prose stdout MUST emit ``agent_emit`` (RFC-002 §3 / RFC-005)."""
     sup = _make_supervisor()
     fake = _FakePopen(stdout_lines=["Hello operator!\n"])
     fake.returncode = 0
@@ -350,8 +350,143 @@ def test_supervisor_stdout_prose_logs_violation(tmp_path: Path) -> None:
     fake._exited.set()
     handle.terminate()
     names = [r.name for r in sup._run_tracker.iter_runs()]  # type: ignore[attr-defined]
-    # The supervisor records a synthetic notify run for the violation.
-    assert any("notify" in n or "violation" in n.lower() for n in names), names
+    # Lines that fail JSON parse become ``agent_emit:malformed_json``;
+    # the same line is ALSO flood-tracked as prose -> ``agent_emit:prose``.
+    assert any("agent_emit:prose" in n for n in names), names
+    assert any("agent_emit:malformed_json" in n for n in names), names
+
+
+def _decode_attrs(attrs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Tiny attr decoder so tests can read ``llmnb.*`` without importing _attrs."""
+    from llm_kernel._attrs import decode_attrs
+    return decode_attrs(attrs)
+
+
+def _agent_emit_spans(sup: AgentSupervisor) -> List[Any]:
+    """Return all open or closed ``agent_emit`` spans on the supervisor."""
+    return [
+        span for span in sup._run_tracker.iter_runs()  # type: ignore[attr-defined]
+        if span.name.startswith("agent_emit:")
+    ]
+
+
+def test_supervisor_stream_json_system_emits_agent_emit(tmp_path: Path) -> None:
+    """RFC-002 §3 / RFC-005: stream-json ``system`` -> ``agent_emit:system_message``."""
+    sup = _make_supervisor()
+    record = json.dumps({"type": "system", "subtype": "init", "session_id": "s"})
+    fake = _FakePopen(stdout_lines=[record + "\n"])
+    fake.returncode = 0
+    with _patch_health(), patch("subprocess.Popen", return_value=fake):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="x",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+    handle.stdout_thread.join(timeout=2.0)
+    fake._exited.set()
+    handle.terminate()
+    spans = _agent_emit_spans(sup)
+    kinds = [_decode_attrs(s.attributes).get("llmnb.emit_kind") for s in spans]
+    assert "system_message" in kinds, kinds
+    sys_span = next(s for s in spans if "system_message" in s.name)
+    attrs = _decode_attrs(sys_span.attributes)
+    assert attrs["llmnb.run_type"] == "agent_emit"
+    assert attrs["llmnb.agent_id"] == "alpha"
+    assert "init" in attrs["llmnb.emit_content"]
+
+
+def test_supervisor_stream_json_result_emits_agent_emit(tmp_path: Path) -> None:
+    """stream-json ``result`` -> ``agent_emit:result``."""
+    sup = _make_supervisor()
+    record = json.dumps({"type": "result", "subtype": "ok", "stop_reason": "end_turn"})
+    fake = _FakePopen(stdout_lines=[record + "\n"])
+    fake.returncode = 0
+    with _patch_health(), patch("subprocess.Popen", return_value=fake):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="x",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+    handle.stdout_thread.join(timeout=2.0)
+    fake._exited.set()
+    handle.terminate()
+    kinds = [
+        _decode_attrs(s.attributes).get("llmnb.emit_kind")
+        for s in _agent_emit_spans(sup)
+    ]
+    assert "result" in kinds, kinds
+
+
+def test_supervisor_stream_json_error_emits_agent_emit(tmp_path: Path) -> None:
+    """stream-json ``error`` -> ``agent_emit:error``."""
+    sup = _make_supervisor()
+    record = json.dumps({"type": "error", "message": "model overloaded"})
+    fake = _FakePopen(stdout_lines=[record + "\n"])
+    fake.returncode = 0
+    with _patch_health(), patch("subprocess.Popen", return_value=fake):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="x",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+    handle.stdout_thread.join(timeout=2.0)
+    fake._exited.set()
+    handle.terminate()
+    kinds = [
+        _decode_attrs(s.attributes).get("llmnb.emit_kind")
+        for s in _agent_emit_spans(sup)
+    ]
+    assert "error" in kinds, kinds
+
+
+def test_supervisor_assistant_text_with_tool_use_is_reasoning(
+    tmp_path: Path,
+) -> None:
+    """RFC-002 §3: text preceding a tool_use is ``agent_emit:reasoning``."""
+    sup = _make_supervisor()
+    assistant = json.dumps({
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "Let me check the file first."},
+                {"type": "tool_use", "id": "u1",
+                 "name": "mcp__llmkernel-operator-bridge__notify",
+                 "input": {"observation": "x", "importance": "info"}},
+            ],
+        },
+    })
+    fake = _FakePopen(stdout_lines=[assistant + "\n"])
+    fake.returncode = 0
+    with _patch_health(), patch("subprocess.Popen", return_value=fake):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="x",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+    handle.stdout_thread.join(timeout=2.0)
+    fake._exited.set()
+    handle.terminate()
+    spans = _agent_emit_spans(sup)
+    kinds = [_decode_attrs(s.attributes).get("llmnb.emit_kind") for s in spans]
+    assert "reasoning" in kinds, kinds
+
+
+def test_supervisor_malformed_json_emits_diagnostic(tmp_path: Path) -> None:
+    """RFC-005: malformed JSON -> agent_emit with parser_diagnostic."""
+    sup = _make_supervisor()
+    # Truncated JSON — fails the decoder mid-parse.
+    fake = _FakePopen(stdout_lines=['{"type":"assistant","message":\n'])
+    fake.returncode = 0
+    with _patch_health(), patch("subprocess.Popen", return_value=fake):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="x",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+    handle.stdout_thread.join(timeout=2.0)
+    fake._exited.set()
+    handle.terminate()
+    spans = _agent_emit_spans(sup)
+    bad = [s for s in spans
+           if _decode_attrs(s.attributes).get("llmnb.emit_kind") == "malformed_json"]
+    assert bad, [s.name for s in spans]
+    diag = _decode_attrs(bad[0].attributes).get("llmnb.parser_diagnostic")
+    assert diag and "position" in diag
 
 
 def test_supervisor_terminate_sets_state_terminated(tmp_path: Path) -> None:
