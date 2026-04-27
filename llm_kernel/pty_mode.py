@@ -369,6 +369,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(dispatcher, "set_drift_detector"):
         from .drift_detector import DriftDetector
         dispatcher.set_drift_detector(DriftDetector())
+    # Register the dispatcher's Comm target with the synthetic kernel so
+    # inbound RFC-006 v2 envelopes (operator.action, layout.edit,
+    # agent_graph.query, notebook.metadata, kernel.shutdown_request)
+    # actually reach their handlers. Without this start() call, the
+    # `kernel.shell.comm_manager.deliver(...)` in `_dispatch_inbound_line`
+    # finds no target and silently drops every inbound envelope.
+    dispatcher.start()
+
     if hasattr(dispatcher, "set_current_volatile_provider"):
         # Provide a callable that returns the kernel's current volatile
         # state for DriftDetector.compare(persisted_volatile, current).

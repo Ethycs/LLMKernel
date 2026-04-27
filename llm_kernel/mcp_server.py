@@ -534,10 +534,31 @@ class OperatorBridgeServer:
                 )
                 return
             try:
+                # work_dir is required by AgentSupervisor.spawn. Default
+                # to a `.llmnb-agents/<agent_id>` under the kernel's CWD
+                # so spawn artifacts (mcp-config.json, system prompt,
+                # stderr log) are inspectable but contained.
+                from pathlib import Path as _Path
+                _work_dir = (_Path.cwd() / ".llmnb-agents" / agent_id).resolve()
+                _work_dir.mkdir(parents=True, exist_ok=True)
+                # Pin a small model by default (haiku-4-5) to keep
+                # per-spawn costs in single-cent territory; operators
+                # can override via LLMKERNEL_DEFAULT_AGENT_MODEL env.
+                import os as _os
+                _model = _os.environ.get(
+                    "LLMKERNEL_DEFAULT_AGENT_MODEL",
+                    "claude-haiku-4-5-20251001",
+                )
+                _use_bare = _os.environ.get("LLMKERNEL_USE_BARE") == "1"
+                _api_key = _os.environ.get("ANTHROPIC_API_KEY") if _use_bare else None
                 spawn_method(
                     zone_id=self.zone_id,
                     agent_id=agent_id,
                     task=task,
+                    work_dir=_work_dir,
+                    model=_model,
+                    api_key=_api_key,
+                    use_bare=_use_bare,
                 )
             except Exception as exc:
                 logger.exception(

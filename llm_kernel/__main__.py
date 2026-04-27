@@ -667,12 +667,27 @@ def _run_pty_mode_smoke() -> int:
 
 
 if __name__ == '__main__':
+    # Load secrets from a project-root .env if python-dotenv is available.
+    # Uses find_dotenv() to walk up from CWD until a .env is found. Safe
+    # no-op if missing. Applied for ALL subcommands so subprocess-spawned
+    # kernels (e.g. the extension's PtyKernelClient launching ``pty-mode``
+    # with cwd=workspaceFolders[0]) pick up ANTHROPIC_API_KEY without the
+    # parent process having to set it.
+    try:
+        from dotenv import find_dotenv as _find_dotenv, load_dotenv as _load_dotenv
+        _dotenv_path = _find_dotenv(usecwd=True)
+        if _dotenv_path:
+            _load_dotenv(_dotenv_path)
+    except ImportError:
+        pass
+
     # Additive subcommand dispatch:
     #   ``mcp-server``               -> Track B1 RFC-001 MCP server
     #   ``litellm-proxy``            -> Track B5 RFC-002 LiteLLM proxy
     #   ``paper-telephone-smoke``    -> Track B3 kernel-only smoke
     #   ``agent-supervisor-smoke``   -> Track B4 single-agent end-to-end smoke
     #   ``metadata-writer-smoke``    -> RFC-005 / RFC-006 Family F smoke
+    #   ``pty-mode``                 -> RFC-008 PTY+socket kernel for extension
     if len(sys.argv) > 1 and sys.argv[1] == "mcp-server":
         from . import mcp_server as _mcp_server
 
