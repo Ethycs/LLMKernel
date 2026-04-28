@@ -662,6 +662,235 @@ def _utc_epoch_ns() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
 
 
+async def _async_serve_socket(state: Dict[str, Any]) -> None:
+    """Drive the existing sync inbound-line dispatcher from the asyncio loop.
+
+    BSP-004 V1: pragmatic — runs the existing threaded :func:`_run_read_loop`
+    in :meth:`loop.run_in_executor` so we get uvicorn's lifecycle management
+    without depending on platform-specific selector/proactor differences for
+    socket FDs. Pure-asyncio reader (via add_reader on SelectorEventLoop OR
+    sock_recv on either) is V2 work — the read path here is identical to
+    before, just managed as an asyncio Future the lifespan can await.
+
+    Halts when the socket EOFs or :attr:`state["async_done"]` is set
+    (lifespan shutdown signals this; the inner _run_read_loop polls
+    shutdown_event every 500ms via select timeout).
+    """
+    import asyncio
+    from . import _diagnostics
+
+    loop = asyncio.get_event_loop()
+    sock = state["writer"]._sock  # type: ignore[attr-defined]
+    if sock is None:
+        _diagnostics.mark("async_serve_socket_no_sock")
+        return
+    kernel = state["kernel"]
+    shutdown_event = state["shutdown_event"]
+    interrupt_event = state.get("interrupt_event")
+    done = asyncio.Event()
+    state["async_done"] = done
+
+    _diagnostics.mark("async_serve_socket_started")
+
+    # Run the existing sync read loop in the default thread-pool executor.
+    # When the lifespan shutdown sets state["async_done"], we set the
+    # shutdown_event so the inner select loop drops out cleanly.
+    async def _watch_shutdown() -> None:
+        await done.wait()
+        shutdown_event.set()
+
+    watch_task = asyncio.create_task(_watch_shutdown())
+    try:
+        await loop.run_in_executor(
+            None, _run_read_loop, state["writer"], kernel, shutdown_event, interrupt_event,
+        )
+    finally:
+        _diagnostics.mark("async_serve_socket_exited")
+        watch_task.cancel()
+        try:
+            await watch_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+def boot_kernel() -> Any:
+    """BSP-004: synchronous boot. Returns a state dict on success or an int
+    exit code on early failure (matches the legacy :func:`main` exit codes:
+    2 = no socket env var, 3 = socket connect failed, 11 = K11 proxy config,
+    12 = K12 proxy start). Used by :mod:`llm_kernel.app` lifespan.
+    """
+    from . import _diagnostics
+    _diagnostics.mark("pty_mode_main_entry")
+    address = os.environ.get(ENV_IPC_SOCKET, "")
+    pty_flag = os.environ.get(ENV_PTY_MODE) == "1"
+    session_id = os.environ.get(ENV_SESSION_ID) or str(uuid.uuid4())
+    _diagnostics.mark("pty_mode_env_read", socket=address, session_id=session_id, pty_flag=pty_flag)
+    if not address:
+        sys.stderr.write(
+            f"LLMKernel pty-mode: {ENV_IPC_SOCKET} env var is required\n"
+        )
+        sys.stderr.flush()
+        _diagnostics.mark("pty_mode_exit_no_socket", rc=2)
+        return 2
+
+    termios_restore = _set_raw_mode_if_tty() if pty_flag else None
+
+    writer = SocketWriter()
+    try:
+        writer.connect(address)
+    except OSError as exc:
+        sys.stderr.write(
+            f"LLMKernel pty-mode: failed to connect to socket {address!r}: {exc}\n"
+        )
+        sys.stderr.flush()
+        if termios_restore is not None:
+            termios_restore()
+        _diagnostics.mark("pty_mode_exit_socket_connect_failed", error=str(exc), rc=3)
+        return 3
+    _diagnostics.mark("pty_mode_socket_connected")
+
+    sys.stderr.write(
+        f"LLMKernel pty-mode v{KERNEL_VERSION}; socket={address}\n"
+    )
+    sys.stderr.flush()
+
+    _emit_ready_handshake(writer, session_id)
+    _diagnostics.mark("pty_mode_ready_emitted")
+
+    proxy_server = _start_owned_proxy_or_none()
+    if proxy_server is _PROXY_START_FAILED:
+        if termios_restore is not None:
+            termios_restore()
+        return 12
+    if proxy_server is _PROXY_CONFIG_REJECTED:
+        if termios_restore is not None:
+            termios_restore()
+        return 11
+
+    handler = OtlpDataPlaneHandler(
+        socket_writer=writer,
+        extra_attributes={"llmnb.kernel.session_id": session_id},
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler_restore = _install_handler(handler)
+
+    kernel = _PtyKernel(writer)
+    from ._kernel_hooks import attach_kernel_subsystems
+    dispatcher, tracker, bridge, supervisor, metadata_writer = (
+        attach_kernel_subsystems(kernel)
+    )
+
+    shutdown_event = threading.Event()
+    interrupt_event = threading.Event()
+
+    if hasattr(dispatcher, "set_shutdown_event"):
+        dispatcher.set_shutdown_event(shutdown_event)
+    if hasattr(dispatcher, "set_metadata_writer"):
+        dispatcher.set_metadata_writer(metadata_writer)
+    if hasattr(dispatcher, "set_agent_supervisor"):
+        dispatcher.set_agent_supervisor(supervisor)
+    if hasattr(dispatcher, "set_drift_detector"):
+        from .drift_detector import DriftDetector
+        dispatcher.set_drift_detector(DriftDetector())
+    dispatcher.start()
+    _diagnostics.mark("pty_mode_dispatcher_started")
+
+    if hasattr(dispatcher, "set_current_volatile_provider"):
+        def _current_volatile() -> Dict[str, Any]:
+            return {
+                "kernel": {
+                    "rfc_001_version": "1.0.0",
+                    "rfc_002_version": "1.0.1",
+                    "rfc_003_version": "2.0.2",
+                    "rfc_005_version": "1.0.0",
+                    "rfc_006_version": "2.0.2",
+                    "rfc_008_version": "1.0.0",
+                    "kernel_version": KERNEL_VERSION,
+                },
+            }
+        dispatcher.set_current_volatile_provider(_current_volatile)
+
+    # Signal handlers — only if on the main thread (uvicorn calls lifespan
+    # off the main thread, so signal.signal raises ValueError; uvicorn
+    # installs its own signal handlers anyway and translates them to
+    # lifespan shutdown).
+    def _on_sigint(_signum: int, _frame: Any) -> None:
+        interrupt_event.set()
+
+    def _on_sigterm(_signum: int, _frame: Any) -> None:
+        shutdown_event.set()
+
+    if hasattr(signal, "SIGINT"):
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+        except ValueError:
+            logger.debug("pty_mode: SIGINT handler not installable from this thread")
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except ValueError:
+            logger.debug("pty_mode: SIGTERM handler not installable from this thread")
+
+    return {
+        "writer": writer,
+        "kernel": kernel,
+        "dispatcher": dispatcher,
+        "tracker": tracker,
+        "bridge": bridge,
+        "supervisor": supervisor,
+        "metadata_writer": metadata_writer,
+        "shutdown_event": shutdown_event,
+        "interrupt_event": interrupt_event,
+        "termios_restore": termios_restore,
+        "handler_restore": handler_restore,
+        "proxy_server": proxy_server,
+        "session_id": session_id,
+    }
+
+
+def shutdown_kernel(state: Dict[str, Any]) -> None:
+    """BSP-004: cleanup matching :func:`boot_kernel`. Mirrors the legacy
+    :func:`main`'s ``finally`` block.
+    """
+    from . import _diagnostics
+    metadata_writer = state.get("metadata_writer")
+    dispatcher = state.get("dispatcher")
+    proxy_server = state.get("proxy_server")
+    writer = state.get("writer")
+    termios_restore = state.get("termios_restore")
+    handler_restore = state.get("handler_restore")
+
+    if metadata_writer is not None:
+        try:
+            metadata_writer.snapshot(trigger="shutdown")
+        except Exception:
+            logger.exception("shutdown_kernel: final metadata snapshot raised")
+        try:
+            metadata_writer.stop(emit_final=False)
+        except Exception:
+            logger.exception("shutdown_kernel: metadata_writer.stop raised")
+    if dispatcher is not None:
+        try:
+            dispatcher.stop()
+        except Exception:
+            logger.exception("shutdown_kernel: dispatcher.stop raised")
+    if proxy_server is not None and proxy_server not in (
+        _PROXY_START_FAILED, _PROXY_CONFIG_REJECTED,
+    ):
+        try:
+            proxy_server.stop()
+            _diagnostics.mark("pty_mode_proxy_stopped")
+        except Exception:
+            logger.exception("shutdown_kernel: proxy_server.stop raised")
+    if writer is not None:
+        writer.close()
+    if termios_restore is not None:
+        termios_restore()
+    if handler_restore is not None:
+        handler_restore()
+
+
 def _run_read_loop(
     writer: SocketWriter,
     kernel: _PtyKernel,

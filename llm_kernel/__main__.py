@@ -701,8 +701,36 @@ if __name__ == '__main__':
     elif len(sys.argv) > 1 and sys.argv[1] == "metadata-writer-smoke":
         sys.exit(_run_metadata_writer_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode":
-        from .pty_mode import main as _pty_main
-        sys.exit(_pty_main(sys.argv[2:]))
+        # BSP-004: kernel runs under uvicorn, with the socket reader on
+        # the asyncio loop. The legacy synchronous main() in pty_mode.py
+        # is retained for tests that don't want a uvicorn process. The
+        # /health route + lifespan management come for free.
+        import asyncio
+        import uvicorn
+
+        # CRITICAL on Windows: the default WindowsProactorEventLoop does
+        # NOT support loop.add_reader() for arbitrary socket file
+        # descriptors. _async_serve_socket uses add_reader to drive the
+        # RFC-008 socket reads off the asyncio loop, so we MUST use
+        # WindowsSelectorEventLoopPolicy. POSIX is unaffected (its
+        # default selector loop already supports add_reader).
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(
+                asyncio.WindowsSelectorEventLoopPolicy()
+            )
+
+        # Bind a localhost HTTP port for /health + future utility routes.
+        # Port 0 = OS-pick. The socket data plane (RFC-008) is unrelated
+        # and continues to use LLMKERNEL_IPC_SOCKET as before.
+        uvicorn.run(
+            "llm_kernel.app:app",
+            host="127.0.0.1",
+            port=0,
+            log_level="warning",  # keep the PTY clean; OTLP carries the real stream
+            access_log=False,
+            lifespan="on",
+            loop="asyncio",  # use the policy we set above, not uvloop
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode-smoke":
         sys.exit(_run_pty_mode_smoke())
     else:
