@@ -135,10 +135,30 @@ class ZoneConfig:
 # ---------------------------------------------------------------------------
 
 
+def _pixi_bin_dirs(env_root: Path) -> List[Path]:
+    """Return the candidate binary directories inside a pixi kernel env.
+
+    Pixi env layout differs by platform:
+      * Windows: ``<env>/`` holds top-level launchers (e.g. ``claude.cmd``
+        from non-Python packages) AND ``<env>/Scripts/`` holds
+        pip-installed entry-point exes (``mitmdump.exe``, ...). Both
+        must be on PATH for the kernel's subprocess.Popen calls to
+        resolve every dependency.
+      * POSIX: ``<env>/bin`` is the single binary directory.
+    """
+    if os.name == "nt":
+        return [env_root, env_root / "Scripts"]
+    return [env_root / "bin"]
+
+
 def _probe_pixi_env_for(binary_name: str) -> Tuple[Optional[str], List[str]]:
     """Walk up from cwd looking for ``.pixi/envs/kernel/<binary>``.
 
     Returns ``(absolute_path, searched_paths)``. RFC-009 §4.2 step 6.
+
+    Searches every directory in :func:`_pixi_bin_dirs` per platform so
+    pip-installed binaries (in ``Scripts/`` on Windows) are reachable
+    alongside top-level launchers (in the env root).
     """
     searched: List[str] = []
     cwd = Path.cwd()
@@ -147,22 +167,40 @@ def _probe_pixi_env_for(binary_name: str) -> Tuple[Optional[str], List[str]]:
         [f"{binary_name}.cmd", f"{binary_name}.exe", binary_name]
         if is_win else [binary_name]
     )
-    bin_subdir = "" if is_win else "bin"
     for level in range(PIXI_PROBE_MAX_LEVELS):
-        env_dir = cwd / Path(*PIXI_ENV_RELATIVE)
-        if bin_subdir:
-            env_dir = env_dir / bin_subdir
-        searched.append(str(env_dir))
-        if env_dir.is_dir():
-            for name in candidate_names:
-                candidate = env_dir / name
-                if candidate.is_file():
-                    return (str(candidate), searched)
+        env_root = cwd / Path(*PIXI_ENV_RELATIVE)
+        for env_dir in _pixi_bin_dirs(env_root):
+            searched.append(str(env_dir))
+            if env_dir.is_dir():
+                for name in candidate_names:
+                    candidate = env_dir / name
+                    if candidate.is_file():
+                        return (str(candidate), searched)
         parent = cwd.parent
         if parent == cwd:
             break
         cwd = parent
     return (None, searched)
+
+
+def _prepend_pixi_to_path(env_root: Path) -> None:
+    """Add every existing :func:`_pixi_bin_dirs` entry to PATH.
+
+    Idempotent — entries already on PATH are not duplicated. Mirrors
+    what ``pixi shell -e kernel`` would have done at activation time
+    so any subsequent ``shutil.which`` / ``subprocess.Popen`` call
+    resolves pixi-installed binaries (including pip entry-point exes
+    in ``Scripts/`` on Windows). Pinned by RFC-009 §4.2.
+    """
+    sep = ";" if os.name == "nt" else ":"
+    current = os.environ.get("PATH", "").split(sep)
+    additions: List[str] = []
+    for env_dir in _pixi_bin_dirs(env_root):
+        s = str(env_dir)
+        if env_dir.is_dir() and s not in current:
+            additions.append(s)
+    if additions:
+        os.environ["PATH"] = sep.join(additions + ([os.environ.get("PATH", "")] if os.environ.get("PATH") else []))
 
 
 def locate_claude_bin() -> Optional[str]:
@@ -201,14 +239,17 @@ def locate_claude_bin() -> Optional[str]:
     # 3) Pixi env probe
     probed, searched = _probe_pixi_env_for("claude")
     if probed:
-        # Side effect: prepend the probed dir to PATH AND set the
-        # LLMNB_CLAUDE_BIN env var so subprocess.Popen inheritance works
+        # Side effect: prepend ALL pixi bin dirs (env root + Scripts/
+        # on Windows; bin/ on POSIX) to PATH so subsequent
+        # subprocess.Popen calls resolve every pixi-installed binary
+        # (claude AND mitmdump for BSP-001 passthrough). Set the
+        # LLMNB_CLAUDE_BIN env var so subprocess inheritance works
         # without each call site re-probing.
-        env_dir = str(Path(probed).parent)
-        sep = ";" if os.name == "nt" else ":"
-        current_path = os.environ.get("PATH", "")
-        if env_dir not in current_path.split(sep):
-            os.environ["PATH"] = f"{env_dir}{sep}{current_path}"
+        env_root_path = Path(probed).parent
+        # Walk up to the .pixi/envs/kernel root if `probed` is in Scripts/.
+        if env_root_path.name == "Scripts":
+            env_root_path = env_root_path.parent
+        _prepend_pixi_to_path(env_root_path)
         os.environ[ENV_CLAUDE_BIN] = probed
         _record("claude_bin", probed, SOURCE_PROBE)
         return probed
