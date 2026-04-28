@@ -663,14 +663,25 @@ def _utc_epoch_ns() -> int:
 
 
 async def _async_serve_socket(state: Dict[str, Any]) -> None:
-    """Drive the existing sync inbound-line dispatcher from the asyncio loop.
+    """Drive the existing sync inbound-line dispatcher off uvicorn's loop.
 
-    BSP-004 V1: pragmatic — runs the existing threaded :func:`_run_read_loop`
-    in :meth:`loop.run_in_executor` so we get uvicorn's lifecycle management
-    without depending on platform-specific selector/proactor differences for
-    socket FDs. Pure-asyncio reader (via add_reader on SelectorEventLoop OR
-    sock_recv on either) is V2 work — the read path here is identical to
-    before, just managed as an asyncio Future the lifespan can await.
+    BSP-004 V2 (focused retry): runs :func:`_run_read_loop` on a DEDICATED
+    :class:`threading.Thread`, not the default :class:`ThreadPoolExecutor`.
+
+    Why dedicated thread, not executor:
+      - Executor pool workers have ambiguous lifecycle — Python may reuse
+        the same OS thread for unrelated callables, can recycle a worker
+        out from under blocking I/O during shutdown, and on Windows
+        there's a known interaction where ``subprocess.Popen`` invoked
+        on a pool worker during a blocking ``select`` (which is what
+        ``_run_read_loop`` is doing) regressed test #4 by EOF'ing the
+        parent's socket recv ~1.4s after agent_spawn dispatch.
+      - A dedicated thread mirrors the pre-BSP-004 main-thread behavior
+        as closely as possible while keeping uvicorn on the asyncio loop.
+        It owns the read loop's select/recv pair end-to-end with no pool
+        scheduling between iterations.
+      - Lifecycle is explicit: thread starts here, exits on
+        shutdown_event or socket EOF, joined by lifespan shutdown.
 
     Halts when the socket EOFs or :attr:`state["async_done"]` is set
     (lifespan shutdown signals this; the inner _run_read_loop polls
@@ -679,7 +690,6 @@ async def _async_serve_socket(state: Dict[str, Any]) -> None:
     import asyncio
     from . import _diagnostics
 
-    loop = asyncio.get_event_loop()
     sock = state["writer"]._sock  # type: ignore[attr-defined]
     if sock is None:
         _diagnostics.mark("async_serve_socket_no_sock")
@@ -692,18 +702,34 @@ async def _async_serve_socket(state: Dict[str, Any]) -> None:
 
     _diagnostics.mark("async_serve_socket_started")
 
-    # Run the existing sync read loop in the default thread-pool executor.
-    # When the lifespan shutdown sets state["async_done"], we set the
-    # shutdown_event so the inner select loop drops out cleanly.
+    # Dedicated thread, not executor. daemon=True so a stuck read loop
+    # (paranoid — _run_read_loop has a select timeout and exits on
+    # shutdown_event) doesn't block process exit.
+    read_thread = threading.Thread(
+        target=_run_read_loop,
+        args=(state["writer"], kernel, shutdown_event, interrupt_event),
+        name="llmkernel-read-loop",
+        daemon=True,
+    )
+    state["read_thread"] = read_thread
+    read_thread.start()
+
+    # Bridge: when the lifespan shutdown signals state["async_done"],
+    # set shutdown_event so the read thread's select timeout notices and
+    # the loop exits cleanly within ~500ms.
     async def _watch_shutdown() -> None:
         await done.wait()
         shutdown_event.set()
 
     watch_task = asyncio.create_task(_watch_shutdown())
+
+    # Park the lifespan-attached coroutine here until the read thread
+    # exits (socket EOF or shutdown). Polling instead of join() because
+    # join() is blocking and would freeze the asyncio loop; this poll
+    # cycles at the shutdown_event's natural cadence.
     try:
-        await loop.run_in_executor(
-            None, _run_read_loop, state["writer"], kernel, shutdown_event, interrupt_event,
-        )
+        while read_thread.is_alive():
+            await asyncio.sleep(0.5)
     finally:
         _diagnostics.mark("async_serve_socket_exited")
         watch_task.cancel()
@@ -711,6 +737,10 @@ async def _async_serve_socket(state: Dict[str, Any]) -> None:
             await watch_task
         except (asyncio.CancelledError, Exception):
             pass
+        # Give the read thread a moment to finish its current iteration
+        # if shutdown_event has been set; the daemon flag ensures we
+        # don't hang here forever.
+        read_thread.join(timeout=2.0)
 
 
 def boot_kernel() -> Any:

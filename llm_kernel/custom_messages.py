@@ -894,11 +894,32 @@ class CustomMessageDispatcher:
                 ag = recoverable.get("agents")
                 if isinstance(ag, list):
                     recoverable_agents = ag
+        # AgentSupervisor.respawn_from_config returns a per-agent status
+        # mapping with values "spawned" | "skipped" | "failed" (skipped
+        # means an agent with that id was already running; failed means
+        # the spawn raised, captured per-agent so one bad entry doesn't
+        # block the rest). Log the breakdown so hydrate failures are
+        # operator-visible without reading the agent_supervisor log.
         try:
-            supervisor.respawn_from_config(recoverable_agents)
+            respawn_results = supervisor.respawn_from_config(recoverable_agents)
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "notebook.metadata mode=hydrate: supervisor.respawn_from_config raised",
+            )
+            respawn_results = {}
+        if respawn_results:
+            counts: Dict[str, int] = {}
+            for status in respawn_results.values():
+                counts[status] = counts.get(status, 0) + 1
+            logger.info(
+                "notebook.metadata mode=hydrate: respawn results: %s",
+                counts,
+                extra={
+                    "event.name": "kernel.hydrate.respawn_summary",
+                    "llmnb.respawn.spawned": counts.get("spawned", 0),
+                    "llmnb.respawn.skipped": counts.get("skipped", 0),
+                    "llmnb.respawn.failed": counts.get("failed", 0),
+                },
             )
 
         # Step 4: emit a confirmation ``mode:"snapshot"`` envelope.
