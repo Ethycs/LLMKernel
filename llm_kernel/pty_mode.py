@@ -911,6 +911,7 @@ def _run_read_loop(
     (RFC-008 §4 step 5).
     """
     import select as _select
+    from . import _diagnostics
 
     sock = writer._sock  # type: ignore[attr-defined]
     if sock is None:
