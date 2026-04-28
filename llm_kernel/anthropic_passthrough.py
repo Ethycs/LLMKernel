@@ -40,7 +40,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import socket
 import subprocess
 import sys  # noqa: F401  # kept for tests that monkeypatch sys.executable
@@ -48,6 +47,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from . import zone_control
 
 if TYPE_CHECKING:  # pragma: no cover
     from .run_tracker import RunTracker
@@ -121,10 +122,19 @@ class AnthropicPassthroughServer:
 
         env = dict(os.environ)
         env["MITM_LOG_FILE"] = str(self.log_file)
-        # Resolve the actual mitmdump executable (Windows installs it as
-        # ``mitmdump.exe`` under the env's Scripts dir; ``python -m
-        # mitmproxy.tools.main`` does not have an importable __main__).
-        mitmdump_bin = shutil.which("mitmdump") or "mitmdump"
+        # Resolve the actual mitmdump executable via RFC-009 §4.2 discovery
+        # (env var override > PATH > pixi env probe). On Windows mitmdump
+        # is a pip-installed entry-point exe at
+        # ``<env>/Scripts/mitmdump.exe``, which the Extension Host's PATH
+        # does not include when it spawns the kernel; the pixi probe is
+        # what lets us survive that. Caller catches the RuntimeError
+        # below and turns it into K12 (`pty_mode_proxy_start_failed`).
+        mitmdump_bin = zone_control.locate_mitmdump_bin()
+        if mitmdump_bin is None:
+            raise RuntimeError(
+                "mitmdump executable not found (set LLMNB_MITM_BIN, "
+                "install mitmproxy, or run inside a pixi kernel env)"
+            )
         argv = [
             mitmdump_bin,
             "--mode", f"reverse:{self.upstream_base}",

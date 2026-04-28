@@ -22,6 +22,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Strip all RFC-009 env vars so tests start from a known baseline."""
     for var in (
         zone_control.ENV_CLAUDE_BIN,
+        zone_control.ENV_MITM_BIN,
         zone_control.ENV_USE_BARE,
         zone_control.ENV_USE_PASSTHROUGH,
         zone_control.ENV_MODEL_OVERRIDE,
@@ -46,6 +47,7 @@ def test_resolve_with_only_default(clean_env: None, monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("PATH", "")
     cfg = zone_control.resolve_zone_config()
     assert cfg.claude_bin is None
+    assert cfg.mitmdump_bin is None
     assert cfg.use_bare is False
     assert cfg.use_passthrough is False
     assert cfg.model_override is None
@@ -176,6 +178,89 @@ def test_locate_claude_no_source_returns_none(
 
 
 # ---------------------------------------------------------------------------
+# locate_mitmdump_bin — env > PATH > pixi probe (RFC-009 §4.2)
+# ---------------------------------------------------------------------------
+
+
+def test_locate_mitmdump_env_var_beats_path(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """LLMNB_MITM_BIN pointing at a real file beats PATH lookup."""
+    is_win = os.name == "nt"
+    fake_mitm = tmp_path / ("mitmdump.exe" if is_win else "mitmdump")
+    fake_mitm.write_text("fake mitmdump")
+    if not is_win:
+        os.chmod(fake_mitm, 0o755)
+    monkeypatch.setenv(zone_control.ENV_MITM_BIN, str(fake_mitm))
+    # Even if PATH had a different mitmdump, env should win.
+    result = zone_control.locate_mitmdump_bin()
+    assert result == str(fake_mitm)
+
+
+def test_locate_mitmdump_pixi_probe_walks_up_to_scripts_dir(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """No env, no PATH, but a pixi env exists 2 levels up → probe finds it.
+
+    On Windows, mitmdump is a pip-installed entry-point exe living in
+    ``.pixi/envs/kernel/Scripts/`` (NOT the env root). On POSIX it's in
+    ``.pixi/envs/kernel/bin/`` like every other binary. This test
+    asserts the pixi-env probe reaches the right per-platform dir.
+    """
+    is_win = os.name == "nt"
+    repo_root = tmp_path / "repo"
+    pixi_env = repo_root / Path(*zone_control.PIXI_ENV_RELATIVE)
+    bin_dir = (pixi_env / "Scripts") if is_win else (pixi_env / "bin")
+    bin_dir.mkdir(parents=True)
+    mitm_path = bin_dir / ("mitmdump.exe" if is_win else "mitmdump")
+    mitm_path.write_text("fake")
+    if not is_win:
+        os.chmod(mitm_path, 0o755)
+    # cwd two levels deep within the repo
+    deep = repo_root / "extension" / "test"
+    deep.mkdir(parents=True)
+    monkeypatch.chdir(deep)
+    monkeypatch.setenv("PATH", "")
+    result = zone_control.locate_mitmdump_bin()
+    assert result is not None
+    assert Path(result).resolve() == mitm_path.resolve()
+    # Side effect: env var was set, PATH was prepended with the pixi
+    # bin dirs so sibling binaries from the same env can be resolved
+    # via shutil.which on subsequent calls.
+    assert os.environ.get(zone_control.ENV_MITM_BIN) == result
+    sep = ";" if is_win else ":"
+    path_entries = os.environ.get("PATH", "").split(sep)
+    assert str(bin_dir) in path_entries
+
+
+def test_locate_mitmdump_no_source_returns_none(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Exhaustive miss → None; caller raises a clean error (K12 by pty_mode)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "")
+    assert zone_control.locate_mitmdump_bin() is None
+
+
+def test_resolve_zone_config_includes_mitmdump_bin(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """ZoneConfig surfaces the resolved mitmdump path alongside claude."""
+    is_win = os.name == "nt"
+    fake_mitm = tmp_path / ("mitmdump.exe" if is_win else "mitmdump")
+    fake_mitm.write_text("fake mitmdump")
+    if not is_win:
+        os.chmod(fake_mitm, 0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv(zone_control.ENV_MITM_BIN, str(fake_mitm))
+    cfg = zone_control.resolve_zone_config()
+    assert cfg.mitmdump_bin == str(fake_mitm)
+    # claude_bin remains independent (no source provided).
+    assert cfg.claude_bin is None
+
+
+# ---------------------------------------------------------------------------
 # Credentials — env-only (RFC-009 §4.4)
 # ---------------------------------------------------------------------------
 
@@ -262,6 +347,7 @@ def test_resolve_zone_config_full_snapshot(
     cfg = zone_control.resolve_zone_config()
 
     assert cfg.claude_bin is None  # no PATH, no pixi env
+    assert cfg.mitmdump_bin is None
     assert cfg.use_bare is True
     assert cfg.use_passthrough is False
     assert cfg.model_override == "haiku-4-5"

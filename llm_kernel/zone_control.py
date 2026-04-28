@@ -47,6 +47,7 @@ from . import _diagnostics
 # operator can grep their env once and tell which subsystem reads what.
 ENV_CLAUDE_BIN = "LLMNB_CLAUDE_BIN"
 ENV_PYTHON_BIN = "LLMNB_PYTHON_BIN"
+ENV_MITM_BIN = "LLMNB_MITM_BIN"
 ENV_USE_BARE = "LLMKERNEL_USE_BARE"
 ENV_USE_PASSTHROUGH = "LLMKERNEL_USE_PASSTHROUGH"
 ENV_MODEL_OVERRIDE = "LLMKERNEL_MODEL"
@@ -113,6 +114,10 @@ class ZoneConfig:
     #: When None, ``AgentSupervisor.spawn`` raises K83 instead of trying to
     #: spawn an unfound binary.
     claude_bin: Optional[str]
+    #: Absolute path to mitmdump executable, or None if unresolved.
+    #: When None, ``AnthropicPassthroughServer.start`` raises a clean
+    #: error which the pty_mode caller turns into K12.
+    mitmdump_bin: Optional[str]
     #: --bare flag for claude (forces ANTHROPIC_API_KEY auth path).
     use_bare: bool
     #: Use the kernel-owned passthrough proxy (BSP-001) for claude's
@@ -203,6 +208,78 @@ def _prepend_pixi_to_path(env_root: Path) -> None:
         os.environ["PATH"] = sep.join(additions + ([os.environ.get("PATH", "")] if os.environ.get("PATH") else []))
 
 
+def _locate_pixi_bin(
+    name: str,
+    env_var: str,
+    setting_label: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the absolute path to a pixi-managed executable per RFC-009 §4.2.
+
+    Priority: ``<env_var>`` env > PATH lookup > pixi env probe.
+
+    Generalizes :func:`locate_claude_bin`'s discovery so any binary that
+    lives in ``.pixi/envs/kernel/`` (top-level launcher on Windows or
+    ``bin/`` on POSIX) or in ``.pixi/envs/kernel/Scripts/`` (pip-installed
+    entry-point exe on Windows) can be located the same way.
+
+    On a successful pixi-probe match, sets ``<env_var>`` in the current
+    process env so subsequent ``subprocess.Popen(name, ...)`` calls
+    inherit it without re-probing. Also prepends every pixi bin dir to
+    PATH so sibling binaries from the same env (e.g. ``mitmdump`` after
+    ``claude``) resolve via ``shutil.which`` for free.
+
+    The ``setting_label`` is the name used in the
+    ``zone_control.resolved`` diagnostic mark (defaults to ``"<name>_bin"``).
+    """
+    label = setting_label or f"{name}_bin"
+    # 1) env var
+    explicit = os.environ.get(env_var, "").strip()
+    if explicit:
+        if Path(explicit).is_file():
+            _record(label, explicit, SOURCE_ENV)
+            return explicit
+        # The env var was set but doesn't point at a real file. Don't
+        # silently fall through — the operator's intent was explicit.
+        # Falling through would mask their mistake.
+        _diagnostics.mark(
+            "zone_control_invalid_value",
+            setting=label,
+            value=explicit,
+            reason=f"{env_var} points at a non-file path",
+        )
+        # Per RFC-009 §8 K81 — but for V1 we treat "explicit-but-broken"
+        # as fall-through with a warning. Production K83 handling at the
+        # caller catches the ultimate "no binary" case.
+    # 2) PATH lookup
+    via_path = shutil.which(name)
+    if via_path:
+        _record(label, via_path, SOURCE_PROBE)  # PATH is technically a probe too
+        return via_path
+    # 3) Pixi env probe
+    probed, searched = _probe_pixi_env_for(name)
+    if probed:
+        # Side effect: prepend ALL pixi bin dirs (env root + Scripts/
+        # on Windows; bin/ on POSIX) to PATH so subsequent
+        # subprocess.Popen calls resolve every pixi-installed binary
+        # in the same env. Set the env_var so subprocess inheritance
+        # works without each call site re-probing.
+        env_root_path = Path(probed).parent
+        # Walk up to the .pixi/envs/kernel root if `probed` is in Scripts/.
+        if env_root_path.name == "Scripts":
+            env_root_path = env_root_path.parent
+        _prepend_pixi_to_path(env_root_path)
+        os.environ[env_var] = probed
+        _record(label, probed, SOURCE_PROBE)
+        return probed
+    _diagnostics.mark(
+        "zone_control_discovery_failed",
+        binary=name,
+        searched_paths=searched,
+    )
+    _record(label, None, SOURCE_UNRESOLVED)
+    return None
+
+
 def locate_claude_bin() -> Optional[str]:
     """Resolve the absolute path to the claude executable per RFC-009 §4.2.
 
@@ -213,53 +290,23 @@ def locate_claude_bin() -> Optional[str]:
     calls (which inherit env) don't need to re-probe. This is the
     side-effect pinned in RFC-009 §4.2's probe rules.
     """
-    # 1) env var
-    explicit = os.environ.get(ENV_CLAUDE_BIN, "").strip()
-    if explicit:
-        if Path(explicit).is_file():
-            _record("claude_bin", explicit, SOURCE_ENV)
-            return explicit
-        # The env var was set but doesn't point at a real file. Don't
-        # silently fall through — the operator's intent was explicit.
-        # Falling through would mask their mistake.
-        _diagnostics.mark(
-            "zone_control_invalid_value",
-            setting="claude_bin",
-            value=explicit,
-            reason="LLMNB_CLAUDE_BIN points at a non-file path",
-        )
-        # Per RFC-009 §8 K81 — but for V1 we treat "explicit-but-broken"
-        # as fall-through with a warning. Production K83 handling at the
-        # caller catches the ultimate "no claude" case.
-    # 2) PATH lookup
-    via_path = shutil.which("claude")
-    if via_path:
-        _record("claude_bin", via_path, SOURCE_PROBE)  # PATH is technically a probe too
-        return via_path
-    # 3) Pixi env probe
-    probed, searched = _probe_pixi_env_for("claude")
-    if probed:
-        # Side effect: prepend ALL pixi bin dirs (env root + Scripts/
-        # on Windows; bin/ on POSIX) to PATH so subsequent
-        # subprocess.Popen calls resolve every pixi-installed binary
-        # (claude AND mitmdump for BSP-001 passthrough). Set the
-        # LLMNB_CLAUDE_BIN env var so subprocess inheritance works
-        # without each call site re-probing.
-        env_root_path = Path(probed).parent
-        # Walk up to the .pixi/envs/kernel root if `probed` is in Scripts/.
-        if env_root_path.name == "Scripts":
-            env_root_path = env_root_path.parent
-        _prepend_pixi_to_path(env_root_path)
-        os.environ[ENV_CLAUDE_BIN] = probed
-        _record("claude_bin", probed, SOURCE_PROBE)
-        return probed
-    _diagnostics.mark(
-        "zone_control_discovery_failed",
-        binary="claude",
-        searched_paths=searched,
-    )
-    _record("claude_bin", None, SOURCE_UNRESOLVED)
-    return None
+    return _locate_pixi_bin("claude", ENV_CLAUDE_BIN, setting_label="claude_bin")
+
+
+def locate_mitmdump_bin() -> Optional[str]:
+    """Resolve the absolute path to the mitmdump executable per RFC-009 §4.2.
+
+    Priority: ``LLMNB_MITM_BIN`` env > PATH lookup > pixi env probe.
+
+    On Windows, ``mitmdump`` is a pip-installed entry-point exe that
+    lives at ``<env>/Scripts/mitmdump.exe`` rather than the env root, so
+    the pixi probe must search ``Scripts/``. The
+    :class:`AnthropicPassthroughServer` in :mod:`anthropic_passthrough`
+    calls this to resolve the binary it spawns; without it, the kernel
+    raises K12 (`pty_mode_proxy_start_failed`) when the Extension Host
+    spawns the kernel without ``Scripts/`` on PATH.
+    """
+    return _locate_pixi_bin("mitmdump", ENV_MITM_BIN, setting_label="mitmdump_bin")
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +388,7 @@ def resolve_zone_config() -> ZoneConfig:
     """
     return ZoneConfig(
         claude_bin=locate_claude_bin(),
+        mitmdump_bin=locate_mitmdump_bin(),
         use_bare=effective_use_bare(),
         use_passthrough=effective_use_passthrough(),
         model_override=effective_model_override(),
@@ -351,6 +399,7 @@ def resolve_zone_config() -> ZoneConfig:
 
 __all__ = [
     "ENV_CLAUDE_BIN",
+    "ENV_MITM_BIN",
     "ENV_USE_BARE",
     "ENV_USE_PASSTHROUGH",
     "ENV_MODEL_OVERRIDE",
@@ -366,6 +415,7 @@ __all__ = [
     "SOURCE_PROBE",
     "SOURCE_UNRESOLVED",
     "locate_claude_bin",
+    "locate_mitmdump_bin",
     "effective_use_bare",
     "effective_use_passthrough",
     "effective_model_override",
