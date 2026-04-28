@@ -237,6 +237,7 @@ def build_argv(
     system_prompt_path: Path, mcp_config_path: Path, task: str,
     *, model: Optional[str] = None, use_bare: bool = False,
     claude_bin: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> List[str]:
     """Assemble the ``claude`` argv per RFC-002 v1.0.1.
 
@@ -287,6 +288,12 @@ def build_argv(
         argv.insert(4, "--bare")
     if model:
         argv.extend(["--model", model])
+    if session_id:
+        # BSP-002 §5: Claude session id is owned by the kernel. Pass
+        # --session-id so we control the UUID; required for a future
+        # --resume <session_id> to thread continuation across spawns.
+        # Pre-positional — matches the placement of other --flag args.
+        argv.extend(["--session-id", session_id])
     argv.append(task)
     return argv
 

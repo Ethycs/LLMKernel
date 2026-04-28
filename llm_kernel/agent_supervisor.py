@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,12 @@ class AgentHandle:
     #: exit) does not double-log; tag is plumbed into the restart
     #: bookkeeping.
     _hang_terminated: bool = False
+    #: Claude session id (UUID) per BSP-002 §5. Assigned at spawn time
+    #: via ``--session-id=<uuid>``. Survives across spawn/idle/respawn
+    #: of the same agent_id so a future ``--resume <claude_session_id>``
+    #: can thread the conversation back to where the prior process left
+    #: off. Empty string when unset (legacy callers, fixtures).
+    claude_session_id: str = ""
 
     def poll(self) -> Optional[int]:
         """Return the process exit code if it has exited, else ``None``."""
@@ -195,8 +202,36 @@ class AgentSupervisor:
         """
         from . import _diagnostics
         _diagnostics.mark("supervisor_spawn_entry", agent_id=agent_id, zone_id=zone_id)
+
+        # BSP-002 Phase 1 idempotency: a /spawn for an agent_id whose
+        # process is still alive returns the existing handle instead of
+        # double-spawning. The conversation graph (BSP-002 §4.2) treats
+        # successive cells against the same agent_id as continuations,
+        # not fresh spawns; the wire layer doesn't yet distinguish, so
+        # the kernel takes responsibility for the dedup. A future
+        # AgentSupervisor.resume(agent_id, task) covers the dead-agent
+        # case via ``--resume <claude_session_id>`` per BSP-002 §4.3.
+        with self._lock:
+            existing = self._agents.get(agent_id)
+        if existing is not None and existing.popen.poll() is None:
+            _diagnostics.mark(
+                "supervisor_spawn_idempotent_alive",
+                agent_id=agent_id,
+                claude_session_id=existing.claude_session_id,
+            )
+            logger.info(
+                "spawn(%s): agent already alive (session=%s); returning existing handle",
+                agent_id, existing.claude_session_id,
+            )
+            return existing
+
         api_key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
         trace_id = self._run_tracker.trace_id
+        # BSP-002 §5: kernel-owned claude_session_id. Assigned at fresh
+        # spawn time and passed via --session-id so the runtime conversation
+        # is tagged with a stable id we control. Persists on AgentHandle
+        # for a future --resume path.
+        claude_session_id = str(uuid.uuid4())
         # Resolve to absolute paths up-front. The child process is launched
         # with ``cwd=work_dir``, so passing relative paths to Claude's CLI
         # would double-prefix the work_dir (cwd + relative arg = doubled).
@@ -300,6 +335,7 @@ class AgentSupervisor:
         argv = build_argv(
             system_prompt_path, mcp_config_path, task,
             model=model, use_bare=use_bare, claude_bin=claude_bin,
+            session_id=claude_session_id,
         )
         logger.info(
             "spawning agent %s (zone=%s) model=%s bare=%s claude=%s",
@@ -321,7 +357,10 @@ class AgentSupervisor:
             "supervisor_spawn_popen_started",
             agent_id=agent_id, pid=popen.pid,
         )
-        handle = self._build_handle(popen, agent_id, zone_id, work_dir, task)
+        handle = self._build_handle(
+            popen, agent_id, zone_id, work_dir, task,
+            claude_session_id=claude_session_id,
+        )
         with self._lock:
             self._agents[agent_id] = handle
         _diagnostics.mark("supervisor_spawn_handle_built", agent_id=agent_id)
@@ -347,8 +386,14 @@ class AgentSupervisor:
     def _build_handle(
         self, popen: subprocess.Popen, agent_id: str, zone_id: str,
         work_dir: Path, task: str,
+        *, claude_session_id: str = "",
     ) -> AgentHandle:
-        """Allocate the handle + start reader/watchdog threads."""
+        """Allocate the handle + start reader/watchdog threads.
+
+        ``claude_session_id`` is the BSP-002 §5 kernel-owned UUID passed
+        to claude via ``--session-id``; persists on the handle so a future
+        ``--resume`` can thread continuation across spawn cycles.
+        """
         spawn_dir = work_dir / ".run" / agent_id
         stderr_log = spawn_dir / f"kernel.stderr.{agent_id}.log"
         now = time.monotonic()
@@ -358,6 +403,7 @@ class AgentSupervisor:
             stdout_thread=threading.Thread(),  # placeholder
             stderr_thread=threading.Thread(),  # placeholder
             _last_stdout_ts=now,
+            claude_session_id=claude_session_id,
         )
         handle.stdout_thread = threading.Thread(
             target=self._read_stdout, args=(handle,),
