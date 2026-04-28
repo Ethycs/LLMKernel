@@ -322,12 +322,14 @@ class AgentSupervisor:
             trace_id=trace_id,
             set_base_url=effective_set_base_url,
         )
-        # Windows: subprocess.Popen does not honor PATHEXT for unquoted
-        # names, so resolve "claude" to its actual file (claude.cmd /
-        # claude.exe / claude bash script). Lookup uses the parent env's
-        # PATH because the child env's PATH is identical (we only filter
-        # secrets, not add path entries).
-        claude_bin = shutil.which("claude") or "claude"
+        # RFC-009 §4.2 — resolve claude binary through zone_control so
+        # the precedence rules (env > PATH > pixi-env probe) are applied
+        # consistently and the diagnostic ``zone_control.resolved`` marker
+        # tells the operator which source supplied the value. Returns
+        # None if no source resolves; we degrade to bare "claude" so
+        # downstream Popen errors carry a useful ENOENT instead of None.
+        from . import zone_control
+        claude_bin = zone_control.locate_claude_bin() or "claude"
         _diagnostics.mark(
             "supervisor_spawn_claude_resolved",
             agent_id=agent_id, claude_bin=claude_bin,
