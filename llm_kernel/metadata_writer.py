@@ -52,7 +52,7 @@ import uuid
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     from .custom_messages import CustomMessageDispatcher
@@ -534,6 +534,18 @@ class MetadataWriter:
         self._last_emitted_envelope: Optional[Dict[str, Any]] = None
         self._overflow_checkpoint_count: int = 0
 
+        # BSP-003 §6 intent registry state.  ``_intent_applied`` is the
+        # idempotency set keyed on ``intent_id`` -> ``snapshot_version``
+        # at the time the intent was applied (BSP-003 §6 step 2).
+        # ``_intent_log`` accumulates the per-intent ``intent_applied``
+        # event-log entries emitted by :meth:`submit_intent` (BSP-003
+        # §6 step 7).  ``_intent_queue_lock`` is the FIFO serialization
+        # gate (BSP-003 §6 final paragraph: single thread of writes
+        # within one zone).
+        self._intent_applied: Dict[str, int] = {}
+        self._intent_log: List[Dict[str, Any]] = []
+        self._intent_queue_lock: threading.RLock = threading.RLock()
+
     # -- Public mutators ---------------------------------------------
 
     def update_layout(self, tree: Dict[str, Any]) -> None:
@@ -726,6 +738,430 @@ class MetadataWriter:
                     self._dirty = True
                     return True
         return False
+
+    # -- BSP-003 §10 intent dispatcher -------------------------------
+
+    #: BSP-003 §5 enumeration of legal ``intent_kind`` values.  Adding
+    #: a kind requires a BSP/RFC amendment; an unknown kind triggers
+    #: K40.
+    _BSP003_INTENT_KINDS: FrozenSet[str] = frozenset({  # type: ignore[name-defined]
+        "append_turn",
+        "create_agent",
+        "move_agent_head",
+        "fork_agent",
+        "update_agent_session",
+        "add_overlay",
+        "move_overlay_ref",
+        "set_cell_metadata",
+        "update_ordering",
+        "add_blob",
+        "record_event",
+        # K-MW slice extensions: these wrap the existing apply functions
+        # so the dispatcher is the single mutation entrypoint per
+        # BSP-003 §2 ("all writes serialize through one queue").  Other
+        # agents call the public methods directly today; the registry
+        # entries here let external clients submit the same operations
+        # via the intent envelope.
+        "apply_layout_edit",
+        "apply_agent_graph_command",
+        "acknowledge_drift",
+    })
+
+    def submit_intent(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        """Submit one BSP-003 intent envelope; apply via the registry.
+
+        Envelope shape (BSP-003 §3):
+
+        ::
+
+            {
+              "type": "operator.action",
+              "payload": {
+                "action_type": "zone_mutate",
+                "intent_kind": "<kind>",
+                "parameters": { ... },
+                "intent_id": "<ulid|uuid>",
+                "expected_snapshot_version": <int>   # optional, CAS
+              }
+            }
+
+        Returns a result dict carrying the disposition:
+
+        ``{"applied": bool, "intent_id": str, "snapshot_version": int,
+        "already_applied": bool, "error_code": str|None,
+        "error_reason": str|None, "response": dict|None}``
+
+        Failure modes (BSP-003 §8):
+
+        * ``K40`` -- unknown ``intent_kind``.  No state change.
+        * ``K41`` -- ``expected_snapshot_version`` mismatch (CAS).  No
+          state change.
+        * ``K42`` -- intent validator rejected (e.g., missing required
+          parameters, target node not found).  No state change.
+        * ``K43`` -- atomic file write failed.  In-memory state still
+          consistent; surface as degraded.
+
+        The method is the public mutation entrypoint per BSP-003 §10.
+        FIFO serialization is provided by ``_intent_queue_lock``; the
+        existing autosave-timer thread handles drainage of the
+        downstream debounced file write.
+
+        Atomic-write step (BSP-003 §6 step 8) is exposed as a no-op in
+        V1 -- the actual file write is the dispatcher's
+        :meth:`snapshot` path which uses ``json.dumps`` over a
+        complete materialized snapshot.  A direct ``tmp + rename``
+        write to ``metadata.rts`` is queued for the ``.llmnb``
+        save-pipeline integration (X-EXT slice, file format owner) and
+        not in the K-MW V1 scope.  This method emits a
+        ``notebook.metadata`` snapshot envelope (BSP-003 §6 step 9)
+        which the dispatcher carries on the wire.
+        """
+        # FIFO gate: serialize all intents through a single re-entrant
+        # lock so concurrent submissions interleave deterministically.
+        with self._intent_queue_lock:
+            return self._dispatch_intent(envelope)
+
+    def _dispatch_intent(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate + route one intent envelope.  Caller holds the FIFO lock."""
+        # Envelope validation (BSP-003 §3 + RFC-006 §"operator.action").
+        if not isinstance(envelope, dict):
+            return self._intent_failure(
+                intent_id="", code="K42",
+                reason="envelope must be a dict",
+            )
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            return self._intent_failure(
+                intent_id="", code="K42",
+                reason="envelope.payload must be a dict",
+            )
+        intent_id = payload.get("intent_id")
+        if not isinstance(intent_id, str) or not intent_id:
+            return self._intent_failure(
+                intent_id="", code="K42",
+                reason="payload.intent_id must be a non-empty string",
+            )
+        intent_kind = payload.get("intent_kind")
+        parameters = payload.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            return self._intent_failure(
+                intent_id=intent_id, code="K42",
+                reason="payload.parameters must be a dict",
+            )
+        expected_version = payload.get("expected_snapshot_version")
+        action_type = payload.get("action_type")
+        if action_type is not None and action_type != "zone_mutate":
+            # We accept only the canonical action_type per BSP-003 §3.
+            # Receivers SHOULD be permissive (RFC-003 §back-compat); we
+            # log a marker and continue rather than fail.
+            logger.debug(
+                "submit_intent: unexpected action_type %r (continuing)",
+                action_type,
+            )
+
+        # BSP-003 §6 step 2: idempotency check.  A re-submission of an
+        # already-applied intent_id is a no-op + emits an
+        # already-applied response.
+        with self._lock:
+            if intent_id in self._intent_applied:
+                applied_version = self._intent_applied[intent_id]
+                return {
+                    "applied": False,
+                    "already_applied": True,
+                    "intent_id": intent_id,
+                    "snapshot_version": applied_version,
+                    "error_code": None,
+                    "error_reason": None,
+                    "response": None,
+                }
+
+        # BSP-003 §6 step 3: CAS check.
+        if expected_version is not None:
+            try:
+                expected_int = int(expected_version)
+            except (TypeError, ValueError):
+                return self._intent_failure(
+                    intent_id=intent_id, code="K42",
+                    reason="expected_snapshot_version must be an integer",
+                )
+            with self._lock:
+                actual = self._snapshot_version
+            if actual != expected_int:
+                # K41 emit a numbered-marker log entry per BSP-003 §8.
+                logger.warning(
+                    "intent_cas_rejected expected=%d actual=%d intent_id=%s",
+                    expected_int, actual, intent_id,
+                    extra={
+                        "event.name": "intent_cas_rejected",
+                        "llmnb.intent_id": intent_id,
+                        "llmnb.expected_snapshot_version": expected_int,
+                        "llmnb.actual_snapshot_version": actual,
+                    },
+                )
+                return {
+                    "applied": False,
+                    "already_applied": False,
+                    "intent_id": intent_id,
+                    "snapshot_version": actual,
+                    "error_code": "K41",
+                    "error_reason": (
+                        f"CAS rejected: expected {expected_int} actual {actual}"
+                    ),
+                    "response": None,
+                }
+
+        # BSP-003 §6 step 1: dispatch through the registry.
+        if intent_kind not in self._BSP003_INTENT_KINDS:
+            logger.warning(
+                "intent_unknown_kind intent_kind=%r intent_id=%s",
+                intent_kind, intent_id,
+                extra={
+                    "event.name": "intent_unknown_kind",
+                    "llmnb.intent_id": intent_id,
+                    "llmnb.intent_kind": str(intent_kind),
+                },
+            )
+            with self._lock:
+                version_at_reject = self._snapshot_version
+            return {
+                "applied": False,
+                "already_applied": False,
+                "intent_id": intent_id,
+                "snapshot_version": version_at_reject,
+                "error_code": "K40",
+                "error_reason": f"unknown intent_kind: {intent_kind!r}",
+                "response": None,
+            }
+
+        # Apply via the per-kind handler.  Handlers return either:
+        #   - True/False/int (truthy = applied; int = post-bumped version)
+        #   - dict response (for query-style commands)
+        handler = self._intent_handler_for(intent_kind)
+        with self._lock:
+            pre_version = self._snapshot_version
+        try:
+            outcome = handler(parameters)
+        except Exception as exc:  # K42 -- validation / apply error.
+            logger.warning(
+                "intent_validation_failed intent_kind=%s intent_id=%s reason=%s",
+                intent_kind, intent_id, str(exc),
+                extra={
+                    "event.name": "intent_validation_failed",
+                    "llmnb.intent_id": intent_id,
+                    "llmnb.intent_kind": intent_kind,
+                },
+            )
+            with self._lock:
+                version_at_reject = self._snapshot_version
+            return {
+                "applied": False,
+                "already_applied": False,
+                "intent_id": intent_id,
+                "snapshot_version": version_at_reject,
+                "error_code": "K42",
+                "error_reason": str(exc),
+                "response": None,
+            }
+
+        # Decode the handler outcome.  For dict outcomes (query-style),
+        # the outcome is the response payload and we do NOT bump the
+        # version unless the dict carries ``"applied": True``.
+        ok: bool
+        response_payload: Optional[Dict[str, Any]] = None
+        if isinstance(outcome, dict):
+            response_payload = outcome
+            # Mutation-style outcomes carry "ok"; query-style do not.
+            ok = bool(outcome.get("ok", True))
+        elif isinstance(outcome, int):
+            # apply_layout_edit returns the post-bump version; if the
+            # version DIDN'T change the apply was a no-op (K42-like).
+            ok = outcome > pre_version
+            # Note: for layout the bump already happened inside the
+            # apply call; record the new version verbatim.
+        else:
+            ok = bool(outcome)
+
+        if not ok:
+            logger.warning(
+                "intent_validation_failed intent_kind=%s intent_id=%s "
+                "reason=apply_returned_false",
+                intent_kind, intent_id,
+                extra={
+                    "event.name": "intent_validation_failed",
+                    "llmnb.intent_id": intent_id,
+                    "llmnb.intent_kind": intent_kind,
+                },
+            )
+            with self._lock:
+                version_at_reject = self._snapshot_version
+            return {
+                "applied": False,
+                "already_applied": False,
+                "intent_id": intent_id,
+                "snapshot_version": version_at_reject,
+                "error_code": "K42",
+                "error_reason": "apply rejected the intent (validator returned false)",
+                "response": response_payload,
+            }
+
+        # BSP-003 §6 steps 6-7: bump version (if the handler hasn't
+        # already), record the intent_applied event, mark dirty.
+        with self._lock:
+            # Layout / agent_graph mutators bump _snapshot_version
+            # themselves; record_event / acknowledge_drift do not.
+            # Bump iff the version is unchanged from before the apply.
+            # We approximate by bumping only when the handler did NOT
+            # already increment (intent_kind in the explicit set).
+            if intent_kind in {"record_event", "acknowledge_drift"}:
+                self._snapshot_version += 1
+            new_version = self._snapshot_version
+            self._intent_applied[intent_id] = new_version
+            entry = {
+                "type": "intent_applied",
+                "intent_id": intent_id,
+                "intent_kind": intent_kind,
+                "snapshot_version": new_version,
+                "recorded_at": _utc_now_iso(),
+            }
+            self._intent_log.append(entry)
+            self._dirty = True
+
+        # BSP-003 §6 step 9: emit the post-apply Family F snapshot
+        # envelope to subscribers.  We wrap exceptions because the
+        # envelope emit must not break the apply contract -- the
+        # in-memory state is already updated by this point.
+        try:
+            self.snapshot(trigger="intent_applied")
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "submit_intent: post-apply snapshot emit raised; "
+                "in-memory state already updated"
+            )
+
+        return {
+            "applied": True,
+            "already_applied": False,
+            "intent_id": intent_id,
+            "snapshot_version": new_version,
+            "error_code": None,
+            "error_reason": None,
+            "response": response_payload,
+        }
+
+    def _intent_handler_for(self, intent_kind: str):
+        """Return the bound apply function for ``intent_kind``."""
+        # Bridge handlers: existing apply_* methods are the V1 truth
+        # for layout / agent_graph; we accept their parameter shapes.
+        if intent_kind == "apply_layout_edit":
+            def _h(params: Dict[str, Any]) -> int:
+                op = params.get("operation")
+                inner = params.get("parameters", {})
+                if not isinstance(op, str):
+                    raise ValueError("apply_layout_edit: missing operation")
+                if not isinstance(inner, dict):
+                    inner = {}
+                return self.apply_layout_edit(operation=op, parameters=inner)
+            return _h
+        if intent_kind == "apply_agent_graph_command":
+            def _h(params: Dict[str, Any]) -> Dict[str, Any]:
+                cmd = params.get("command")
+                inner = params.get("parameters", {})
+                if not isinstance(cmd, str):
+                    raise ValueError("apply_agent_graph_command: missing command")
+                if not isinstance(inner, dict):
+                    inner = {}
+                return self.apply_agent_graph_command(command=cmd, parameters=inner)
+            return _h
+        if intent_kind == "acknowledge_drift":
+            def _h(params: Dict[str, Any]) -> bool:
+                fp = params.get("field_path")
+                da = params.get("detected_at")
+                if not isinstance(fp, str) or not isinstance(da, str):
+                    raise ValueError(
+                        "acknowledge_drift: field_path and detected_at "
+                        "must be strings"
+                    )
+                return self.acknowledge_drift(field_path=fp, detected_at=da)
+            return _h
+        if intent_kind == "record_event":
+            def _h(params: Dict[str, Any]) -> bool:
+                # Append a structured event-log entry; we fold these
+                # into the intent_log so the snapshot carries them.
+                fp = params.get("field_path")
+                if not isinstance(fp, str) or not fp:
+                    raise ValueError("record_event: field_path is required")
+                self.append_drift_event(
+                    field_path=fp,
+                    previous_value=params.get("previous_value"),
+                    current_value=params.get("current_value"),
+                    severity=str(params.get("severity", "info")),
+                    detected_at=params.get("detected_at"),
+                )
+                return True
+            return _h
+        if intent_kind == "add_blob":
+            def _h(params: Dict[str, Any]) -> bool:
+                key = params.get("key")
+                blob = params.get("blob")
+                if not isinstance(key, str) or not key:
+                    raise ValueError("add_blob: key is required")
+                if not isinstance(blob, dict):
+                    raise ValueError("add_blob: blob must be a dict")
+                with self._lock:
+                    if key not in self._blobs:
+                        self._blobs[key] = dict(blob)
+                    self._dirty = True
+                return True
+            return _h
+
+        # BSP-002 turn graph kinds: not yet wired into MetadataWriter
+        # state (the writer carries the agent graph but not the
+        # turn-level conversation graph).  We return a stub that
+        # raises K42-style validation so the dispatcher returns a
+        # well-formed error rather than silently ignoring the call.
+        # When BSP-002 §"Implementation slice" lands, this stub is
+        # replaced by the real apply functions.
+        def _stub(params: Dict[str, Any]) -> bool:
+            raise ValueError(
+                f"intent_kind {intent_kind!r} is not yet implemented in "
+                "the V1 MetadataWriter (BSP-002 turn graph slice pending)"
+            )
+        return _stub
+
+    def _intent_failure(
+        self, *, intent_id: str, code: str, reason: str,
+    ) -> Dict[str, Any]:
+        """Build a uniform K-coded failure response and log a marker."""
+        marker = {
+            "K40": "intent_unknown_kind",
+            "K41": "intent_cas_rejected",
+            "K42": "intent_validation_failed",
+            "K43": "zone_write_failed",
+        }.get(code, "intent_failed")
+        logger.warning(
+            "%s intent_id=%s reason=%s",
+            marker, intent_id, reason,
+            extra={
+                "event.name": marker,
+                "llmnb.intent_id": intent_id,
+            },
+        )
+        with self._lock:
+            version_at_reject = self._snapshot_version
+        return {
+            "applied": False,
+            "already_applied": False,
+            "intent_id": intent_id,
+            "snapshot_version": version_at_reject,
+            "error_code": code,
+            "error_reason": reason,
+            "response": None,
+        }
+
+    def iter_intent_log(self) -> List[Dict[str, Any]]:
+        """Return a snapshot of the in-memory intent_applied log entries."""
+        with self._lock:
+            return [dict(entry) for entry in self._intent_log]
 
     # -- Family B (layout) state machine -----------------------------
 
@@ -1390,6 +1826,31 @@ class MetadataWriter:
             persisted_session = snapshot.get("session_id")
             if isinstance(persisted_session, str) and persisted_session:
                 self._session_id = persisted_session
+            # Reset BSP-003 §10 intent dispatcher state.  Re-hydrating
+            # is idempotent: a previously-applied intent_id appears as
+            # an unseen ID after hydrate (the registry tracks
+            # in-process state only).  This is acceptable because the
+            # idempotency set is for replay-within-a-session, not
+            # cross-session de-duplication; the latter is V3 work.
+            event_log_dict = snapshot.get("event_log") or {}
+            persisted_intents = (
+                event_log_dict.get("intent_log")
+                if isinstance(event_log_dict, dict) else None
+            )
+            if isinstance(persisted_intents, list):
+                self._intent_log = [
+                    _deepcopy_json(e) for e in persisted_intents
+                ]
+                # Rebuild the idempotency set so a freshly-hydrated
+                # writer rejects re-submissions of in-snapshot intents.
+                self._intent_applied = {
+                    e.get("intent_id"): e.get("snapshot_version", 0)
+                    for e in self._intent_log
+                    if isinstance(e, dict) and isinstance(e.get("intent_id"), str)
+                }
+            else:
+                self._intent_log = []
+                self._intent_applied = {}
             persisted_created_at = snapshot.get("created_at")
             if isinstance(persisted_created_at, str) and persisted_created_at:
                 self._created_at = persisted_created_at
@@ -1539,10 +2000,27 @@ class MetadataWriter:
                 "layout": dict(self._layout),
                 "agents": dict(self._agent_graph),
                 "config": _deepcopy_json(self._config),
-                "event_log": {"version": 1, "runs": runs},
+                "event_log": self._build_event_log(runs),
                 "blobs": dict(self._blobs),
                 "drift_log": list(self._drift_log),
             }
+
+    def _build_event_log(
+        self, runs: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Compose the ``event_log`` substructure.
+
+        ``intent_log`` (BSP-003 §6 step 7) is included only when
+        non-empty so on-the-wire snapshots from a never-mutated writer
+        remain byte-identical to a freshly-built baseline (existing
+        hydrate round-trip tests rely on this).
+        """
+        out: Dict[str, Any] = {"version": 1, "runs": runs}
+        if self._intent_log:
+            out["intent_log"] = [
+                _deepcopy_json(e) for e in self._intent_log
+            ]
+        return out
 
     def _build_envelope(
         self, snapshot: Dict[str, Any], *, trigger: str,
