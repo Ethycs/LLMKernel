@@ -914,7 +914,9 @@ def _run_read_loop(
 
     sock = writer._sock  # type: ignore[attr-defined]
     if sock is None:
+        _diagnostics.mark("read_loop_no_socket")
         return
+    _diagnostics.mark("read_loop_entered")
     buffer = bytearray()
     while not shutdown_event.is_set():
         # SIGINT bookkeeping: the handler set ``interrupt_event``; we
@@ -928,16 +930,25 @@ def _run_read_loop(
             )
         try:
             ready, _, _ = _select.select([sock], [], [], 0.5)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            _diagnostics.mark(
+                "read_loop_select_error",
+                error_type=type(exc).__name__, error=str(exc),
+            )
             break
         if not ready:
             continue
         try:
             chunk = sock.recv(4096)
-        except OSError:
+        except OSError as exc:
+            _diagnostics.mark(
+                "read_loop_recv_error",
+                error_type=type(exc).__name__, error=str(exc),
+            )
             break
         if not chunk:
             # Peer closed -- RFC-008 §4 step 6 normal shutdown path.
+            _diagnostics.mark("read_loop_peer_eof")
             break
         buffer.extend(chunk)
         while True:
@@ -949,6 +960,8 @@ def _run_read_loop(
             if not line.strip():
                 continue
             _dispatch_inbound_line(line, kernel)
+    if shutdown_event.is_set():
+        _diagnostics.mark("read_loop_shutdown_event_set")
 
 
 def _dispatch_inbound_line(line: bytes, kernel: _PtyKernel) -> None:

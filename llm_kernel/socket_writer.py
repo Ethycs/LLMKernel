@@ -93,6 +93,16 @@ class SocketWriter:
                 )
             family, target = parse_address(address)
             sock = socket.socket(family, socket.SOCK_STREAM)
+            # On Windows, socket.socket() returns an inheritable handle by
+            # default. When the kernel later spawns Claude via subprocess.Popen
+            # (AgentSupervisor.spawn), the child inherits a copy of this fd
+            # despite close_fds=True (Windows close_fds covers regular handles
+            # but socket fds need explicit set_inheritable(False)). The
+            # inherited copy keeps the OS-level reference alive past the
+            # child's startup, which can EOF the parent's recv when the child
+            # does its own handle cleanup. Set non-inheritable here so the
+            # child gets nothing.
+            sock.set_inheritable(False)
             sock.connect(target)
             self._sock = sock
             self._address = address
