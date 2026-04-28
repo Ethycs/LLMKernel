@@ -158,6 +158,13 @@ def attach_kernel_subsystems(
         setattr(kernel, ATTR_OPERATOR_BRIDGE, bridge)
     supervisor = attach_agent_supervisor(kernel, tracker, dispatcher)
     metadata_writer = attach_metadata_writer(kernel, dispatcher, tracker)
+    # Wire the bridge's collaborator slots so its agent_spawn /
+    # drift_acknowledged routes resolve without falling through to the
+    # kernel-attribute probe fallback (which the synthetic _PtyKernel
+    # in pty_mode.py doesn't expose).
+    bridge.kernel = kernel
+    bridge.agent_supervisor = supervisor
+    bridge.metadata_writer = metadata_writer
     return dispatcher, tracker, bridge, supervisor, metadata_writer
 
 

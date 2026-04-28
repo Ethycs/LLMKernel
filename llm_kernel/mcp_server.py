@@ -512,26 +512,31 @@ class OperatorBridgeServer:
             # supervisor's spawn record so future per-cell correlation is
             # possible (V1 relies on the controller's "only-inflight" cell
             # fallback in findExecForCorrelation).
+            from . import _diagnostics
             agent_id = params.get("agent_id")
             task = params.get("task")
             cell_id = params.get("cell_id") or payload.get("originating_cell_id")
+            _diagnostics.mark("agent_spawn_received", agent_id=agent_id, cell_id=cell_id)
             if not agent_id or not task:
                 logger.warning(
                     "agent_spawn missing required parameters; agent_id=%r task=%r",
                     agent_id, task,
                 )
+                _diagnostics.mark("agent_spawn_missing_params", agent_id=agent_id, task=task)
                 return
             supervisor = self._resolve_agent_supervisor()
             if supervisor is None:
                 logger.warning(
                     "agent_spawn received but no AgentSupervisor is attached"
                 )
+                _diagnostics.mark("agent_spawn_no_supervisor")
                 return
             spawn_method = getattr(supervisor, "spawn", None)
             if not callable(spawn_method):
                 logger.warning(
                     "agent_spawn: attached AgentSupervisor does not implement spawn"
                 )
+                _diagnostics.mark("agent_spawn_no_spawn_method")
                 return
             try:
                 # work_dir is required by AgentSupervisor.spawn. Default
@@ -551,6 +556,11 @@ class OperatorBridgeServer:
                 )
                 _use_bare = _os.environ.get("LLMKERNEL_USE_BARE") == "1"
                 _api_key = _os.environ.get("ANTHROPIC_API_KEY") if _use_bare else None
+                _diagnostics.mark(
+                    "agent_spawn_calling_spawn",
+                    agent_id=agent_id, work_dir=str(_work_dir), model=_model,
+                    use_bare=_use_bare, has_api_key=bool(_api_key),
+                )
                 spawn_method(
                     zone_id=self.zone_id,
                     agent_id=agent_id,
@@ -560,9 +570,14 @@ class OperatorBridgeServer:
                     api_key=_api_key,
                     use_bare=_use_bare,
                 )
+                _diagnostics.mark("agent_spawn_returned", agent_id=agent_id)
             except Exception as exc:
                 logger.exception(
                     "agent_spawn: supervisor.spawn raised; agent_id=%s", agent_id,
+                )
+                _diagnostics.mark(
+                    "agent_spawn_raised", agent_id=agent_id,
+                    error_type=type(exc).__name__, error=str(exc),
                 )
                 # Emit a synthetic terminal Family A span so the
                 # extension's cell exec completes with STATUS_CODE_ERROR
@@ -573,6 +588,7 @@ class OperatorBridgeServer:
                 self._emit_agent_spawn_error_span(
                     agent_id=agent_id, cell_id=cell_id, error=str(exc),
                 )
+                _diagnostics.mark("agent_spawn_synth_error_span_emitted", agent_id=agent_id)
                 return
             logger.info(
                 "operator.agent_spawn",

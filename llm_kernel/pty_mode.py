@@ -288,14 +288,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     after writing to PTY stderr) when missing -- the extension is
     expected to set this before spawning per RFC-008 §4 step 1.
     """
+    from . import _diagnostics
+    _diagnostics.mark("pty_mode_main_entry")
     address = os.environ.get(ENV_IPC_SOCKET, "")
     pty_flag = os.environ.get(ENV_PTY_MODE) == "1"
     session_id = os.environ.get(ENV_SESSION_ID) or str(uuid.uuid4())
+    _diagnostics.mark("pty_mode_env_read", socket=address, session_id=session_id, pty_flag=pty_flag)
     if not address:
         sys.stderr.write(
             f"LLMKernel pty-mode: {ENV_IPC_SOCKET} env var is required\n"
         )
         sys.stderr.flush()
+        _diagnostics.mark("pty_mode_exit_no_socket", rc=2)
         return 2
 
     # Termios raw mode -- only meaningful under a real PTY. The smoke
@@ -312,7 +316,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.flush()
         if termios_restore is not None:
             termios_restore()
+        _diagnostics.mark("pty_mode_exit_socket_connect_failed", error=str(exc), rc=3)
         return 3
+    _diagnostics.mark("pty_mode_socket_connected")
 
     # Banner BEFORE installing the OTLP handler so it actually reaches
     # PTY stderr (RFC-008 §3 "Boot output"). Once the handler is up,
@@ -327,6 +333,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     # OTLP handler; logs MUST come after the ready record so the
     # extension can recognize the kernel before processing anything else.
     _emit_ready_handshake(writer, session_id)
+    _diagnostics.mark("pty_mode_ready_emitted")
+
+    # BSP-001: proxy lifecycle. Either trust an externally-provided URL
+    # (operator already started a proxy and points us at it) or start
+    # one ourselves and publish its URL via the env var that
+    # ``attach_agent_supervisor`` reads downstream. Failures here are
+    # K11/K12 and we exit BEFORE attaching subsystems.
+    proxy_server = _start_owned_proxy_or_none()
+    if proxy_server is _PROXY_START_FAILED:
+        # K12 already marked + stderr already written by helper.
+        if termios_restore is not None:
+            termios_restore()
+        return 12
+    if proxy_server is _PROXY_CONFIG_REJECTED:
+        # K11 already marked + stderr already written by helper.
+        if termios_restore is not None:
+            termios_restore()
+        return 11
 
     # Install OTLP handler on the root + ``llm_kernel`` namespace.
     # Removing existing stdout-bound StreamHandlers per RFC-008 §7
@@ -376,6 +400,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # `kernel.shell.comm_manager.deliver(...)` in `_dispatch_inbound_line`
     # finds no target and silently drops every inbound envelope.
     dispatcher.start()
+    _diagnostics.mark("pty_mode_dispatcher_started")
 
     if hasattr(dispatcher, "set_current_volatile_provider"):
         # Provide a callable that returns the kernel's current volatile
@@ -442,6 +467,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             dispatcher.stop()
         except Exception:  # pragma: no cover - defensive
             logger.exception("pty_mode: dispatcher.stop raised")
+        # BSP-001 §3 step 7: stop kernel-owned proxy on exit. None means
+        # external lifecycle (operator owns it; not ours to stop).
+        if proxy_server is not None and proxy_server not in (
+            _PROXY_START_FAILED, _PROXY_CONFIG_REJECTED,
+        ):
+            try:
+                proxy_server.stop()
+                _diagnostics.mark("pty_mode_proxy_stopped")
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("pty_mode: proxy_server.stop raised")
         writer.close()
         if termios_restore is not None:
             termios_restore()
@@ -453,6 +488,98 @@ def main(argv: Optional[List[str]] = None) -> int:
 # ---------------------------------------------------------------------------
 # Helpers (factored for testability)
 # ---------------------------------------------------------------------------
+
+#: Sentinel returned by :func:`_start_owned_proxy_or_none` when the
+#: ``(auth, proxy)`` combination is illegal per BSP-001 §2 (K11).
+_PROXY_CONFIG_REJECTED: object = object()
+#: Sentinel returned by :func:`_start_owned_proxy_or_none` when the
+#: chosen proxy server failed to start (port unavailable, mitmdump
+#: missing, etc.) — K12 per BSP-001 §5.
+_PROXY_START_FAILED: object = object()
+
+
+def _start_owned_proxy_or_none() -> Any:
+    """BSP-001: resolve and start the proxy per the lifecycle contract.
+
+    Returns:
+      * ``None`` — external lifecycle (``LLMKERNEL_LITELLM_ENDPOINT_URL``
+        was set; operator owns it). Caller continues boot.
+      * a server object exposing ``start() / stop() / base_url()`` —
+        kernel-owned, already started. Caller stops it on exit.
+      * :data:`_PROXY_CONFIG_REJECTED` — K11. Caller exits 11.
+      * :data:`_PROXY_START_FAILED` — K12. Caller exits 12.
+
+    Reads env vars per BSP-001 §2 table; sets
+    ``LLMKERNEL_LITELLM_ENDPOINT_URL`` to the bound URL when starting a
+    kernel-owned server so :mod:`._kernel_hooks` reads it uniformly.
+    """
+    from . import _diagnostics
+
+    external_url = os.environ.get("LLMKERNEL_LITELLM_ENDPOINT_URL", "").strip()
+    if external_url:
+        _diagnostics.mark("pty_mode_proxy_external", url=external_url)
+        return None
+
+    # Resolve the (auth, proxy) combination per BSP-001 §2.
+    auth_mode = "api_key" if os.environ.get("LLMKERNEL_USE_BARE") == "1" else "oauth"
+    proxy_mode = os.environ.get("LLMKERNEL_PROXY_MODE", "passthrough").strip().lower()
+    if proxy_mode not in ("passthrough", "litellm"):
+        sys.stderr.write(
+            f"LLMKernel pty-mode: K11 unknown LLMKERNEL_PROXY_MODE={proxy_mode!r}; "
+            f"valid: passthrough | litellm\n"
+        )
+        sys.stderr.flush()
+        _diagnostics.mark(
+            "pty_mode_proxy_config_rejected",
+            auth_mode=auth_mode, proxy_mode=proxy_mode,
+            reason="unknown_proxy_mode",
+        )
+        return _PROXY_CONFIG_REJECTED
+    if auth_mode == "oauth" and proxy_mode == "litellm":
+        sys.stderr.write(
+            "LLMKernel pty-mode: K11 (auth=oauth, proxy=litellm) is illegal; "
+            "LiteLLM proxy breaks OAuth model-resolution preflight. Set "
+            "LLMKERNEL_PROXY_MODE=passthrough or LLMKERNEL_USE_BARE=1.\n"
+        )
+        sys.stderr.flush()
+        _diagnostics.mark(
+            "pty_mode_proxy_config_rejected",
+            auth_mode=auth_mode, proxy_mode=proxy_mode,
+            reason="oauth_litellm_incompatible",
+        )
+        return _PROXY_CONFIG_REJECTED
+
+    # Construct + start.
+    try:
+        if proxy_mode == "passthrough":
+            from . import anthropic_passthrough as _pt
+            server = _pt.AnthropicPassthroughServer(host="127.0.0.1", port=0)
+        else:  # proxy_mode == "litellm"
+            from . import litellm_proxy as _proxy
+            server = _proxy.LiteLLMProxyServer(
+                api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+                host="127.0.0.1", port=0,
+            )
+        server.start()
+    except Exception as exc:
+        sys.stderr.write(
+            f"LLMKernel pty-mode: K12 proxy ({proxy_mode}) start failed: {exc}\n"
+        )
+        sys.stderr.flush()
+        _diagnostics.mark(
+            "pty_mode_proxy_start_failed",
+            proxy_mode=proxy_mode,
+            error_type=type(exc).__name__, error=str(exc),
+        )
+        return _PROXY_START_FAILED
+
+    base_url = server.base_url()
+    os.environ["LLMKERNEL_LITELLM_ENDPOINT_URL"] = base_url
+    _diagnostics.mark(
+        "pty_mode_proxy_started",
+        proxy_mode=proxy_mode, auth_mode=auth_mode, url=base_url,
+    )
+    return server
 
 
 def _install_handler(handler: logging.Handler) -> Callable[[], None]:

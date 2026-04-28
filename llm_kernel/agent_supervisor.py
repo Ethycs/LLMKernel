@@ -193,6 +193,8 @@ class AgentSupervisor:
         :class:`PreSpawnValidationError` on validation failure (also
         emits a synthetic ``report_problem``).
         """
+        from . import _diagnostics
+        _diagnostics.mark("supervisor_spawn_entry", agent_id=agent_id, zone_id=zone_id)
         api_key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
         trace_id = self._run_tracker.trace_id
         # Resolve to absolute paths up-front. The child process is launched
@@ -201,6 +203,7 @@ class AgentSupervisor:
         work_dir = Path(work_dir).resolve()
         spawn_dir = (work_dir / ".run" / agent_id).resolve()
         spawn_dir.mkdir(parents=True, exist_ok=True)
+        _diagnostics.mark("supervisor_spawn_dirs_ready", agent_id=agent_id, spawn_dir=str(spawn_dir))
         mcp_config_path = spawn_dir / "mcp-config.json"
         system_prompt_path = spawn_dir / "system-prompt.txt"
 
@@ -226,16 +229,22 @@ class AgentSupervisor:
             pythonpath=abs_pp,
         )
         mcp_config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        _diagnostics.mark("supervisor_spawn_mcp_config_written", agent_id=agent_id)
         rendered_prompt = render_system_prompt(task)
         # RFC-002 §"Failure modes": refuse spawn on system-prompt
         # template major-version mismatch; warn-and-proceed on minor.
         try:
             self._validate_template_version(rendered_prompt)
         except PreSpawnValidationError as exc:
+            _diagnostics.mark(
+                "supervisor_spawn_template_version_failed",
+                agent_id=agent_id, error=str(exc),
+            )
             self._record_synthetic_problem(
                 agent_id, zone_id, str(exc), exc.log_signature,
             )
             raise
+        _diagnostics.mark("supervisor_spawn_template_validated", agent_id=agent_id)
         system_prompt_path.write_text(rendered_prompt, encoding="utf-8")
         for p in (mcp_config_path, system_prompt_path):
             try:
@@ -250,10 +259,15 @@ class AgentSupervisor:
                 system_prompt_path=system_prompt_path,
             )
         except PreSpawnValidationError as exc:
+            _diagnostics.mark(
+                "supervisor_spawn_preflight_failed",
+                agent_id=agent_id, log_signature=exc.log_signature, error=str(exc),
+            )
             self._record_synthetic_problem(
                 agent_id, zone_id, str(exc), exc.log_signature,
             )
             raise
+        _diagnostics.mark("supervisor_spawn_preflight_passed", agent_id=agent_id)
 
         # Default: set ANTHROPIC_BASE_URL only under --bare, because the
         # LiteLLM proxy only handles /v1/messages and breaks OAuth's
@@ -279,6 +293,10 @@ class AgentSupervisor:
         # PATH because the child env's PATH is identical (we only filter
         # secrets, not add path entries).
         claude_bin = shutil.which("claude") or "claude"
+        _diagnostics.mark(
+            "supervisor_spawn_claude_resolved",
+            agent_id=agent_id, claude_bin=claude_bin,
+        )
         argv = build_argv(
             system_prompt_path, mcp_config_path, task,
             model=model, use_bare=use_bare, claude_bin=claude_bin,
@@ -287,14 +305,26 @@ class AgentSupervisor:
             "spawning agent %s (zone=%s) model=%s bare=%s claude=%s",
             agent_id, zone_id, model, use_bare, claude_bin,
         )
-        popen = subprocess.Popen(
-            argv, env=env, cwd=str(work_dir),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1,
+        try:
+            popen = subprocess.Popen(
+                argv, env=env, cwd=str(work_dir),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1,
+            )
+        except OSError as exc:
+            _diagnostics.mark(
+                "supervisor_spawn_popen_failed",
+                agent_id=agent_id, error_type=type(exc).__name__, error=str(exc),
+            )
+            raise
+        _diagnostics.mark(
+            "supervisor_spawn_popen_started",
+            agent_id=agent_id, pid=popen.pid,
         )
         handle = self._build_handle(popen, agent_id, zone_id, work_dir, task)
         with self._lock:
             self._agents[agent_id] = handle
+        _diagnostics.mark("supervisor_spawn_handle_built", agent_id=agent_id)
         return handle
 
     def get(self, agent_id: str) -> Optional[AgentHandle]:
