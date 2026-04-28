@@ -236,6 +236,10 @@ class _FakePopen:
         self._exit_code = exit_code
         self._exited = threading.Event()
         self.returncode: Optional[int] = None
+        # AgentSupervisor.spawn reads popen.pid for the diagnostics mark
+        # (agent_supervisor.py:322). Real Popen always exposes pid; the test
+        # double must too.
+        self.pid = 12345
 
     def poll(self) -> Optional[int]:
         return self.returncode

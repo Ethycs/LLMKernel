@@ -40,6 +40,10 @@ class _StallPopen:
         self.stdout = self._stdout_iter()
         self.stderr = iter([""])
         self._terminated_at: Optional[float] = None
+        # Diagnostics in AgentSupervisor.spawn read .pid right after Popen
+        # returns; provide a stable non-real pid so the test doubles do
+        # not AttributeError on access.
+        self.pid: int = 99999
 
     def _stdout_iter(self):  # type: ignore[no-untyped-def]
         # Block until terminate() unblocks us, then return EOF.
@@ -145,6 +149,7 @@ def test_silence_watchdog_does_not_terminate_active_agent(tmp_path: Path) -> Non
             self.stdout = self._lines
             self.stderr = iter([""])
             self._terminated_at: Optional[float] = None
+            self.pid: int = 99998
 
         def poll(self) -> Optional[int]:
             return self.returncode
