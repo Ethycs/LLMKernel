@@ -247,6 +247,49 @@ def test_submit_intent_unknown_kind_returns_k40() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 2026-04-28 amendment: 5 intent kinds spec'd in BSP-007 + BSP-008 are
+# registered for envelope acceptance but their handlers ship with later
+# slices.  Registry accepts the kind (no K40); stub handler returns K42.
+# ---------------------------------------------------------------------------
+
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "intent_kind, slice_label",
+    [
+        ("apply_overlay_commit",     "BSP-007 overlay_applier"),
+        ("revert_overlay_to_commit", "BSP-007 overlay_applier"),
+        ("create_overlay_ref",       "BSP-007 overlay_applier"),
+        ("record_context_manifest",  "BSP-008 context_packer"),
+        ("record_run_frame",         "BSP-008 context_packer"),
+    ],
+)
+def test_submit_intent_amendment_kinds_registered_but_unimplemented(
+    intent_kind: str, slice_label: str,
+) -> None:
+    """The 5 amendment kinds are in the registry (no K40) but their
+    handlers ship with later slices — submitting today returns K42 with
+    a slice-label reason so the operator knows where the work is queued."""
+    writer = _new_writer()
+    result = writer.submit_intent(_envelope(
+        intent_kind=intent_kind,
+        parameters={},
+        intent_id=f"intent-pending-{intent_kind}",
+    ))
+    assert result["applied"] is False
+    assert result["error_code"] == "K42", (
+        f"{intent_kind} should return K42 (registered-but-unimplemented), "
+        f"not {result['error_code']}"
+    )
+    assert intent_kind in result["error_reason"]
+    assert slice_label in result["error_reason"], (
+        f"{intent_kind}'s K42 reason should cite the {slice_label} slice"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Validation: K42 on bad parameters.
 # ---------------------------------------------------------------------------
 

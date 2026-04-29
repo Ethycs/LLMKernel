@@ -765,6 +765,16 @@ class MetadataWriter:
         "apply_layout_edit",
         "apply_agent_graph_command",
         "acknowledge_drift",
+        # 2026-04-28 amendment kinds: registered for envelope acceptance
+        # but their handlers live in modules that ship with later slices.
+        # Submitting today returns K42 ("not yet implemented") rather than
+        # K40 ("unknown kind") so callers know the protocol contract is
+        # honored even though execution is queued.
+        "apply_overlay_commit",        # BSP-007 §8 — overlay_applier.py
+        "revert_overlay_to_commit",    # BSP-007 §4.2 — overlay_applier.py
+        "create_overlay_ref",          # BSP-007 §4.4 — overlay_applier.py
+        "record_context_manifest",     # BSP-008 §3 — context_packer.py
+        "record_run_frame",            # BSP-008 §7 — context_packer.py
     })
 
     def submit_intent(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
@@ -1114,17 +1124,36 @@ class MetadataWriter:
                 return True
             return _h
 
-        # BSP-002 turn graph kinds: not yet wired into MetadataWriter
-        # state (the writer carries the agent graph but not the
-        # turn-level conversation graph).  We return a stub that
-        # raises K42-style validation so the dispatcher returns a
-        # well-formed error rather than silently ignoring the call.
-        # When BSP-002 §"Implementation slice" lands, this stub is
-        # replaced by the real apply functions.
+        # Registered-but-not-yet-implemented kinds: the registry
+        # accepts the envelope so callers see K42 ("not yet implemented")
+        # rather than K40 ("unknown kind"), which preserves the protocol
+        # contract while individual handlers ship with later slices.
+        _PENDING_SLICE = {
+            # BSP-002 turn graph kinds (writer carries the agent graph
+            # but not the turn-level conversation graph yet).
+            "append_turn":              "BSP-002 turn graph slice",
+            "create_agent":             "BSP-002 turn graph slice",
+            "move_agent_head":          "BSP-002 turn graph slice",
+            "fork_agent":               "BSP-002 turn graph slice",
+            "update_agent_session":     "BSP-002 turn graph slice",
+            "add_overlay":              "BSP-002 turn graph slice",
+            "move_overlay_ref":         "BSP-002 turn graph slice",
+            "set_cell_metadata":        "BSP-002 turn graph slice",
+            "update_ordering":          "BSP-002 turn graph slice",
+            # BSP-007 overlay-commit kinds.
+            "apply_overlay_commit":     "BSP-007 overlay_applier (K-OVERLAY slice)",
+            "revert_overlay_to_commit": "BSP-007 overlay_applier (K-OVERLAY slice)",
+            "create_overlay_ref":       "BSP-007 overlay_applier (K-OVERLAY slice)",
+            # BSP-008 ContextPacker / RunFrame kinds.
+            "record_context_manifest":  "BSP-008 context_packer (K-CTXR slice)",
+            "record_run_frame":         "BSP-008 context_packer (K-CTXR slice)",
+        }
+        slice_label = _PENDING_SLICE.get(intent_kind, "future slice")
         def _stub(params: Dict[str, Any]) -> bool:
             raise ValueError(
-                f"intent_kind {intent_kind!r} is not yet implemented in "
-                "the V1 MetadataWriter (BSP-002 turn graph slice pending)"
+                f"intent_kind {intent_kind!r} is registered but its "
+                f"handler ships with the {slice_label}; not yet "
+                "implemented in V1 MetadataWriter."
             )
         return _stub
 
