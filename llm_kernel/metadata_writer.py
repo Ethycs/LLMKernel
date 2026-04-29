@@ -83,6 +83,41 @@ DEFAULT_EVENT_LOG_QUEUE_CAP: int = 10_000
 #: accepts that.
 DEFAULT_AUTOSAVE_INTERVAL_SEC: float = 30.0
 
+#: V1 Kernel Gap Closure G13 -- intent-queue overflow threshold (RFC-005
+#: §F13 disk-fallback rule, applied to the buffered ``submit_intent``
+#: queue).  RFC-005 §F13 caps the *event-log* queue at 10 000; the
+#: brief asks for a separate threshold on the *intent* queue.  No
+#: published number; we INVENT 1 000 as a sane default and flag it in
+#: the slice report.  Operators can tune via the constructor kwarg.
+DEFAULT_INTENT_QUEUE_OVERFLOW_THRESHOLD: int = 1_000
+
+#: BSP-005 §6.1 / [cell-kinds atom](docs/atoms/concepts/cell-kinds.md) --
+#: the eight cell kinds the V1 writer accepts.  ``agent | markdown |
+#: scratch | checkpoint`` are *active* (renderer dispatches per kind);
+#: ``tool | artifact | control | native`` are *reserved* (V1 stores
+#: them verbatim and renders inert).  Anything outside the eight values
+#: is rejected with K42 ``unknown_cell_kind``.
+CELL_KINDS_ACTIVE: Tuple[str, ...] = (
+    "agent",
+    "markdown",
+    "scratch",
+    "checkpoint",
+)
+CELL_KINDS_RESERVED: Tuple[str, ...] = (
+    "tool",
+    "artifact",
+    "control",
+    "native",
+)
+CELL_KINDS: FrozenSet[str] = frozenset(CELL_KINDS_ACTIVE + CELL_KINDS_RESERVED)
+DEFAULT_CELL_KIND: str = "agent"
+
+#: Sentinel used by :meth:`MetadataWriter._handle_set_cell_metadata` to
+#: distinguish "caller did not pass this key" from "caller explicitly
+#: passed ``None``".  Distinct sentinel object so isinstance(x, type)
+#: checks can never collide with a legitimate ``None`` payload.
+_UNSET: Any = object()
+
 #: Forbidden-field name regexes per RFC-005 §"Forbidden fields
 #: (security)".  Matched case-insensitively against the FIELD NAME (not
 #: the value) at every depth of the ``config`` substructure.  The
@@ -469,6 +504,9 @@ class MetadataWriter:
         autosave_interval_sec: float = DEFAULT_AUTOSAVE_INTERVAL_SEC,
         event_log_queue_cap: int = DEFAULT_EVENT_LOG_QUEUE_CAP,
         workspace_root: Optional[Path] = None,
+        intent_queue_overflow_threshold: int = (
+            DEFAULT_INTENT_QUEUE_OVERFLOW_THRESHOLD
+        ),
     ) -> None:
         """Construct an unstarted writer.
 
@@ -527,6 +565,29 @@ class MetadataWriter:
         self._extra_runs: List[Dict[str, Any]] = []
         self._blobs: Dict[str, Dict[str, Any]] = {}
         self._drift_log: List[Dict[str, Any]] = []
+        # BSP-005 §6.1 / S0.5 -- per-cell metadata keyed by cell_id.
+        # Stored at ``metadata.rts.cells`` in the snapshot.  Each entry:
+        #   {"kind": "agent" | ..., "bound_agent_id": str|None,
+        #    "section_id": str|None, "capabilities": [], ...flags}
+        # The writer is the source of truth; the extension reads via
+        # the Family F snapshot.
+        self._cells: Dict[str, Dict[str, Any]] = {}
+        # V1 Kernel Gap Closure G13 -- intent-queue overflow state.
+        # ``_pending_intents`` is the buffered (deferred) intent queue
+        # filled by :meth:`enqueue_intent` and drained by
+        # :meth:`flush_pending_intents`.  When buffered count exceeds
+        # ``_intent_queue_overflow_threshold`` the buffer spills to a
+        # JSON-line file under ``<workspace_root>/.llmnb-intent-queue/``
+        # and a marker is recorded at
+        # ``metadata.rts.queues['intents'].overflow``.  ``_queues`` is
+        # the persistent record of overflow markers (cleared once the
+        # corresponding spill is fully drained).
+        self._intent_queue_overflow_threshold: int = max(
+            1, int(intent_queue_overflow_threshold),
+        )
+        self._pending_intents: List[Dict[str, Any]] = []
+        self._queues: Dict[str, Dict[str, Any]] = {}
+        self._intent_overflow_count: int = 0
 
         self._timer_thread: Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
@@ -1123,6 +1184,8 @@ class MetadataWriter:
                     self._dirty = True
                 return True
             return _h
+        if intent_kind == "set_cell_metadata":
+            return self._handle_set_cell_metadata
 
         # Registered-but-not-yet-implemented kinds: the registry
         # accepts the envelope so callers see K42 ("not yet implemented")
@@ -1138,7 +1201,6 @@ class MetadataWriter:
             "update_agent_session":     "BSP-002 turn graph slice",
             "add_overlay":              "BSP-002 turn graph slice",
             "move_overlay_ref":         "BSP-002 turn graph slice",
-            "set_cell_metadata":        "BSP-002 turn graph slice",
             "update_ordering":          "BSP-002 turn graph slice",
             # BSP-007 overlay-commit kinds.
             "apply_overlay_commit":     "BSP-007 overlay_applier (K-OVERLAY slice)",
@@ -1191,6 +1253,380 @@ class MetadataWriter:
         """Return a snapshot of the in-memory intent_applied log entries."""
         with self._lock:
             return [dict(entry) for entry in self._intent_log]
+
+    # -- BSP-005 §6.1 / S0.5 cell-kinds -----------------------------
+
+    # Recognized parameter keys on the ``set_cell_metadata`` intent.
+    # Anything else is preserved on the cell record verbatim (forward-
+    # compat with future per-cell flags) but is not validated here.
+    _SET_CELL_METADATA_FLAG_KEYS: Tuple[str, ...] = (
+        "pinned", "excluded", "scratch", "checkpoint", "read_only",
+    )
+
+    def _handle_set_cell_metadata(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply one ``set_cell_metadata`` intent.
+
+        Per BSP-005 §6.1 / [cell-kinds atom](docs/atoms/concepts/cell-kinds.md)
+        and [cell atom](docs/atoms/concepts/cell.md) §"Schema":
+
+        * Required: ``cell_id`` (string).
+        * Required from S0.5 forward: ``kind`` (one of the eight enum
+          values).
+        * Validators (raise ``ValueError`` -> K42 with structured
+          reason):
+
+          - ``unknown_cell_kind``: ``kind`` not in
+            :data:`CELL_KINDS`.
+          - ``markdown_must_have_no_agent``: ``kind == "markdown"``
+            with non-null ``bound_agent_id``.
+
+        * Per-kind soft rules (NOT errors, the writer normalizes):
+
+          - ``markdown`` cells have ``bound_agent_id`` stripped
+            (forced to ``None``).
+          - ``scratch`` / ``checkpoint`` cells without an explicit
+            ``bound_agent_id`` get ``None`` written through.
+
+        * Reserved kinds (``tool | artifact | control | native``)
+          round-trip identically to active kinds; the writer does NOT
+          dispatch them anywhere -- the renderer falls through to the
+          kind-label-only view per the cell-kinds atom invariants.
+
+        Returns ``{"ok": True, "cell_id": ..., "kind": ...}`` on
+        success.
+        """
+        cell_id = params.get("cell_id")
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("set_cell_metadata: cell_id is required")
+        # ``kind`` is the new field S0.5 lands.  We accept its absence
+        # iff the cell already exists with a kind (operator is editing
+        # flags only); otherwise it's required.
+        kind = params.get("kind", _UNSET)
+        bound_agent_id = params.get("bound_agent_id", _UNSET)
+        with self._lock:
+            existing = self._cells.get(cell_id)
+        if kind is _UNSET:
+            if existing is None or "kind" not in existing:
+                raise ValueError(
+                    "set_cell_metadata: kind is required (kind_required)"
+                )
+            kind_value: str = existing["kind"]
+        else:
+            if not isinstance(kind, str) or kind not in CELL_KINDS:
+                raise ValueError(
+                    f"set_cell_metadata: unknown_cell_kind {kind!r} "
+                    f"(allowed: {sorted(CELL_KINDS)})"
+                )
+            kind_value = kind
+
+        # Per-kind constraints.  ``markdown`` MUST NOT carry a non-null
+        # bound_agent_id (cell-kinds atom invariant).  ``scratch`` and
+        # ``checkpoint`` SHOULD have a null bound_agent_id; the writer
+        # normalizes to None when not provided.
+        if kind_value == "markdown":
+            if bound_agent_id is not _UNSET and bound_agent_id is not None:
+                raise ValueError(
+                    "set_cell_metadata: markdown_must_have_no_agent "
+                    f"(kind=markdown, bound_agent_id={bound_agent_id!r})"
+                )
+            normalized_bound: Optional[str] = None
+        elif kind_value in ("scratch", "checkpoint"):
+            if bound_agent_id is _UNSET:
+                normalized_bound = (
+                    existing.get("bound_agent_id")
+                    if existing is not None else None
+                )
+            else:
+                normalized_bound = bound_agent_id  # type: ignore[assignment]
+            # SHOULD-rule: not enforced as K42, but normalize None when
+            # the caller explicitly passed None.
+        elif kind_value == "agent":
+            if bound_agent_id is _UNSET:
+                normalized_bound = (
+                    existing.get("bound_agent_id")
+                    if existing is not None else None
+                )
+            else:
+                normalized_bound = bound_agent_id  # type: ignore[assignment]
+        else:
+            # Reserved kinds: round-trip whatever the caller sent.
+            if bound_agent_id is _UNSET:
+                normalized_bound = (
+                    existing.get("bound_agent_id")
+                    if existing is not None else None
+                )
+            else:
+                normalized_bound = bound_agent_id  # type: ignore[assignment]
+
+        # Build / merge the cell record.
+        with self._lock:
+            record = dict(self._cells.get(cell_id, {}))
+            record["kind"] = kind_value
+            record["bound_agent_id"] = normalized_bound
+            # Optional fields: section_id, capabilities, plus the flag
+            # set.  Only overwrite when the caller passed a value.
+            if "section_id" in params:
+                record["section_id"] = params["section_id"]
+            elif "section_id" not in record:
+                record["section_id"] = None
+            if "capabilities" in params:
+                caps = params["capabilities"]
+                record["capabilities"] = list(caps) if isinstance(caps, list) else []
+            elif "capabilities" not in record:
+                record["capabilities"] = []
+            for flag_key in self._SET_CELL_METADATA_FLAG_KEYS:
+                if flag_key in params:
+                    record[flag_key] = bool(params[flag_key])
+            # Clear the back-fill marker (if any) once the operator has
+            # explicitly written the kind.
+            record.pop("_kind_back_filled", None)
+            self._cells[cell_id] = record
+            self._dirty = True
+        return {"ok": True, "cell_id": cell_id, "kind": kind_value}
+
+    # -- V1 Kernel Gap Closure G13 -- intent-queue overflow ----------
+
+    #: The single logical "intents" queue name (used as the key in
+    #: ``metadata.rts.queues``).  V1 has only one such queue; the
+    #: ``queues[*]`` indirection in the schema reserves room for V2+
+    #: per-zone queues.
+    _INTENT_QUEUE_NAME: str = "intents"
+
+    def enqueue_intent(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
+        """Buffer an intent envelope for deferred application.
+
+        Unlike :meth:`submit_intent` (which applies synchronously),
+        this method appends the envelope to the in-memory pending
+        queue.  Callers drain via :meth:`flush_pending_intents`
+        (typically on the next dispatcher round-trip / autosave tick).
+
+        Per RFC-005 §F13 the queue is bounded; on overflow
+        (``len(buffer) > intent_queue_overflow_threshold``) the writer
+        spills the buffered intents to a JSON-line file under
+        ``<workspace_root>/.llmnb-intent-queue/`` and records a marker
+        at ``metadata.rts.queues[<queue>].overflow``.  Subsequent
+        :meth:`flush_pending_intents` calls drain the disk spill IN
+        ORDER before any in-memory entries.
+
+        Returns a small status dict: ``{"buffered": True,
+        "overflow": bool, "buffer_size": int}``.
+        """
+        if not isinstance(envelope, dict):
+            raise ValueError("enqueue_intent: envelope must be a dict")
+        marker_to_log: Optional[Tuple[int, int, str]] = None
+        with self._lock:
+            self._pending_intents.append(envelope)
+            buffer_size = len(self._pending_intents)
+            overflow = buffer_size > self._intent_queue_overflow_threshold
+            if overflow:
+                checkpoint_id, disk_path = self._spill_intent_buffer_locked()
+                marker_to_log = (
+                    self._intent_overflow_count, buffer_size, checkpoint_id,
+                )
+                # Buffer is now empty (spill_intent_buffer_locked
+                # drained it into the disk file).
+                buffer_size = 0
+        # Log AFTER releasing the lock per Engineering Guide §11.7.
+        if marker_to_log is not None:
+            count, spilled_size, checkpoint_id = marker_to_log
+            logger.warning(
+                "intent queue overflow: spilled=%d threshold=%d "
+                "checkpoint=%s; spill-to-disk per RFC-005 §F13",
+                spilled_size, self._intent_queue_overflow_threshold,
+                checkpoint_id,
+                extra={
+                    "event.name": "metadata.intent_queue_overflow",
+                    "llmnb.intent_overflow_count": count,
+                    "llmnb.spilled_intent_count": spilled_size,
+                    "llmnb.checkpoint_id": checkpoint_id,
+                },
+            )
+        return {
+            "buffered": True,
+            "overflow": marker_to_log is not None,
+            "buffer_size": buffer_size,
+        }
+
+    def _intent_overflow_dir(self) -> Path:
+        """Return the directory the intent-queue overflow spills land in."""
+        return self._workspace_root / ".llmnb-intent-queue"
+
+    def _spill_intent_buffer_locked(self) -> Tuple[str, str]:
+        """Spill ``self._pending_intents`` to disk and record the marker.
+
+        Caller MUST hold ``self._lock``.  Returns ``(checkpoint_id,
+        disk_path)`` for the marker.
+
+        On-disk format: one JSON object per line, each line a complete
+        intent envelope.  The file lives at
+        ``<workspace_root>/.llmnb-intent-queue/<checkpoint_id>.jsonl``.
+        Atomic write via ``<file>.tmp + os.replace``.
+
+        After spill, the in-memory buffer is emptied; the marker
+        persists in ``metadata.rts.queues[intents].overflow`` until the
+        spill is fully drained (see :meth:`flush_pending_intents`).
+        """
+        self._intent_overflow_count += 1
+        # Compose a checkpoint ID that's both unique and deterministic-
+        # enough to debug.  ``ovf-<session>-<count>-<timestamp>``.
+        ts = _utc_now_iso().replace(":", "").replace(".", "").replace("-", "")
+        checkpoint_id = (
+            f"ovf-{self._session_id[:8]}-{self._intent_overflow_count:06d}-{ts}"
+        )
+        target_dir = self._intent_overflow_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / f"{checkpoint_id}.jsonl"
+        tmp_path = target_path.with_name(target_path.name + ".tmp")
+        # Serialize each envelope as a single line.
+        lines: List[str] = []
+        for env in self._pending_intents:
+            lines.append(json.dumps(env, ensure_ascii=False))
+        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp_path, target_path)
+        # Record / merge the queue overflow marker.  We store the disk
+        # path RELATIVE to the workspace root so the marker is
+        # workspace-portable (the operator may move the workspace; the
+        # absolute path would not).
+        try:
+            disk_rel = target_path.relative_to(self._workspace_root).as_posix()
+        except ValueError:  # pragma: no cover - workspace mismatch
+            disk_rel = str(target_path)
+        queue_record = self._queues.setdefault(
+            self._INTENT_QUEUE_NAME,
+            {"version": 1, "spills": []},
+        )
+        spill_entry = {
+            "checkpoint_id": checkpoint_id,
+            "disk_path": disk_rel,
+            "spilled_at": _utc_now_iso(),
+            "intent_count": len(self._pending_intents),
+        }
+        queue_record.setdefault("spills", []).append(spill_entry)
+        # Per the brief: store the *current* overflow marker as a
+        # single-object slot at queues[<queue>].overflow.  When the
+        # spill is drained the slot is cleared but the spill row stays
+        # in ``spills[]`` for audit.
+        queue_record["overflow"] = {
+            "checkpoint_id": checkpoint_id,
+            "disk_path": disk_rel,
+        }
+        # Drain the in-memory buffer.
+        self._pending_intents = []
+        self._dirty = True
+        return checkpoint_id, disk_rel
+
+    def flush_pending_intents(self) -> List[Dict[str, Any]]:
+        """Drain disk-spilled intents (in order), then in-memory buffer.
+
+        Per the V1 Kernel Gap Closure G13 brief: "On next successful
+        flush, drain disk-spilled intents in order, then resume in-
+        memory queueing."  We honour that order:
+
+        1. For every overflow marker on this queue (oldest first),
+           read the JSONL file and ``submit_intent`` each line.
+        2. After all spill files are drained, clear the
+           ``queues[<queue>].overflow`` marker (the spill rows in
+           ``spills[]`` stay for audit).
+        3. Drain the in-memory ``_pending_intents`` buffer through
+           ``submit_intent`` in arrival order.
+
+        Returns the list of per-intent results (the same dict shape
+        :meth:`submit_intent` returns).  Failures of individual
+        intents (K40/K42/K43) do NOT abort the flush; they appear in
+        the result list with their error codes.
+        """
+        results: List[Dict[str, Any]] = []
+        # Step 1: drain disk spills.
+        with self._lock:
+            queue_record = self._queues.get(self._INTENT_QUEUE_NAME)
+            spills_to_drain: List[Dict[str, Any]] = []
+            if queue_record is not None:
+                spills_to_drain = list(queue_record.get("spills", []))
+        # The drain itself MUST happen outside the lock because each
+        # submit_intent acquires the FIFO gate.
+        drained_paths: List[str] = []
+        for spill in spills_to_drain:
+            disk_path = spill.get("disk_path")
+            if not isinstance(disk_path, str) or not disk_path:
+                continue
+            spill_file = self._resolve_spill_path(disk_path)
+            if not spill_file.exists():
+                # Already drained on a prior flush; skip but remember
+                # for marker cleanup.
+                drained_paths.append(disk_path)
+                continue
+            try:
+                contents = spill_file.read_text(encoding="utf-8")
+            except OSError:  # pragma: no cover - defensive
+                logger.exception(
+                    "flush_pending_intents: failed reading spill %s",
+                    spill_file,
+                )
+                continue
+            for line in contents.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    env = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "flush_pending_intents: malformed spill line skipped"
+                    )
+                    continue
+                result = self.submit_intent(env)
+                results.append(result)
+            # Remove the on-disk file once successfully replayed.
+            try:
+                spill_file.unlink()
+            except OSError:  # pragma: no cover - defensive
+                pass
+            drained_paths.append(disk_path)
+        # Step 2: clear marker / spill rows for fully-drained files.
+        if drained_paths:
+            with self._lock:
+                queue_record = self._queues.get(self._INTENT_QUEUE_NAME)
+                if queue_record is not None:
+                    spills = queue_record.get("spills", [])
+                    queue_record["spills"] = [
+                        s for s in spills
+                        if s.get("disk_path") not in drained_paths
+                    ]
+                    if not queue_record["spills"]:
+                        # All spills drained: clear the active overflow
+                        # marker so the next enqueue resumes in-memory.
+                        queue_record.pop("overflow", None)
+                    self._dirty = True
+        # Step 3: drain in-memory buffer.
+        with self._lock:
+            in_memory = list(self._pending_intents)
+            self._pending_intents = []
+        for env in in_memory:
+            results.append(self.submit_intent(env))
+        return results
+
+    def _resolve_spill_path(self, disk_path: str) -> Path:
+        """Resolve a disk_path stored in the queue marker to an absolute Path.
+
+        Markers store paths *relative* to ``workspace_root`` so they
+        survive workspace moves; absolute paths are also tolerated for
+        manual debug spills.
+        """
+        candidate = Path(disk_path)
+        if candidate.is_absolute():
+            return candidate
+        return self._workspace_root / candidate
+
+    def get_queue_overflow_marker(
+        self, queue_name: str = "intents",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the active overflow marker for ``queue_name`` or None."""
+        with self._lock:
+            queue_record = self._queues.get(queue_name)
+            if queue_record is None:
+                return None
+            marker = queue_record.get("overflow")
+            return dict(marker) if isinstance(marker, dict) else None
 
     # -- Family B (layout) state machine -----------------------------
 
@@ -1883,7 +2319,43 @@ class MetadataWriter:
             persisted_created_at = snapshot.get("created_at")
             if isinstance(persisted_created_at, str) and persisted_created_at:
                 self._created_at = persisted_created_at
-            self._dirty = False
+            # BSP-005 §6.1 / S0.5 -- hydrate the cells map.  Pre-S0.5
+            # snapshots carry no ``cells`` key, or carry cells without
+            # a ``kind`` field; we default to ``agent`` and mark the
+            # record so the next snapshot writes the resolved value
+            # back persistently (PLAN-S0.5 §3 step 3).
+            cells_raw = snapshot.get("cells")
+            self._cells = {}
+            back_filled_any = False
+            if isinstance(cells_raw, dict):
+                for cell_id, record in cells_raw.items():
+                    if not isinstance(cell_id, str) or not cell_id:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    record_copy = _deepcopy_json(record)
+                    if (
+                        "kind" not in record_copy
+                        or not isinstance(record_copy.get("kind"), str)
+                        or record_copy.get("kind") not in CELL_KINDS
+                    ):
+                        record_copy["kind"] = DEFAULT_CELL_KIND
+                        record_copy["_kind_back_filled"] = True
+                        back_filled_any = True
+                    self._cells[cell_id] = record_copy
+            # V1 Kernel Gap Closure G13 -- hydrate the queues marker
+            # so a session that crashed mid-overflow knows there's a
+            # disk spill awaiting drain.  ``flush_pending_intents`` on
+            # the next dispatcher round-trip will replay the file.
+            queues_raw = snapshot.get("queues")
+            if isinstance(queues_raw, dict):
+                self._queues = _deepcopy_json(queues_raw)
+            else:
+                self._queues = {}
+            self._pending_intents = []
+            # Mark dirty iff we back-filled at least one cell.kind so
+            # the next snapshot writes the resolved values out.
+            self._dirty = back_filled_any
 
     # -- Snapshot triggers -------------------------------------------
 
@@ -2020,7 +2492,7 @@ class MetadataWriter:
 
             self._snapshot_version += 1
 
-            return {
+            snapshot_out: Dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
                 "schema_uri": SCHEMA_URI,
                 "session_id": self._session_id,
@@ -2033,6 +2505,31 @@ class MetadataWriter:
                 "blobs": dict(self._blobs),
                 "drift_log": list(self._drift_log),
             }
+            # BSP-005 §6.1 / S0.5 -- emit ``cells`` ONLY when non-empty
+            # so existing baseline-snapshot tests stay byte-identical.
+            if self._cells:
+                # Back-filled records need their _kind_back_filled
+                # marker cleared on emission so the *persisted* snapshot
+                # carries only the canonical kind field.  We mutate
+                # in place: the marker is an in-memory hint, not part
+                # of the on-the-wire schema.
+                cells_out: Dict[str, Dict[str, Any]] = {}
+                for cell_id, record in self._cells.items():
+                    persisted = {
+                        k: v for k, v in record.items()
+                        if k != "_kind_back_filled"
+                    }
+                    cells_out[cell_id] = persisted
+                    # Clear the back-fill marker now that we've written
+                    # the kind field into a snapshot the persistence
+                    # layer will emit.
+                    record.pop("_kind_back_filled", None)
+                snapshot_out["cells"] = cells_out
+            # V1 Kernel Gap Closure G13 -- emit ``queues`` ONLY when
+            # non-empty for the same byte-identity reason.
+            if self._queues:
+                snapshot_out["queues"] = _deepcopy_json(self._queues)
+            return snapshot_out
 
     def _build_event_log(
         self, runs: List[Dict[str, Any]],
