@@ -603,6 +603,121 @@ class OperatorBridgeServer:
             )
             return
 
+        if action_type == "agent_continue":
+            # BSP-005 S3 / atoms/operations/continue-turn.md — multi-turn
+            # continuation. The extension parsed `@<agent_id>: <text>`
+            # and shipped this envelope; we route to
+            # ``AgentSupervisor.send_user_turn`` which writes a
+            # stream-json user line to the agent's stdin (resuming the
+            # process via S2's ``--resume`` plumbing first if it has
+            # gone idle/exited).
+            #
+            # K-class translation (BSP-002 §7 / BSP-003 §8):
+            #   * Unknown ``agent_id`` (KeyError)        -> K23 marker
+            #     (``agent_continue_unknown_agent``).
+            #   * Empty / malformed ``text`` (ValueError)-> K42 marker
+            #     (validator-rejected) per the intent envelope contract.
+            from . import _diagnostics
+            intent_kind = payload.get("intent_kind")
+            agent_id = params.get("agent_id")
+            text = params.get("text")
+            cell_id = params.get("cell_id") or payload.get("originating_cell_id")
+            _diagnostics.mark(
+                "agent_continue_received",
+                agent_id=agent_id, cell_id=cell_id, intent_kind=intent_kind,
+            )
+            if intent_kind not in (None, "send_user_turn"):
+                logger.warning(
+                    "agent_continue: unknown intent_kind=%r; forward-compat drop",
+                    intent_kind,
+                )
+                return
+            if not isinstance(agent_id, str) or not agent_id:
+                logger.warning(
+                    "agent_continue missing agent_id; params=%r", params,
+                )
+                _diagnostics.mark("agent_continue_missing_agent_id")
+                return
+            supervisor = self._resolve_agent_supervisor()
+            if supervisor is None:
+                logger.warning(
+                    "agent_continue received but no AgentSupervisor is attached"
+                )
+                _diagnostics.mark("agent_continue_no_supervisor")
+                return
+            send_method = getattr(supervisor, "send_user_turn", None)
+            if not callable(send_method):
+                logger.warning(
+                    "agent_continue: attached AgentSupervisor does not "
+                    "implement send_user_turn"
+                )
+                _diagnostics.mark("agent_continue_no_send_method")
+                return
+            try:
+                result = send_method(
+                    agent_id=agent_id, text=text, cell_id=cell_id,
+                )
+            except KeyError:
+                # BSP-002 §7 K23: agent process gone unrecoverably
+                # / unknown agent_id. The atom reserves K23 for the
+                # supervisor-level miss; the directive-side K20 is
+                # the wire equivalent. The dispatcher logs both for
+                # operator visibility.
+                logger.warning(
+                    "agent_continue: unknown agent_id=%r (K23)", agent_id,
+                    extra={
+                        "event.name": "agent_continue_unknown_agent",
+                        "llmnb.k_code": "K23",
+                        "llmnb.continued_agent_id": agent_id,
+                        "llmnb.cell_id": cell_id,
+                    },
+                )
+                _diagnostics.mark(
+                    "agent_continue_k23_unknown_agent",
+                    agent_id=agent_id, cell_id=cell_id,
+                )
+                return
+            except ValueError as exc:
+                # BSP-003 K42: validator rejected (empty/malformed text).
+                logger.warning(
+                    "agent_continue: K42 validator-rejected %s", exc,
+                    extra={
+                        "event.name": "agent_continue_invalid_text",
+                        "llmnb.k_code": "K42",
+                        "llmnb.continued_agent_id": agent_id,
+                    },
+                )
+                _diagnostics.mark(
+                    "agent_continue_k42_invalid_text",
+                    agent_id=agent_id, error=str(exc),
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "agent_continue: supervisor.send_user_turn raised; "
+                    "agent_id=%s", agent_id,
+                )
+                _diagnostics.mark(
+                    "agent_continue_raised", agent_id=agent_id,
+                )
+                return
+            logger.info(
+                "operator.agent_continue",
+                extra={
+                    "event.name": "operator.agent_continue",
+                    "rfc": "RFC-006",
+                    "bsp": "BSP-005",
+                    "llmnb.continued_agent_id": agent_id,
+                    "llmnb.cell_id": cell_id,
+                    "llmnb.continue_status": (
+                        result.get("status") if isinstance(result, dict) else None
+                    ),
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
         if action_type == "branch_switch":
             new_branch = params.get("new_branch") or params.get("branch")
             logger.info(

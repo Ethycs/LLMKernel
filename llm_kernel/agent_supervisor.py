@@ -375,9 +375,16 @@ class AgentSupervisor:
             agent_id, zone_id, model, use_bare, claude_bin,
         )
         try:
+            # BSP-002 §4.1 / §4.2: stdin is a JSON-line channel so
+            # ``send_user_turn`` can write ``{"type":"user","message":...}``
+            # frames to continue an existing conversation. The agent
+            # process stays alive between turns; reader threads on
+            # stdout pick up the agent's response spans. Tests stub
+            # subprocess.Popen so the PIPE here is a MagicMock and the
+            # supervisor never actually writes to a real pipe.
             popen = subprocess.Popen(
                 argv, env=env, cwd=str(work_dir),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, bufsize=1,
             )
         except OSError as exc:
@@ -403,6 +410,163 @@ class AgentSupervisor:
         """Return the live handle for ``agent_id``, or ``None`` if unknown."""
         with self._lock:
             return self._agents.get(agent_id)
+
+    # BSP-002 §4.2 / atoms/operations/continue-turn.md — multi-turn
+    # continuation. Writes one stream-json user turn to the live agent's
+    # stdin; if the agent has gone idle/exited the supervisor resumes via
+    # the S2 ``resume_claude_session_id`` path on ``spawn`` first.
+    #
+    # Returned status discriminator:
+    #   "sent"              -- alive agent; one stdin write only.
+    #   "resumed_then_sent" -- idle/exited agent resumed via --resume,
+    #                          then stdin write.
+    #   "spawned_fresh"     -- resume failed (K24 fallback ran inside
+    #                          ``_spawn_from_config_entry`` semantics);
+    #                          a fresh session was minted, the new
+    #                          handle is alive, the stdin write went
+    #                          through. The transcript replay BSP-002
+    #                          §4.4 Case-B is left to a higher slice.
+    def send_user_turn(
+        self,
+        agent_id: str,
+        text: str,
+        cell_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Continue an existing agent's conversation with one user turn.
+
+        Per ``atoms/operations/continue-turn.md`` and
+        ``atoms/contracts/agent-supervisor.md``: write a stream-json
+        ``{"type":"user","message":{"role":"user","content":text}}``
+        line to the agent's stdin. The agent's response streams back via
+        the existing stdout reader thread (Family A spans).
+
+        Resume semantics (S2 path): if the agent's ``runtime_status`` is
+        idle/exited (i.e., the popen has reaped), the supervisor calls
+        :meth:`spawn` with ``resume_claude_session_id`` set to the
+        handle's preserved ``claude_session_id`` before writing stdin.
+        BSP-002 §4.6 cross-agent context handoff is NOT implemented in
+        this slice; that lands in S4.
+
+        Args:
+            agent_id: The agent to continue. Unknown ids raise
+                :class:`KeyError`; the dispatcher translates that to
+                **K23** (``agent_continue_unknown_agent``) per
+                BSP-002 §7. (Note: the atom's K20 ``cell_directive_unknown_agent``
+                covers the wire-side directive; the supervisor's
+                contract uses K23 because the runtime miss is the
+                supervisor's failure mode.)
+            text: The operator's message body. Empty / whitespace-only
+                input is rejected with :class:`ValueError`; the
+                dispatcher translates that to BSP-003 K42
+                (validator-rejected) per the intent envelope contract.
+            cell_id: Optional originating cell URI. Threaded through
+                for diagnostics and future cell→turn bookkeeping
+                (BSP-005 S6).
+
+        Returns:
+            ``{"agent_id": ..., "status": "sent" | "resumed_then_sent"
+            | "spawned_fresh", "cell_id": ...}``
+        """
+        from . import _diagnostics
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(
+                f"send_user_turn: text must be a non-empty string "
+                f"(agent_id={agent_id!r})"
+            )
+        with self._lock:
+            handle = self._agents.get(agent_id)
+        if handle is None:
+            raise KeyError(agent_id)
+
+        status: str = "sent"
+        # Resume-if-needed: poll() returning a non-None code means the
+        # claude process has reaped. The S2 plumbing on ``spawn``
+        # accepts ``resume_claude_session_id`` so claude re-attaches
+        # via ``--resume`` instead of minting a fresh session id.
+        if handle.popen.poll() is not None:
+            prior_session_id = handle.claude_session_id
+            zone_id = handle.zone_id
+            work_dir = handle.work_dir
+            # Drop the dead handle BEFORE re-spawning so the live-agent
+            # idempotency short-circuit in ``spawn`` does not return
+            # the (now reaped) handle. The fresh-spawn fallback below
+            # mirrors the K24 path in ``_spawn_from_config_entry``.
+            with self._lock:
+                if self._agents.get(agent_id) is handle:
+                    del self._agents[agent_id]
+            _diagnostics.mark(
+                "send_user_turn_resume_attempt",
+                agent_id=agent_id, prior_session_id=prior_session_id,
+            )
+            if prior_session_id:
+                resumed = self.spawn(
+                    zone_id=zone_id, agent_id=agent_id,
+                    task=text, work_dir=work_dir,
+                    resume_claude_session_id=prior_session_id,
+                )
+                if self._resume_failed(resumed):
+                    self._record_resume_failure_k24(
+                        agent_id=agent_id, zone_id=zone_id,
+                        attempted_session_id=prior_session_id,
+                        exit_code=resumed.popen.poll(),
+                    )
+                    with self._lock:
+                        if self._agents.get(agent_id) is resumed:
+                            del self._agents[agent_id]
+                    handle = self.spawn(
+                        zone_id=zone_id, agent_id=agent_id,
+                        task=text, work_dir=work_dir,
+                    )
+                    status = "spawned_fresh"
+                else:
+                    handle = resumed
+                    status = "resumed_then_sent"
+            else:
+                # No prior session id -> fresh spawn straight away.
+                handle = self.spawn(
+                    zone_id=zone_id, agent_id=agent_id,
+                    task=text, work_dir=work_dir,
+                )
+                status = "spawned_fresh"
+
+        # Write the stream-json user turn. BSP-002 §4.1: claude reads
+        # ``{"type":"user","message":{"role":"user","content":<text>}}``
+        # from stdin when the process was launched with
+        # ``--input-format=stream-json``. Drift flag: ``build_argv`` in
+        # _provisioning.py does not yet emit that flag (atom drift
+        # noted in S3 report); without it claude treats stdin as the
+        # initial prompt only. The wire-side write is correct per the
+        # atom; the argv-side completion is a separate amendment.
+        line = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": text},
+        }) + "\n"
+        if handle.popen.stdin is None:
+            # Defensive: spawn now opens stdin=PIPE; legacy fixtures
+            # that pre-build a handle without stdin land here.
+            raise RuntimeError(
+                f"send_user_turn: agent {agent_id!r} has no writable "
+                f"stdin (was the popen built with stdin=PIPE?)"
+            )
+        try:
+            handle.popen.stdin.write(line)
+            handle.popen.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            _diagnostics.mark(
+                "send_user_turn_stdin_write_failed",
+                agent_id=agent_id, error_type=type(exc).__name__,
+            )
+            raise
+        _diagnostics.mark(
+            "send_user_turn_stdin_written",
+            agent_id=agent_id, status=status, cell_id=cell_id,
+            bytes_written=len(line),
+        )
+        return {
+            "agent_id": agent_id,
+            "status": status,
+            "cell_id": cell_id,
+        }
 
     def terminate_all(self, grace_seconds: float = 10.0) -> None:
         """Graceful shutdown of every active agent (RFC-002 §6)."""
