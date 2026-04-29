@@ -112,6 +112,10 @@ def test_build_argv_includes_required_flags() -> None:
     assert "--print" in argv
     assert "--verbose" in argv  # required with --output-format=stream-json
     assert "--output-format=stream-json" in argv
+    # BSP-002 §4.1 + S3 multi-turn continuation: stdin carries newline-delimited
+    # JSON user turns. Without --input-format=stream-json the CLI ignores stdin
+    # and only honors the trailing positional argv as the initial prompt.
+    assert "--input-format=stream-json" in argv
     assert "--system-prompt-file" in argv  # not --system-prompt
     assert "--mcp-config" in argv
     assert "--strict-mcp-config" in argv

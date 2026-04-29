@@ -291,6 +291,12 @@ def build_argv(
         claude_bin or "claude",
         "--print", "--verbose",
         "--output-format=stream-json",
+        # BSP-002 §4.1: stdin carries newline-delimited JSON user turns
+        # so AgentSupervisor.send_user_turn(...) can continue an existing
+        # conversation. Without --input-format=stream-json the CLI treats
+        # only the trailing positional argv as the initial prompt and
+        # ignores stdin lines, breaking S3 multi-turn continuation.
+        "--input-format=stream-json",
         "--system-prompt-file", str(system_prompt_path),
         "--mcp-config", str(mcp_config_path),
         "--strict-mcp-config",
