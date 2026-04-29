@@ -238,6 +238,7 @@ def build_argv(
     *, model: Optional[str] = None, use_bare: bool = False,
     claude_bin: Optional[str] = None,
     session_id: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
 ) -> List[str]:
     """Assemble the ``claude`` argv per RFC-002 v1.0.1.
 
@@ -266,8 +267,26 @@ def build_argv(
       ``PATHEXT`` for unquoted names, so the supervisor passes
       ``shutil.which("claude")`` here to disambiguate ``claude.cmd``.
 
+    BSP-002 §4.3 / decisions/no-rebind-popen — resume semantics:
+
+    * ``session_id`` (fresh spawn) emits ``--session-id <uuid>``; the
+      kernel mints a new UUID and tags the runtime conversation with it.
+    * ``resume_session_id`` (idle / exited / alive-snapshot reattach)
+      emits ``--resume <session_id>``; claude re-attaches a new process
+      to the existing conversation cache.
+    * The two are MUTUALLY EXCLUSIVE per the claude CLI grammar — passing
+      both raises ``ValueError`` so callers cannot accidentally request a
+      "fresh session that also resumes." Choose one branch at the
+      AgentSupervisor level (BSP-002 §4.3).
+
     See RFC-002 v1.0.1 amendments section.
     """
+    if session_id is not None and resume_session_id is not None:
+        raise ValueError(
+            "build_argv: session_id and resume_session_id are mutually "
+            "exclusive (claude CLI: --session-id is for fresh spawns; "
+            "--resume re-attaches to an existing session)"
+        )
     argv: List[str] = [
         claude_bin or "claude",
         "--print", "--verbose",
@@ -294,6 +313,12 @@ def build_argv(
         # --resume <session_id> to thread continuation across spawns.
         # Pre-positional — matches the placement of other --flag args.
         argv.extend(["--session-id", session_id])
+    if resume_session_id:
+        # BSP-002 §4.3 / decisions/no-rebind-popen: re-attach to an
+        # existing claude session. Used by AgentSupervisor.respawn_from_config
+        # for idle / exited / alive-snapshot agents whose conversation is
+        # preserved on disk by the claude CLI.
+        argv.extend(["--resume", resume_session_id])
     argv.append(task)
     return argv
 

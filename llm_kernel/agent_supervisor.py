@@ -191,6 +191,7 @@ class AgentSupervisor:
         self, zone_id: str, agent_id: str, task: str, work_dir: Path,
         api_key: Optional[str] = None, model: Optional[str] = None,
         use_bare: bool = False, set_base_url: Optional[bool] = None,
+        resume_claude_session_id: Optional[str] = None,
     ) -> AgentHandle:
         """Spawn a Claude Code subprocess wired into paper-telephone topology.
 
@@ -199,6 +200,16 @@ class AgentSupervisor:
         reader threads, watchdog. Raises
         :class:`PreSpawnValidationError` on validation failure (also
         emits a synthetic ``report_problem``).
+
+        BSP-002 §4.3 resume branch — when ``resume_claude_session_id`` is
+        set, the supervisor re-attaches to that existing claude session
+        instead of minting a new UUID. argv carries ``--resume <id>``
+        rather than ``--session-id <uuid>``; the resulting AgentHandle's
+        ``claude_session_id`` matches the resumed value so the operator-
+        visible identity is unchanged. Used by ``respawn_from_config``
+        when the snapshot's ``runtime_status`` is ``idle`` / ``exited``
+        / ``alive`` (per ``decisions/no-rebind-popen``: alive-in-snapshot
+        but process-gone is treated as idle).
         """
         from . import _diagnostics
         _diagnostics.mark("supervisor_spawn_entry", agent_id=agent_id, zone_id=zone_id)
@@ -231,7 +242,16 @@ class AgentSupervisor:
         # spawn time and passed via --session-id so the runtime conversation
         # is tagged with a stable id we control. Persists on AgentHandle
         # for a future --resume path.
-        claude_session_id = str(uuid.uuid4())
+        #
+        # Resume branch (BSP-002 §4.3 / decisions/no-rebind-popen): when
+        # ``resume_claude_session_id`` is provided, do NOT mint a new UUID
+        # — re-use the stored id and emit ``--resume`` instead of
+        # ``--session-id`` so claude re-attaches to the existing
+        # conversation cache.
+        if resume_claude_session_id:
+            claude_session_id = resume_claude_session_id
+        else:
+            claude_session_id = str(uuid.uuid4())
         # Resolve to absolute paths up-front. The child process is launched
         # with ``cwd=work_dir``, so passing relative paths to Claude's CLI
         # would double-prefix the work_dir (cwd + relative arg = doubled).
@@ -334,11 +354,22 @@ class AgentSupervisor:
             "supervisor_spawn_claude_resolved",
             agent_id=agent_id, claude_bin=claude_bin,
         )
-        argv = build_argv(
-            system_prompt_path, mcp_config_path, task,
-            model=model, use_bare=use_bare, claude_bin=claude_bin,
-            session_id=claude_session_id,
-        )
+        # Mutually-exclusive flags per `_provisioning.build_argv`:
+        # ``--session-id <uuid>`` for fresh spawns vs. ``--resume <id>``
+        # for re-attach. The supervisor decides at spawn-time which
+        # branch the entry belongs to.
+        if resume_claude_session_id:
+            argv = build_argv(
+                system_prompt_path, mcp_config_path, task,
+                model=model, use_bare=use_bare, claude_bin=claude_bin,
+                resume_session_id=claude_session_id,
+            )
+        else:
+            argv = build_argv(
+                system_prompt_path, mcp_config_path, task,
+                model=model, use_bare=use_bare, claude_bin=claude_bin,
+                session_id=claude_session_id,
+            )
         logger.info(
             "spawning agent %s (zone=%s) model=%s bare=%s claude=%s",
             agent_id, zone_id, model, use_bare, claude_bin,
@@ -760,14 +791,44 @@ class AgentSupervisor:
                 results[agent_id] = "failed"
         return results
 
+    #: Statuses that signal a resumable claude session per
+    #: ``decisions/no-rebind-popen``. ``alive`` is included because a
+    #: snapshot taken before clean shutdown may carry the prior
+    #: ``runtime_status`` even though the process has since gone away —
+    #: per the decision atom that case is treated as ``idle``.
+    _RESUMABLE_RUNTIME_STATUSES: frozenset[str] = frozenset(
+        {"alive", "idle", "exited"}
+    )
+    #: How long the supervisor waits for a resume-spawn's popen to
+    #: confirm liveness before declaring the resume failed (K24). Short
+    #: by design — claude exits quickly when the session id is unknown
+    #: or the cache has expired. Tests pass a smaller value via
+    #: ``_resume_verify_timeout_sec``.
+    _RESUME_VERIFY_TIMEOUT_SEC: float = 0.5
+
     def _spawn_from_config_entry(self, entry: Dict[str, Any]) -> AgentHandle:
         """Resolve a recoverable+volatile config entry to a spawn(...) call.
 
         Required keys: ``agent_id``, ``zone_id``, ``task``,
         ``work_dir``. Optional volatile keys (per RFC-005
-        ``config.volatile.agents[]``): ``model``. Raises ValueError on
+        ``config.volatile.agents[]``): ``model``,
+        ``claude_session_id``, ``runtime_status``. Raises ValueError on
         missing required key; the caller in
         :meth:`respawn_from_config` translates that to ``'failed'``.
+
+        Resume branch (BSP-002 §4.3 / decisions/no-rebind-popen): when
+        the entry carries ``claude_session_id`` AND ``runtime_status``
+        is in :data:`_RESUMABLE_RUNTIME_STATUSES`, the supervisor calls
+        :meth:`spawn` with ``resume_claude_session_id=...`` so claude
+        re-attaches via ``--resume <id>`` instead of minting a new UUID.
+
+        K24 fallback (BSP-002 §7): if the resume-spawn's claude process
+        exits non-zero before the verify timeout elapses, the
+        supervisor emits a K24 ``report_problem``, drops the failed
+        handle, and retries as a FRESH spawn (new UUID). The agent's
+        task will then replay via the BSP-002 §4.4 Case-B mechanism on
+        the next continuation; for V1 the K24 marker + fresh spawn is
+        the documented fallback path.
         """
         agent_id = entry["agent_id"]
         zone_id = entry["zone_id"]
@@ -785,10 +846,97 @@ class AgentSupervisor:
         model = entry.get("model")
         api_key = entry.get("api_key")
         use_bare = bool(entry.get("use_bare", False))
-        return self.spawn(
+
+        # Decide whether this entry is a fresh spawn or a resume.
+        prior_session_id = entry.get("claude_session_id")
+        runtime_status = entry.get("runtime_status")
+        is_resume = bool(
+            prior_session_id
+            and isinstance(prior_session_id, str)
+            and isinstance(runtime_status, str)
+            and runtime_status in self._RESUMABLE_RUNTIME_STATUSES
+        )
+        if not is_resume:
+            return self.spawn(
+                zone_id=zone_id, agent_id=agent_id, task=task,
+                work_dir=work_dir, api_key=api_key,
+                model=model, use_bare=use_bare,
+            )
+
+        handle = self.spawn(
             zone_id=zone_id, agent_id=agent_id, task=task,
             work_dir=work_dir, api_key=api_key,
             model=model, use_bare=use_bare,
+            resume_claude_session_id=prior_session_id,
+        )
+        if self._resume_failed(handle):
+            self._record_resume_failure_k24(
+                agent_id=agent_id, zone_id=zone_id,
+                attempted_session_id=prior_session_id,
+                exit_code=handle.popen.poll(),
+            )
+            # Drop the failed handle so the fresh spawn does not hit
+            # the live-agent idempotency short-circuit in :meth:`spawn`.
+            with self._lock:
+                if self._agents.get(agent_id) is handle:
+                    del self._agents[agent_id]
+            handle = self.spawn(
+                zone_id=zone_id, agent_id=agent_id, task=task,
+                work_dir=work_dir, api_key=api_key,
+                model=model, use_bare=use_bare,
+            )
+        return handle
+
+    def _resume_failed(self, handle: AgentHandle) -> bool:
+        """Return True if the just-spawned resume process has already exited
+        with a non-zero status.
+
+        Polls ``popen.poll()`` for at most ``_RESUME_VERIFY_TIMEOUT_SEC``
+        at a fine granularity. A still-alive popen (``poll() is None``)
+        and a clean exit (``poll() == 0``) both count as success — the
+        K24 path triggers only on observable non-zero termination.
+        """
+        deadline = time.monotonic() + self._RESUME_VERIFY_TIMEOUT_SEC
+        granularity = 0.05
+        while time.monotonic() < deadline:
+            rc = handle.popen.poll()
+            if rc is None:
+                time.sleep(granularity)
+                continue
+            return rc != 0
+        return False
+
+    def _record_resume_failure_k24(
+        self,
+        *,
+        agent_id: str,
+        zone_id: str,
+        attempted_session_id: str,
+        exit_code: Optional[int],
+    ) -> None:
+        """Emit the K24 fallback marker + synthetic ``report_problem``.
+
+        Per BSP-002 §7 K24: ``--resume <session_id>`` failed (the local
+        claude cache likely expired the session per
+        ``concepts/agent.md`` ``runtime_status: "exited"`` semantics).
+        The kernel then mints a new session and retries as a fresh
+        spawn; the operator surface sees a K24 problem run flagging
+        the lossy transition.
+        """
+        from . import _diagnostics
+        _diagnostics.mark(
+            "supervisor_resume_failed_k24",
+            agent_id=agent_id, zone_id=zone_id,
+            attempted_session_id=attempted_session_id,
+            exit_code=exit_code,
+        )
+        self._record_synthetic_problem(
+            agent_id, zone_id,
+            (
+                f"claude --resume <{attempted_session_id}> failed "
+                f"(exit_code={exit_code}); falling back to fresh spawn"
+            ),
+            "agent.resume_failed.k24",
         )
 
     # -- Synthetic-run helpers ---------------------------------------
