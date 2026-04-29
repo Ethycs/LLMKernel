@@ -215,6 +215,24 @@ class AgentSupervisor:
         from . import _diagnostics
         _diagnostics.mark("supervisor_spawn_entry", agent_id=agent_id, zone_id=zone_id)
 
+        # BSP-005 S5.0 K32 — reject agent_ids that collide with the
+        # cell-magic registry. PLAN-S5.0 §4 reserves the union of
+        # CELL_MAGICS + LINE_MAGICS keys (plus the ``llmnb_*`` future-
+        # reservation prefix) so an operator can't shadow a magic by
+        # spawning ``pin`` / ``agent`` / ``break`` / etc.
+        from .magic_registry import is_reserved_name, K32_RESERVED_MAGIC_NAME
+        if is_reserved_name(agent_id):
+            _diagnostics.mark(
+                "supervisor_spawn_reserved_name_rejected",
+                agent_id=agent_id, k_class=K32_RESERVED_MAGIC_NAME,
+            )
+            raise PreSpawnValidationError(
+                f"{K32_RESERVED_MAGIC_NAME}: agent_id {agent_id!r} collides "
+                f"with a reserved magic name (cell or line magic, or the "
+                f"`llmnb_*` future-reservation prefix). Pick a non-reserved id.",
+                log_signature="reserved_magic_name_as_agent_id",
+            )
+
         # BSP-002 Phase 1 idempotency: a /spawn for an agent_id whose
         # process is still alive returns the existing handle instead of
         # double-spawning. The conversation graph (BSP-002 §4.2) treats

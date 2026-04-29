@@ -1396,6 +1396,160 @@ class MetadataWriter:
             self._dirty = True
         return {"ok": True, "cell_id": cell_id, "kind": kind_value}
 
+    # -- BSP-005 S5.0 cell-text canonical accessors ------------------
+
+    # PLAN-S5.0 §3.5: cells[<id>] schema collapses to ``{ text, outputs,
+    # bound_agent_id }``. The ``kind``, ``pinned``, ``excluded`` fields
+    # become *parse-derived* from ``text``. ``cell_view`` returns the
+    # parsed view with text-hash caching so repeated reads of an
+    # unchanged cell don't re-walk the parser.
+    #
+    # We keep a parallel ``_cell_view_cache`` keyed by cell_id; entries
+    # invalidate when ``set_cell_text`` writes a new text. The cache is
+    # populated lazily on first ``cell_view`` call.
+
+    def get_cell_text(self, cell_id: str) -> Optional[str]:
+        """Return the canonical cell ``text`` (PLAN-S5.0 §3.5) or None."""
+        with self._lock:
+            record = self._cells.get(cell_id)
+            if record is None:
+                return None
+            return record.get("text")
+
+    def set_cell_text(self, cell_id: str, text: str) -> None:
+        """Write ``text`` as the canonical source for ``cell_id``.
+
+        Invalidates the parsed-view cache for the cell. Marks the
+        writer dirty so the next snapshot persists the change.
+        """
+        if not isinstance(text, str):
+            raise ValueError("set_cell_text: text must be a str")
+        with self._lock:
+            record = dict(self._cells.get(cell_id, {}))
+            record["text"] = text
+            self._cells[cell_id] = record
+            # Invalidate the cached parse.
+            if hasattr(self, "_cell_view_cache"):
+                self._cell_view_cache.pop(cell_id, None)
+            self._dirty = True
+
+    def delete_cell(self, cell_id: str) -> bool:
+        """Remove a cell record. Returns True iff it was present."""
+        with self._lock:
+            existed = cell_id in self._cells
+            self._cells.pop(cell_id, None)
+            if hasattr(self, "_cell_view_cache"):
+                self._cell_view_cache.pop(cell_id, None)
+            if existed:
+                self._dirty = True
+            return existed
+
+    def cell_view(self, cell_id: str):
+        """Return the parsed :class:`cell_text.ParsedCell` for ``cell_id``.
+
+        Per PLAN-S5.0 §3.5: text-hash caching. Cache hit when the
+        text's SHA-256 matches the entry; miss re-runs ``parse_cell``.
+        Returns ``None`` when the cell does not exist.
+        """
+        from .cell_text import parse_cell  # lazy import
+
+        with self._lock:
+            record = self._cells.get(cell_id)
+            if record is None:
+                return None
+            text = record.get("text", "")
+            cache = getattr(self, "_cell_view_cache", None)
+            if cache is None:
+                self._cell_view_cache: Dict[str, Tuple[str, Any]] = {}
+                cache = self._cell_view_cache
+            text_hash = _sha256_hex(text or "")
+            cached = cache.get(cell_id)
+            if cached is not None and cached[0] == text_hash:
+                return cached[1]
+        # Parse outside the lock so a future K30/K31 raise doesn't hold
+        # writes against the snapshot lock.
+        view = parse_cell(text or "")
+        with self._lock:
+            self._cell_view_cache[cell_id] = (text_hash, view)
+        return view
+
+    def migrate_cells_to_canonical_text(self) -> Dict[str, Any]:
+        """One-shot: re-emit pre-S5.0 cell records as canonical text form.
+
+        PLAN-S5.0 §3.5 — a cell record carrying explicit ``kind`` /
+        ``pinned`` / ``excluded`` / ``scratch`` / ``checkpoint`` /
+        ``bound_agent_id`` fields without a ``text`` field is migrated:
+        the canonical text is rebuilt from those fields and stored in
+        the new ``text`` slot. The pre-existing fields are NOT removed
+        (back-compat: older readers may still want them); the writer's
+        ``cell_view`` accessor henceforth derives them from ``text``.
+
+        Idempotent: a cell that already carries ``text`` is skipped.
+        Returns a marker dict logging the cells migrated.
+        """
+        migrated: List[Dict[str, Any]] = []
+        with self._lock:
+            for cell_id, record in list(self._cells.items()):
+                if not isinstance(record, dict):
+                    continue
+                if "text" in record and isinstance(record["text"], str):
+                    continue
+                kind = record.get("kind", DEFAULT_CELL_KIND) or DEFAULT_CELL_KIND
+                bound_agent_id = record.get("bound_agent_id")
+                pieces: List[str] = []
+                # Cell-magic declaration. ``agent`` cells default to no
+                # explicit ``@@agent`` line — but if a bound_agent_id is
+                # set, emit the declaration so the binding round-trips
+                # through the parser.
+                if kind == "agent" and bound_agent_id:
+                    pieces.append(f"@@agent {bound_agent_id}")
+                elif kind != "agent":
+                    pieces.append(f"@@{kind}")
+                # Flag line magics.
+                if record.get("pinned"):
+                    pieces.append("@pin")
+                if record.get("excluded"):
+                    pieces.append("@exclude")
+                # Body — whatever the existing record stored as a
+                # source field. Pre-S5.0 records didn't have a single
+                # canonical body slot; we accept ``source`` if present
+                # (that's the field the extension serializer writes).
+                source = record.get("source") or ""
+                if source:
+                    pieces.append(source)
+                new_text = "\n".join(p for p in pieces if p)
+                record["text"] = new_text
+                self._cells[cell_id] = record
+                migrated.append({
+                    "cell_id": cell_id,
+                    "from_kind": kind,
+                    "had_pinned": bool(record.get("pinned")),
+                    "had_excluded": bool(record.get("excluded")),
+                })
+            if migrated:
+                self._dirty = True
+        marker = {
+            "migration": "BSP-005-S5.0-cell-text-canonical",
+            "migrated_count": len(migrated),
+            "cells": migrated,
+        }
+        if migrated:
+            try:
+                self._workspace_root.mkdir(parents=True, exist_ok=True)
+                marker_path = (
+                    self._workspace_root / ".llmnb-s5-0-cell-text-migration.json"
+                )
+                marker_path.write_text(
+                    json.dumps(marker, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError:  # pragma: no cover - defensive
+                logger.warning(
+                    "metadata writer: could not write S5.0 cell-text migration "
+                    "marker; continuing"
+                )
+        return marker
+
     # -- BSP-008 §3 / S3.5 record_context_manifest ------------------
 
     def _handle_record_context_manifest(
