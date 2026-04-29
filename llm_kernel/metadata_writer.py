@@ -572,6 +572,15 @@ class MetadataWriter:
         # The writer is the source of truth; the extension reads via
         # the Family F snapshot.
         self._cells: Dict[str, Dict[str, Any]] = {}
+        # BSP-008 §3 / S3.5 -- per-zone substructure rooted at
+        # ``metadata.rts.zone``. Today carries only the
+        # ``context_manifests`` map keyed by manifest_id; future slices
+        # add ``run_frames`` (S6), ``sections`` (S5.5), and the rest of
+        # the zone substructure listed in
+        # [concepts/context-manifest](docs/atoms/concepts/context-manifest.md).
+        # The manifests are append-only -- Inspect mode needs historical
+        # access -- so the writer never deletes from this map.
+        self._zone: Dict[str, Any] = {}
         # V1 Kernel Gap Closure G13 -- intent-queue overflow state.
         # ``_pending_intents`` is the buffered (deferred) intent queue
         # filled by :meth:`enqueue_intent` and drained by
@@ -1186,6 +1195,8 @@ class MetadataWriter:
             return _h
         if intent_kind == "set_cell_metadata":
             return self._handle_set_cell_metadata
+        if intent_kind == "record_context_manifest":
+            return self._handle_record_context_manifest
 
         # Registered-but-not-yet-implemented kinds: the registry
         # accepts the envelope so callers see K42 ("not yet implemented")
@@ -1206,8 +1217,9 @@ class MetadataWriter:
             "apply_overlay_commit":     "BSP-007 overlay_applier (K-OVERLAY slice)",
             "revert_overlay_to_commit": "BSP-007 overlay_applier (K-OVERLAY slice)",
             "create_overlay_ref":       "BSP-007 overlay_applier (K-OVERLAY slice)",
-            # BSP-008 ContextPacker / RunFrame kinds.
-            "record_context_manifest":  "BSP-008 context_packer (K-CTXR slice)",
+            # BSP-008 ContextPacker / RunFrame kinds. ``record_context_manifest``
+            # ships in K-AS-A (S3.5) -- handler routed above. ``record_run_frame``
+            # remains pending until the S6 RunFrame slice lands.
             "record_run_frame":         "BSP-008 context_packer (K-CTXR slice)",
         }
         slice_label = _PENDING_SLICE.get(intent_kind, "future slice")
@@ -1383,6 +1395,70 @@ class MetadataWriter:
             self._cells[cell_id] = record
             self._dirty = True
         return {"ok": True, "cell_id": cell_id, "kind": kind_value}
+
+    # -- BSP-008 §3 / S3.5 record_context_manifest ------------------
+
+    def _handle_record_context_manifest(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist one ContextManifest under ``metadata.rts.zone.context_manifests``.
+
+        Per BSP-008 §3 / [concepts/context-manifest](docs/atoms/concepts/context-manifest.md):
+        the ``record_context_manifest`` intent carries a fully-formed
+        :class:`context_packer.ContextManifest` dict -- the writer's job
+        is single-writer persistence into the zone substructure, not
+        re-validation of the V1 walk (the packer is the source of truth
+        per :func:`context_packer.pack`).
+
+        Validation surface (raises ``ValueError`` -> K42):
+
+        * ``params['manifest']`` MUST be a dict (or ``params`` itself
+          MAY carry the manifest fields directly per the brief's
+          "store ``params`` into ..." phrasing -- we accept both).
+        * ``manifest['manifest_id']`` MUST be a non-empty string.
+        * ``manifest['cell_id']`` MUST be a non-empty string.
+
+        Storage key: ``metadata.rts.zone.context_manifests[<manifest_id>]``.
+        Manifests are append-only per the atom's invariants; submitting
+        the same ``manifest_id`` twice through the intent registry hits
+        the BSP-003 §6 step 2 idempotency check (``intent_id`` keyed) so
+        re-submission is a no-op even if the manifest payload were
+        re-derived.
+        """
+        # Accept both shapes: params={"manifest": {...}} OR params={...}
+        # (the brief's "store params" phrasing). The former matches the
+        # contract atom's envelope example; the latter is what the
+        # AgentSupervisor will likely build for symmetry with other
+        # intent shapes once S6 wires it up.
+        manifest = params.get("manifest")
+        if not isinstance(manifest, dict):
+            manifest = params
+        if not isinstance(manifest, dict):
+            raise ValueError(
+                "record_context_manifest: manifest must be a dict"
+            )
+        manifest_id = manifest.get("manifest_id")
+        if not isinstance(manifest_id, str) or not manifest_id:
+            raise ValueError(
+                "record_context_manifest: manifest_id is required"
+            )
+        cell_id = manifest.get("cell_id")
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError(
+                "record_context_manifest: cell_id is required"
+            )
+        # Defensive copy so the caller's dict is not mutated by later
+        # snapshot serialization passes.
+        record = _deepcopy_json(manifest)
+        with self._lock:
+            zone = self._zone.setdefault("context_manifests", {})
+            zone[manifest_id] = record
+            self._dirty = True
+        return {
+            "ok": True,
+            "manifest_id": manifest_id,
+            "cell_id": cell_id,
+        }
 
     # -- V1 Kernel Gap Closure G13 -- intent-queue overflow ----------
 
@@ -2352,6 +2428,14 @@ class MetadataWriter:
                 self._queues = _deepcopy_json(queues_raw)
             else:
                 self._queues = {}
+            # BSP-008 §3 / S3.5 -- hydrate the zone substructure. Pre-S3.5
+            # snapshots carry no ``zone`` key; we default to an empty dict
+            # and the next ``record_context_manifest`` populates it.
+            zone_raw = snapshot.get("zone")
+            if isinstance(zone_raw, dict):
+                self._zone = _deepcopy_json(zone_raw)
+            else:
+                self._zone = {}
             self._pending_intents = []
             # Mark dirty iff we back-filled at least one cell.kind so
             # the next snapshot writes the resolved values out.
@@ -2529,6 +2613,11 @@ class MetadataWriter:
             # non-empty for the same byte-identity reason.
             if self._queues:
                 snapshot_out["queues"] = _deepcopy_json(self._queues)
+            # BSP-008 §3 / S3.5 -- emit ``zone`` ONLY when non-empty so
+            # baseline-snapshot tests stay byte-identical for unmutated
+            # writers. The hydrate path round-trips this verbatim.
+            if self._zone:
+                snapshot_out["zone"] = _deepcopy_json(self._zone)
             return snapshot_out
 
     def _build_event_log(

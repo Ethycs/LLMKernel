@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -567,6 +568,87 @@ class AgentSupervisor:
             "status": status,
             "cell_id": cell_id,
         }
+
+    # BSP-005 S9 — interrupt method paired with the X-EXT cell-toolbar
+    # interrupt button (commit 5de3401 sends ``{action_type:
+    # "agent_interrupt", agent_id}``). The dispatcher in mcp_server.py
+    # routes that envelope here.
+    def interrupt(self, agent_id: str) -> Dict[str, Any]:
+        """Send SIGINT to ``agent_id``'s live process.
+
+        Pairs with the X-EXT cell-toolbar interrupt button (commit
+        5de3401): the extension ships an ``operator.action`` envelope
+        with ``action_type: "agent_interrupt"`` whose dispatcher routes
+        through here. The semantic distinction vs ``/stop`` (per
+        ``atoms/operations/stop-agent.md``):
+
+        * ``/stop`` is a clean shutdown -- SIGTERM, ``runtime_status:
+          idle``, conversation resumable on the next turn.
+        * ``interrupt`` is an in-flight cancellation -- SIGINT to the
+          live process so claude aborts its current generation but the
+          process stays alive for the next turn. No resume cycle.
+
+        Returns:
+            ``{"agent_id": ..., "status": "interrupted" | "not_running"
+            | "unknown"}``
+
+            * ``"interrupted"`` -- SIGINT was delivered to a live PID.
+            * ``"not_running"`` -- the agent is registered with this
+              supervisor but its process has reaped (idle / exited
+              runtime status); SIGINT would target a stale or recycled
+              PID so we refuse.
+            * ``"unknown"`` -- ``agent_id`` is not registered with this
+              supervisor (no spawn record).
+
+        Best-effort: a ``ProcessLookupError`` on the kill (race against
+        the process reaping between ``poll()`` and ``os.kill()``)
+        downgrades to ``"not_running"`` rather than raising.
+        """
+        from . import _diagnostics
+        with self._lock:
+            handle = self._agents.get(agent_id)
+        if handle is None:
+            _diagnostics.mark(
+                "supervisor_interrupt_unknown_agent",
+                agent_id=agent_id,
+            )
+            return {"agent_id": agent_id, "status": "unknown"}
+        if handle.popen is None or handle.popen.poll() is not None:
+            _diagnostics.mark(
+                "supervisor_interrupt_not_running",
+                agent_id=agent_id,
+                state=handle.state,
+            )
+            return {"agent_id": agent_id, "status": "not_running"}
+        pid = getattr(handle.popen, "pid", None)
+        if pid is None:
+            _diagnostics.mark(
+                "supervisor_interrupt_no_pid",
+                agent_id=agent_id,
+            )
+            return {"agent_id": agent_id, "status": "not_running"}
+        try:
+            os.kill(pid, signal.SIGINT)
+        except ProcessLookupError:
+            _diagnostics.mark(
+                "supervisor_interrupt_pid_gone",
+                agent_id=agent_id, pid=pid,
+            )
+            return {"agent_id": agent_id, "status": "not_running"}
+        _diagnostics.mark(
+            "supervisor_interrupt_sigint_sent",
+            agent_id=agent_id, pid=pid,
+        )
+        logger.info(
+            "agent.interrupted agent_id=%s pid=%s",
+            agent_id, pid,
+            extra={
+                "event.name": "agent.interrupted",
+                "llmnb.agent_id": agent_id,
+                "llmnb.pid": pid,
+            },
+        )
+        return {"agent_id": agent_id, "status": "interrupted"}
 
     def terminate_all(self, grace_seconds: float = 10.0) -> None:
         """Graceful shutdown of every active agent (RFC-002 §6)."""
