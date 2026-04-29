@@ -262,14 +262,15 @@ import pytest
         ("apply_overlay_commit",     "BSP-007 overlay_applier"),
         ("revert_overlay_to_commit", "BSP-007 overlay_applier"),
         ("create_overlay_ref",       "BSP-007 overlay_applier"),
-        ("record_context_manifest",  "BSP-008 context_packer"),
+        # ``record_context_manifest`` shipped in K-AS-A (S3.5) -- now has
+        # a real handler; covered by ``test_context_packer.py``.
         ("record_run_frame",         "BSP-008 context_packer"),
     ],
 )
 def test_submit_intent_amendment_kinds_registered_but_unimplemented(
     intent_kind: str, slice_label: str,
 ) -> None:
-    """The 5 amendment kinds are in the registry (no K40) but their
+    """The remaining amendment kinds are in the registry (no K40) but their
     handlers ship with later slices — submitting today returns K42 with
     a slice-label reason so the operator knows where the work is queued."""
     writer = _new_writer()

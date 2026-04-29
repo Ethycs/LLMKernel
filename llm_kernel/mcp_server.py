@@ -718,6 +718,84 @@ class OperatorBridgeServer:
             )
             return
 
+        if action_type == "agent_interrupt":
+            # BSP-005 S9 / atoms/contracts/agent-supervisor.md::interrupt --
+            # paired with the X-EXT cell-toolbar interrupt button (commit
+            # 5de3401). Routes to ``AgentSupervisor.interrupt`` which
+            # sends SIGINT to the live agent's PID. Distinct from
+            # ``/stop`` (clean SIGTERM + idle); see
+            # ``atoms/operations/stop-agent.md`` for the V1 distinction.
+            #
+            # K-class envelope shape on malformed input: BSP-003 K42
+            # (validator-rejected) for a missing / non-string /
+            # empty ``agent_id``. The supervisor itself returns the
+            # status discriminator (``interrupted | not_running |
+            # unknown``); the kernel logs the outcome and lets the
+            # extension render the toolbar feedback.
+            from . import _diagnostics
+            agent_id = params.get("agent_id") or payload.get("agent_id")
+            cell_id = params.get("cell_id") or payload.get("originating_cell_id")
+            _diagnostics.mark(
+                "agent_interrupt_received",
+                agent_id=agent_id, cell_id=cell_id,
+            )
+            if not isinstance(agent_id, str) or not agent_id:
+                logger.warning(
+                    "agent_interrupt: K42 validator-rejected; missing/empty agent_id",
+                    extra={
+                        "event.name": "agent_interrupt_invalid_envelope",
+                        "llmnb.k_code": "K42",
+                        "llmnb.cell_id": cell_id,
+                    },
+                )
+                _diagnostics.mark(
+                    "agent_interrupt_k42_invalid_envelope",
+                    agent_id=agent_id, cell_id=cell_id,
+                )
+                return
+            supervisor = self._resolve_agent_supervisor()
+            if supervisor is None:
+                logger.warning(
+                    "agent_interrupt received but no AgentSupervisor is attached"
+                )
+                _diagnostics.mark("agent_interrupt_no_supervisor")
+                return
+            interrupt_method = getattr(supervisor, "interrupt", None)
+            if not callable(interrupt_method):
+                logger.warning(
+                    "agent_interrupt: attached AgentSupervisor does not "
+                    "implement interrupt"
+                )
+                _diagnostics.mark("agent_interrupt_no_method")
+                return
+            try:
+                result = interrupt_method(agent_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "agent_interrupt: supervisor.interrupt raised; agent_id=%s",
+                    agent_id,
+                )
+                _diagnostics.mark(
+                    "agent_interrupt_raised", agent_id=agent_id,
+                )
+                return
+            logger.info(
+                "operator.agent_interrupt",
+                extra={
+                    "event.name": "operator.agent_interrupt",
+                    "rfc": "RFC-006",
+                    "bsp": "BSP-005",
+                    "llmnb.interrupted_agent_id": agent_id,
+                    "llmnb.cell_id": cell_id,
+                    "llmnb.interrupt_status": (
+                        result.get("status") if isinstance(result, dict) else None
+                    ),
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
         if action_type == "branch_switch":
             new_branch = params.get("new_branch") or params.get("branch")
             logger.info(
