@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 
 __all__ = (
     "ParsedCell",
+    "ParserContext",
     "split_at_breaks",
     "parse_cell",
     "CellParseError",
@@ -41,7 +42,9 @@ __all__ = (
 #: K-class identifiers per PLAN §4 K-class additions.
 K30_MULTIPLE_KINDS: str = "K30"
 K31_UNKNOWN_CELL_MAGIC: str = "K31"
+K33_MAGIC_HASH_MISMATCH: str = "K33"
 K34_INCOMPATIBLE_KIND_CHANGE: str = "K34"
+K35_PLAIN_MAGIC_IN_HASH_MODE: str = "K35"
 
 
 class CellParseError(ValueError):
@@ -57,6 +60,48 @@ class CellParseError(ValueError):
         super().__init__(f"{code}: {reason}")
         self.code: str = code
         self.reason: str = reason
+
+
+@dataclass
+class ParserContext:
+    """Carrier for hash-mode awareness across :func:`parse_cell`.
+
+    PLAN-S5.0.1b §3.5 PIN-AWARE PARSER. The parser is a pure function;
+    the dispatcher / Cell Manager builds a context from the writer's
+    ``metadata.rts.config`` (``magic_hash_enabled``,
+    ``magic_pin_fingerprint``) plus the registered magic-name set,
+    then passes it in. ``pin`` is *not* read from the notebook — it
+    arrives via env / OS-keychain in V1 (see ``auth_handlers``); the
+    parser only needs the value at parse time.
+
+    Contract:
+
+    * ``hash_mode_on=False`` (or ``parser_context=None``): legacy /
+      permissive path. Plain ``@@<name>`` and ``@<name>`` dispatch as
+      today. Hashed-shaped lines are body unless they happen to also
+      satisfy the legacy regex (they don't, the regex is identifier-
+      strict).
+    * ``hash_mode_on=True`` AND ``pin`` non-empty: only
+      ``@@<hash>:<name> [args]`` and ``@<hash>:<name> [args]``
+      dispatch, validated via ``magic_hash.validate_hashed_magic``.
+      Plain ``@@<known>`` lines emit K35 (in
+      ``cell.k_class_emissions``) and become body. Hashed-shaped
+      lines that fail validation emit K33 and become body.
+    * ``hash_mode_on=True`` BUT ``pin`` is empty/None: degraded path.
+      The notebook says hash mode is on but the kernel has no pin
+      loaded; we treat plain magics as K35-body (defensive — a no-pin
+      operator session must NOT silently dispatch). The auth
+      handlers gate the pin-load surface; this is just the parser's
+      defensive fallback.
+
+    The in-memory ``ParsedCell`` holds the recovered ``<name>`` (not
+    the hash). Storage retains the canonical hashed form via
+    ``cell.text``.
+    """
+
+    hash_mode_on: bool = False
+    pin: Optional[str] = None
+    known_magics: FrozenSet[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -88,6 +133,15 @@ class ParsedCell:
     #: PLAN §3.9. The parser sets this to True so the round-trip layer
     #: can preserve the original text on emission.
     legacy_alias_used: bool = False
+    #: PLAN-S5.0.1b §3.5 — append-only audit of K-class emissions
+    #: produced *during* this cell's parse pass. Each entry:
+    #: ``{"code": "K33"|"K35", "line": <str>, "reason": <str>}``.
+    #: The parser does NOT raise on K33/K35 (unlike K30/K31 which do
+    #: raise via :class:`CellParseError`) — they are advisory and the
+    #: dispatcher / drift-detector consumer iterates over them after
+    #: a successful parse to decide whether to surface a warning chip
+    #: or a contamination flag.
+    k_class_emissions: List[Dict[str, str]] = field(default_factory=list)
 
 
 # --- Legacy-directive rewrite ----------------------------------------
@@ -184,24 +238,54 @@ _CELL_MAGIC_RE: re.Pattern[str] = re.compile(r"^@@([A-Za-z_][\w]*)\s*(.*)$")
 _LINE_MAGIC_RE: re.Pattern[str] = re.compile(r"^@([A-Za-z_][\w]*)\s*(.*)$")
 
 
-def parse_cell(text: str) -> ParsedCell:
+#: Hashed-magic line shape — ``@@<hash>:<name> [args]`` / ``@<hash>:<name>``.
+#: Mirrors :data:`magic_hash.HASHED_MAGIC_LINE` but kept local so the
+#: parser doesn't import the magic_hash module unconditionally (the
+#: legacy/permissive path doesn't need it).
+_HASHED_CELL_MAGIC_RE: re.Pattern[str] = re.compile(
+    r"^@@([a-f0-9]+):([A-Za-z_][\w]*)\s*(.*)$"
+)
+_HASHED_LINE_MAGIC_RE: re.Pattern[str] = re.compile(
+    r"^@([a-f0-9]+):([A-Za-z_][\w]*)\s*(.*)$"
+)
+
+
+def parse_cell(
+    text: str,
+    *,
+    parser_context: Optional[ParserContext] = None,
+) -> ParsedCell:
     """Parse one cell's text into a :class:`ParsedCell` view.
 
-    Walking rule per PLAN §3.2:
+    Walking rule per PLAN §3.2 (S5.0) + §3.5 PIN-AWARE PARSER (S5.0.1b):
 
     1. Apply the legacy-directive rewrite first so ``/spawn`` and
        ``@<id>:`` shipping cells parse identically to their canonical
        magic form.
-    2. Walk lines top-down. A column-0 ``@@<name>`` line is a *cell
-       magic*; the FIRST one sets :attr:`ParsedCell.kind` and parses
-       its arg-string via the registry. A SECOND ``@@<known>`` line
-       raises K30. An ``@@<unknown>`` at the kind position raises K31.
-    3. A column-0 ``@<name>`` line is a *line magic*; the registry's
-       handler mutates :attr:`flags` or appends to
-       :attr:`line_magics`. Unknown line magics are *body* (so a typed
-       email address ``@user`` mid-cell still round-trips).
+    2. **Hash mode off** (``parser_context=None`` or
+       ``parser_context.hash_mode_on=False``): walk lines top-down.
+       Plain ``@@<name>`` / ``@<name>`` dispatch via the registry as
+       today. Hashed-shaped lines (``@@<hex>:<name>``) are body in
+       this path; the legacy parser regex only matches identifier-like
+       names, so a hashed line is *naturally* body without a special
+       case.
+    3. **Hash mode on** (``parser_context.hash_mode_on=True``):
+       * ``@@<hash>:<name> [args]`` validates via
+         ``magic_hash.validate_hashed_magic``. Match → dispatch by
+         ``<name>``. Mismatch (or unknown ``<name>``) → emit K33,
+         line becomes body.
+       * Plain ``@@<known>`` (no hash) → emit K35, line becomes body.
+       * Same shape pair for ``@<hash>:<name>`` line magics.
+       * Plain ``@@<unknown>`` at the kind position still raises K31
+         (preserves the kind-required invariant; a typo is a typo
+         regardless of hash mode).
     4. Anything else is body. The body is joined with ``\\n``,
        preserving the operator's whitespace and blank lines verbatim.
+
+    K30/K31 still raise (cell unparseable). K33/K35 are advisory — the
+    parser appends entries to ``cell.k_class_emissions`` and the
+    line falls through to body. The dispatcher / drift-detector
+    consumer iterates over emissions after a successful parse.
 
     The parser imports the registries at call time to avoid an import
     cycle (the registry's K32 hook in turn imports back from this
@@ -218,10 +302,145 @@ def parse_cell(text: str) -> ParsedCell:
     cell = ParsedCell()
     cell.legacy_alias_used = was_legacy
 
+    # Hash-mode prelude. We treat a context-with-empty-pin as "hash
+    # mode active but pin missing" — defensive: plain magics still
+    # emit K35 + become body; the parser must NOT silently dispatch
+    # in a no-pin session (PLAN §3.5 invariant).
+    ctx = parser_context
+    hash_mode_on = bool(ctx is not None and ctx.hash_mode_on)
+    pin = ctx.pin if (ctx is not None) else None
+    known_magics = (ctx.known_magics if ctx is not None else frozenset())
+    # In hash mode we need the union of cell + line magic names for
+    # the validator's name-set guard. We default to the live registry
+    # union when the context didn't pre-supply it (caller convenience).
+    if hash_mode_on and not known_magics:
+        known_magics = frozenset(set(CELL_MAGICS.keys()) | set(LINE_MAGICS.keys()))
+
     body_lines: List[str] = []
     saw_kind = False
 
+    # Local helper — record a K33/K35 emission. Caller decides
+    # whether to also append to body_lines (always yes for these
+    # codes — they're advisory).
+    def _emit_k(code: str, line: str, reason: str) -> None:
+        cell.k_class_emissions.append({
+            "code": code, "line": line[:256], "reason": reason,
+        })
+
+    # Lazy validator import — only needed in the hash-mode branch.
+    if hash_mode_on:
+        from .magic_hash import validate_hashed_magic
+
     for line in rewritten.splitlines():
+        # --- Hash-mode branches ---------------------------------------
+        if hash_mode_on:
+            # @@<hash>:<name> cell magic.
+            if line.startswith("@@"):
+                hm = _HASHED_CELL_MAGIC_RE.match(line)
+                if hm is not None:
+                    if not pin:
+                        # Hash mode on but pin missing → defensive K33.
+                        _emit_k(
+                            K33_MAGIC_HASH_MISMATCH, line,
+                            "hash_mode_on_but_pin_missing",
+                        )
+                        body_lines.append(line)
+                        continue
+                    ok, recovered = validate_hashed_magic(
+                        line, pin, known_magics,
+                    )
+                    if ok and recovered is not None and recovered in CELL_MAGICS:
+                        if recovered == "break":
+                            continue
+                        if saw_kind:
+                            raise CellParseError(
+                                K30_MULTIPLE_KINDS,
+                                f"multiple cell-kind declarations: "
+                                f"saw @@{cell.kind!r} then @@{recovered!r}",
+                            )
+                        # The args portion is everything AFTER the
+                        # ``<name>`` token; the regex's group(3) is
+                        # the trimmed remainder.
+                        args_str = hm.group(3).strip()
+                        handler = CELL_MAGICS[recovered]
+                        handler.apply(cell, args_str)
+                        cell.kind_was_default = False
+                        saw_kind = True
+                        continue
+                    # Hashed shape but didn't validate — K33 + body.
+                    _emit_k(
+                        K33_MAGIC_HASH_MISMATCH, line,
+                        "invalid_hash_or_unknown_name",
+                    )
+                    body_lines.append(line)
+                    continue
+                # @@<plain_name> in hash mode → K35 + body (unless it's
+                # an @@<unknown> at kind position, which still raises K31
+                # so operator typos surface uniformly).
+                m = _CELL_MAGIC_RE.match(line)
+                if m is not None:
+                    name = m.group(1)
+                    if name == "break":
+                        continue
+                    if name in CELL_MAGICS:
+                        _emit_k(
+                            K35_PLAIN_MAGIC_IN_HASH_MODE, line,
+                            "plain_cell_magic_in_hash_mode",
+                        )
+                        body_lines.append(line)
+                        continue
+                    # Unknown @@<x> still raises K31 at kind position.
+                    if not saw_kind:
+                        raise CellParseError(
+                            K31_UNKNOWN_CELL_MAGIC,
+                            f"unknown cell magic @@{name!r}",
+                        )
+                    body_lines.append(line)
+                    continue
+                body_lines.append(line)
+                continue
+            # @<hash>:<name> line magic.
+            if line.startswith("@"):
+                hm = _HASHED_LINE_MAGIC_RE.match(line)
+                if hm is not None:
+                    if not pin:
+                        _emit_k(
+                            K33_MAGIC_HASH_MISMATCH, line,
+                            "hash_mode_on_but_pin_missing",
+                        )
+                        body_lines.append(line)
+                        continue
+                    ok, recovered = validate_hashed_magic(
+                        line, pin, known_magics,
+                    )
+                    if ok and recovered is not None and recovered in LINE_MAGICS:
+                        args_str = hm.group(3).strip()
+                        handler = LINE_MAGICS[recovered]
+                        handler.apply(cell, args_str)
+                        if recovered not in FLAG_SETTING_LINE_MAGICS:
+                            cell.line_magics.append((recovered, args_str))
+                        continue
+                    _emit_k(
+                        K33_MAGIC_HASH_MISMATCH, line,
+                        "invalid_hash_or_unknown_name",
+                    )
+                    body_lines.append(line)
+                    continue
+                # Plain @<name> in hash mode → K35 if known, else body.
+                m = _LINE_MAGIC_RE.match(line)
+                if m is not None and m.group(1) in LINE_MAGICS:
+                    _emit_k(
+                        K35_PLAIN_MAGIC_IN_HASH_MODE, line,
+                        "plain_line_magic_in_hash_mode",
+                    )
+                    body_lines.append(line)
+                    continue
+                body_lines.append(line)
+                continue
+            body_lines.append(line)
+            continue
+
+        # --- Legacy / permissive (hash-mode-off) path -----------------
         # Column-0 cell magic? `@@<name> [args]` at line[0:2] == '@@'.
         if line.startswith("@@"):
             m = _CELL_MAGIC_RE.match(line)
