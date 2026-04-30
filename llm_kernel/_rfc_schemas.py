@@ -537,6 +537,51 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
             "no-ops and do NOT re-emit K3G."
         ),
     },
+    # PLAN-S5.0.2 §7 — magic code generators.
+    "K3H": {
+        "name": "agent_emitted_generator_magic_blocked",
+        "fires_in": "agent_supervisor._scan_for_magic_contamination",
+        "description": (
+            "Agent's contaminated stdout contained a generator-magic "
+            "call (`@@template`, `@@expand`, `@@import`, or a hashed "
+            "equivalent). Layered on top of K35's plain-magic "
+            "contamination flag: the cell is flagged contaminated AND "
+            "the line is escaped (Layer-2 in hash mode); no generator "
+            "dispatch happens. K3H is log-level — it does not raise; "
+            "it tags the contamination event so analytics can split "
+            "generator-class injection attempts from generic ones."
+        ),
+    },
+    "K3I": {
+        "name": "generator_handler_produced_invalid_hash",
+        "fires_in": "magic_generators.dispatch_generator",
+        "description": (
+            "A generator handler returned a fragment whose `@@<hash>` "
+            "prefix did NOT match `HMAC(pin, name)` against the "
+            "operator's pin. The dispatcher rejects ALL fragments "
+            "from the invocation atomically (no partial inserts). "
+            "K3I is log-level on the diagnostics stream and surfaces "
+            "to the operator as a structured `GeneratorError`. Likely "
+            "cause: handler bug or operator-registered custom "
+            "generator with a bad hash-stamp implementation."
+        ),
+    },
+    "K3J": {
+        "name": "generator_provenance_missing",
+        "fires_in": (
+            "cell_manager.CellManager.insert_cells_with_provenance / "
+            "metadata_writer.MetadataWriter.insert_generated_cell"
+        ),
+        "description": (
+            "Cell-Manager's ``insert_cells_with_provenance`` path was "
+            "called without a non-empty ``generated_by`` / "
+            "``generated_at`` pair. Defense-in-depth assertion: the "
+            "happy-path generator dispatcher always sets both fields. "
+            "Unreachable in normal operation; exists so a programmer "
+            "calling the API directly without provenance trips a loud "
+            "K3J instead of silently inserting orphan cells."
+        ),
+    },
 }
 
 

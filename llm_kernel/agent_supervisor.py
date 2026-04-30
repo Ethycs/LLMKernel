@@ -65,6 +65,7 @@ _RESTART_WINDOW_MAX: int = 3
 #: drift-marker emit path can reference the canonical name.
 K35_PLAIN_MAGIC_IN_HASH_MODE: str = "K35"
 K36_HASHED_MAGIC_EMISSION_BLOCKED: str = "K36"
+K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED: str = "K3H"
 
 AgentState = str  # starting | running | restarting | failed | terminated
 
@@ -1489,18 +1490,52 @@ class AgentSupervisor:
         # Lazy import: this module otherwise has no dependency on the
         # registry (preserves the pre-S5.0.1 import topology).
         from .magic_hash import (
-            looks_like_hashed_magic, looks_like_plain_magic,
+            HASHED_MAGIC_LINE,
+            PLAIN_MAGIC_LINE,
+            looks_like_hashed_magic,
+            looks_like_plain_magic,
         )
-        from .magic_registry import RESERVED_NAMES
+        from .magic_registry import RESERVED_NAMES, is_generator
 
         if not isinstance(line, str) or not line:
             return None
+
+        # PLAN-S5.0.2 §7 — extract the magic name regardless of shape
+        # so we can upgrade the contamination tag to K3H when the agent
+        # emitted a generator-magic call. Generator names are a strict
+        # subset of RESERVED_NAMES so we only do this when a layer-1
+        # match happens.
+        emitted_name: Optional[str] = None
+        plain_match = PLAIN_MAGIC_LINE.match(line) if line else None
+        hashed_match = HASHED_MAGIC_LINE.match(line) if line else None
+        if hashed_match is not None:
+            emitted_name = hashed_match.group(2)
+        elif plain_match is not None:
+            emitted_name = plain_match.group(1)
+        emitted_is_generator = bool(
+            isinstance(emitted_name, str) and is_generator(emitted_name)
+        )
 
         # Layer 1: plain magic detection (always on).
         if looks_like_plain_magic(line, RESERVED_NAMES):
             self._flag_contaminated(
                 handle.agent_id, line=line, source=source, layer="plain",
             )
+            if emitted_is_generator:
+                # PLAN-S5.0.2 §7 — log K3H specifically for generator
+                # names so analytics can split generator-class injection
+                # attempts from generic plain-magic ones. K3H is log-
+                # level (the contamination flag + Layer-2 escape are
+                # the actual defenses).
+                self._emit_drift_marker(
+                    handle.agent_id,
+                    code=K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED,
+                    reason=(
+                        f"agent emitted generator magic "
+                        f"@@{emitted_name}"
+                    ),
+                    line=line,
+                )
 
         # Layer 2: hashed magic emission ban (hash-mode-only).
         if self._magic_hash_enabled() and looks_like_hashed_magic(line):
@@ -1508,6 +1543,18 @@ class AgentSupervisor:
                 handle.agent_id, line=line, source=source,
                 layer="hashed_emission_ban",
             )
+            # When the recovered name is a generator we tag K3H *in
+            # addition to* K36 — analytics consumers index on both.
+            if emitted_is_generator:
+                self._emit_drift_marker(
+                    handle.agent_id,
+                    code=K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED,
+                    reason=(
+                        f"agent emitted hashed generator magic "
+                        f"{emitted_name}"
+                    ),
+                    line=line,
+                )
             self._emit_drift_marker(
                 handle.agent_id,
                 code=K36_HASHED_MAGIC_EMISSION_BLOCKED,
