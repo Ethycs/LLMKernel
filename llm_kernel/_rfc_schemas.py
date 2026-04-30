@@ -376,3 +376,86 @@ def validate_tool_input(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
         # client error.  Surface it but don't crash.
         return f"$: schema error ({exc.message})"
     return None
+
+
+# ---------------------------------------------------------------------------
+# K-class registry — PLAN-S5.0.1 §3.9 cell-magic injection-defense codes
+# ---------------------------------------------------------------------------
+#
+# Slice 5.0.1a wires K35 + K36 only. The remaining K3C..K3G ship with
+# the precondition-gates / acceptance-flag slice (5.0.1c). This central
+# registry lets drift-detector / dispatcher consumers index the K-code
+# without scanning every module's local string constants — and gives
+# the audit pass a single place to confirm a code has a documented
+# meaning before it appears in a marker.
+
+K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
+    # K30/K31/K32/K34 — pre-S5.0.1 codes, registered here for
+    # completeness so a future audit pass can validate the full set
+    # in one place.
+    "K30": {
+        "name": "multiple_kinds",
+        "fires_in": "cell_text.parse_cell",
+        "description": (
+            "Two or more @@<cell_magic> declarations in a single cell."
+        ),
+    },
+    "K31": {
+        "name": "unknown_cell_magic",
+        "fires_in": "cell_text.parse_cell",
+        "description": (
+            "@@<unknown_name> at the kind position; not in CELL_MAGICS."
+        ),
+    },
+    "K32": {
+        "name": "reserved_magic_name",
+        "fires_in": "agent_supervisor.spawn",
+        "description": (
+            "agent_id collides with the cell-magic registry "
+            "(RESERVED_NAMES) or the llmnb_* future-reservation prefix."
+        ),
+    },
+    "K34": {
+        "name": "incompatible_kind_change",
+        "fires_in": "magic_registry._MarkLineMagic",
+        "description": (
+            "@mark <kind> target is not a known cell-magic kind."
+        ),
+    },
+    # PLAN-S5.0.1 §3.9 — slice 5.0.1a wires K35 + K36.
+    "K35": {
+        "name": "plain_magic_in_hash_mode",
+        "fires_in": "cell_text.parse_cell (slice 5.0.1b)",
+        "description": (
+            "Hash mode is enabled but the parser saw a plain @@<known> "
+            "line (no hash). Treated as body, NOT dispatched. Logged "
+            "so the operator surface can warn about a likely operator "
+            "typo or a reverted notebook from before hash mode was "
+            "enabled. The constant is registered here in 5.0.1a; the "
+            "parser hookup lands in slice 5.0.1b."
+        ),
+    },
+    "K36": {
+        "name": "hashed_magic_emission_blocked",
+        "fires_in": (
+            "agent_supervisor._scan_for_magic_contamination + "
+            "socket_writer.write_frame"
+        ),
+        "description": (
+            "Agent stdout / tool output / kernel-emitted span carried a "
+            "line matching the canonical hashed-magic shape "
+            "(^@@?[a-f0-9]+:<name>) while hash mode was on. The line "
+            "is escaped (@ -> \\@) before it lands in cell outputs so "
+            "it's never dispatchable. The receiving cell is flagged "
+            "contaminated. K36 fires from BOTH the agent_supervisor "
+            "scan path (Layer-2 emission ban in §3.2) AND the "
+            "socket_writer outbound sanitizer (defense-in-depth in "
+            "§3.3)."
+        ),
+    },
+}
+
+
+def k_class_info(code: str) -> Optional[Dict[str, str]]:
+    """Look up a K-class registry entry. ``None`` for unknown codes."""
+    return K_CLASS_REGISTRY.get(code)

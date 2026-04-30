@@ -295,3 +295,27 @@ def test_k_class_constants_present() -> None:
     """K35 + K36 land as module-level string constants."""
     assert K35_PLAIN_MAGIC_IN_HASH_MODE == "K35"
     assert K36_HASHED_MAGIC_EMISSION_BLOCKED == "K36"
+
+
+def test_k_class_registry_has_k35_k36() -> None:
+    """The central K-class registry documents K35 + K36."""
+    from llm_kernel._rfc_schemas import K_CLASS_REGISTRY, k_class_info
+
+    assert "K35" in K_CLASS_REGISTRY
+    assert "K36" in K_CLASS_REGISTRY
+    k35 = k_class_info("K35")
+    k36 = k_class_info("K36")
+    assert k35 is not None and k35["name"] == "plain_magic_in_hash_mode"
+    assert k36 is not None and k36["name"] == "hashed_magic_emission_blocked"
+    # Unknown code returns None.
+    assert k_class_info("K99") is None
+
+
+def test_k_class_registry_includes_pre_s5_codes() -> None:
+    """Pre-S5.0.1 codes (K30/K31/K32/K34) are registered for audit completeness."""
+    from llm_kernel._rfc_schemas import K_CLASS_REGISTRY
+
+    for code in ("K30", "K31", "K32", "K34"):
+        assert code in K_CLASS_REGISTRY, f"missing {code} in registry"
+        entry = K_CLASS_REGISTRY[code]
+        assert "name" in entry and "fires_in" in entry and "description" in entry
