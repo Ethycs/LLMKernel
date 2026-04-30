@@ -166,24 +166,26 @@ def _run_paper_telephone_smoke() -> int:
 def _run_agent_supervisor_smoke() -> int:
     """Track B4 dispatch: spawn one Claude Code agent end-to-end.
 
-    Brings up the LiteLLM proxy on an ephemeral port, instantiates a
-    :class:`CustomMessageDispatcher` + :class:`RunTracker` +
-    :class:`AgentSupervisor`, then calls ``supervisor.spawn`` against
-    the configured ``ANTHROPIC_API_KEY``. Waits up to 60s for the
+    Boots the kernel via ``llm_client.boot.boot_minimal_kernel``, then
+    instantiates an :class:`AgentSupervisor` and calls ``supervisor.spawn``
+    against the configured ``ANTHROPIC_API_KEY``. Waits up to 60s for the
     agent process to finish; PASS if a ``notify`` and a
     ``report_completion`` are observed in the run-tracker.
 
     The argv this assembles is the RFC-002 v1.0.0 best-guess; deviations
     from real Claude Code CLI behavior land as RFC-002 v1.0.1 amendments
     once the operator runs the R2-prototype.
+
+    Refactored in S5.0.3b to consume ``llm_client.boot.boot_minimal_kernel``
+    instead of inlining the boot scaffolding.
     """
     import json
     import os
-    import tempfile
     import time
-    import uuid as _uuid
     from pathlib import Path
-    from unittest.mock import MagicMock
+
+    from llm_client.boot import boot_minimal_kernel
+    from .agent_supervisor import AgentSupervisor
 
     # Load secrets from a project-root .env if python-dotenv is available.
     # Walks up from CWD; first .env found wins. Safe no-op if missing.
@@ -193,12 +195,6 @@ def _run_agent_supervisor_smoke() -> int:
     except ImportError:
         pass
 
-    from . import litellm_proxy as _proxy
-    from . import anthropic_passthrough as _passthrough
-    from .agent_supervisor import AgentSupervisor
-    from .custom_messages import CustomMessageDispatcher
-    from .run_tracker import RunTracker
-
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "FAIL: ANTHROPIC_API_KEY missing from env "
@@ -207,52 +203,18 @@ def _run_agent_supervisor_smoke() -> int:
         )
         return 1
 
-    class _Sink:
-        def send(self, *args, **kwargs):  # noqa: D401, ANN001
-            pass
-
-    kernel = MagicMock()
-    kernel.session = _Sink()
-    kernel.iopub_socket = MagicMock()
-
-    class _CommMgr:
-        def register_target(self, n, cb): ...
-        def unregister_target(self, n, cb): ...
-
-    kernel.shell.comm_manager = _CommMgr()
-    kernel._parent_header = {}
-
     # Pick the proxy: LLMKERNEL_USE_PASSTHROUGH=1 selects the transparent
     # Anthropic passthrough at /v1/* (works under OAuth — model-resolution
     # preflights reach the real API). Default is the LiteLLM proxy
     # (only honors --bare/API-key auth flows).
     use_passthrough = os.environ.get("LLMKERNEL_USE_PASSTHROUGH") == "1"
-    dispatcher = CustomMessageDispatcher(MagicMock())  # placeholder
-    tracker = RunTracker(
-        trace_id=str(_uuid.uuid4()), sink=dispatcher,
-        agent_id="smoke", zone_id="smoke",
-    )
-    if use_passthrough:
-        from . import anthropic_passthrough as _pt
-        server = _pt.AnthropicPassthroughServer(
-            run_tracker=tracker, host="127.0.0.1", port=0,
-        )
-    else:
-        server = _proxy.LiteLLMProxyServer(
-            api_key=os.environ["ANTHROPIC_API_KEY"],
-            host="127.0.0.1", port=0,
-        )
-    server.start()
+    proxy_mode = "passthrough" if use_passthrough else "litellm"
+
+    conn = boot_minimal_kernel(proxy=proxy_mode)
+    server = conn._server      # internal: needed for base_url() + stop()
+    dispatcher = conn._dispatcher
+    tracker = conn._tracker
     try:
-        # Re-bind dispatcher to the real MagicMock kernel.
-        dispatcher = CustomMessageDispatcher(kernel)
-        tracker = RunTracker(
-            trace_id=str(_uuid.uuid4()), sink=dispatcher,
-            agent_id="smoke", zone_id="smoke",
-        )
-        # If we have a passthrough server, swap in the new tracker.
-        if use_passthrough:
-            server.run_tracker = tracker  # type: ignore[attr-defined]
         # Instantiate the supervisor directly. `attach_agent_supervisor`
         # uses ``getattr(kernel, ATTR, None)`` for idempotency, but the
         # MagicMock kernel above auto-creates attributes — which would
@@ -328,7 +290,7 @@ def _run_agent_supervisor_smoke() -> int:
         _dump_debug_artifacts(debug_root, "alpha")
         return 1
     finally:
-        server.stop()
+        conn.close()  # stops the proxy/passthrough server via KernelConnection
 
 
 def _dump_debug_artifacts(work_dir, agent_id: str) -> None:  # noqa: ANN001
