@@ -142,6 +142,12 @@ class ParsedCell:
     #: a successful parse to decide whether to surface a warning chip
     #: or a contamination flag.
     k_class_emissions: List[Dict[str, str]] = field(default_factory=list)
+    #: PLAN-S5.0.2 — True iff ``kind`` resolves to a registered magic
+    #: code generator (``@@template`` / ``@@expand`` / ``@@import``).
+    #: The dispatcher reads this to route to
+    #: :func:`llm_kernel.magic_generators.dispatch_generator` instead
+    #: of the regular cell-execution path.
+    is_generator: bool = False
 
 
 # --- Legacy-directive rewrite ----------------------------------------
@@ -509,4 +515,14 @@ def parse_cell(
         body_lines.append(line)
 
     cell.body = "\n".join(body_lines)
+    # PLAN-S5.0.2 — mark generator cells so the dispatcher can route
+    # to ``magic_generators.dispatch_generator`` instead of the regular
+    # cell execution path. We import lazily to avoid the registry
+    # bootstrap circular import.
+    try:
+        from .magic_registry import is_generator as _is_gen
+        if _is_gen(cell.kind):
+            cell.is_generator = True
+    except Exception:  # pragma: no cover - defensive
+        pass
     return cell

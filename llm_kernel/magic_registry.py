@@ -44,10 +44,12 @@ __all__ = (
     "LineMagicHandler",
     "CELL_MAGICS",
     "LINE_MAGICS",
+    "GENERATORS",
     "RESERVED_NAMES",
     "FLAG_SETTING_LINE_MAGICS",
     "K32_RESERVED_MAGIC_NAME",
     "K42_NOT_YET_IMPLEMENTED",
+    "is_generator",
     "is_reserved_name",
     "parse_kv_args",
 )
@@ -284,6 +286,14 @@ CELL_MAGICS: Dict[str, CellMagicHandler] = {
     "native": CellMagicHandler(
         name="native", kind="native", status="stub", pending_slice="V2+",
     ),
+    # PLAN-S5.0.2 — magic code generators. The cell-magic registry
+    # entry exists so the parser classifies ``@@template foo`` as a
+    # cell with ``kind=template`` (and friends); the dispatcher routes
+    # to ``magic_generators.dispatch_generator`` based on the
+    # ``GENERATORS`` mapping below.
+    "template": CellMagicHandler(name="template", kind="template"),
+    "expand": CellMagicHandler(name="expand", kind="expand"),
+    "import": CellMagicHandler(name="import", kind="import"),
 }
 
 
@@ -339,6 +349,59 @@ RESERVED_NAMES: FrozenSet[str] = frozenset(
 )
 
 
+# --- PLAN-S5.0.2 — magic code generator registry --------------------
+#
+# The ``GENERATORS`` mapping points each generator-magic name at its
+# handler in :mod:`llm_kernel.magic_generators`. Lazy-imported at
+# build time to keep this module's import graph minimal (and to avoid
+# a circular dep — the generator handlers import back into this
+# module's :data:`CELL_MAGICS` for parse-side classification).
+#
+# V1 ships the three built-ins exactly as listed in
+# [magic-code-generator atom](../docs/atoms/concepts/magic-code-generator.md).
+# V2+ operator-registered custom generators append to this dict via
+# the registration intent (deferred slice).
+
+
+def _build_generators() -> Dict[str, Any]:
+    from . import magic_generators
+
+    return {
+        "template": magic_generators._handle_template,
+        "expand": magic_generators._handle_expand,
+        "import": magic_generators._handle_import,
+    }
+
+
+# Populated lazily on first read via :func:`is_generator` /
+# :data:`GENERATORS` access; the build-time function is invoked when
+# the module finishes importing.
+GENERATORS: Dict[str, Any] = {}
+
+
+def _ensure_generators_loaded() -> None:
+    """Populate :data:`GENERATORS` on first access (lazy import)."""
+    global GENERATORS
+    if not GENERATORS:
+        GENERATORS = _build_generators()
+
+
+def is_generator(name: str) -> bool:
+    """Return True iff ``name`` resolves to a registered generator.
+
+    PLAN-S5.0.2 §4. The dispatcher (``magic_generators.dispatch_generator``)
+    consults this to route a parsed ``@@<name>`` cell. Used also by
+    ``cell_text.parse_cell`` to mark ``parsed.is_generator = True``
+    on classify (so the dispatcher can fast-path the routing decision)
+    and by ``agent_supervisor`` to upgrade a contamination K-tag from
+    K35 to K3H when the agent emitted a generator-magic-name line.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    _ensure_generators_loaded()
+    return name in GENERATORS
+
+
 def is_reserved_name(name: str) -> bool:
     """Check whether ``name`` is reserved as a magic identifier.
 
@@ -353,3 +416,18 @@ def is_reserved_name(name: str) -> bool:
     if name.startswith("llmnb_"):
         return True
     return False
+
+
+# Eager-load the generator registry at import time. We do this AFTER
+# this module has finished defining ``CELL_MAGICS`` / ``LINE_MAGICS``
+# so the import inside ``_build_generators`` (which pulls
+# :mod:`llm_kernel.magic_generators`, which itself imports back into
+# this module for classification) doesn't see a partially-built state.
+try:
+    _ensure_generators_loaded()
+except Exception:  # pragma: no cover - defensive
+    # If the generator module fails to import for any reason we keep
+    # ``GENERATORS`` empty; ``is_generator`` returns False and the
+    # parser falls through (the cell-magic registry entry still sets
+    # the kind so the cell round-trips).
+    pass
