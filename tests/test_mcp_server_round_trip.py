@@ -34,7 +34,7 @@ from llm_kernel.mcp_server import (
 #: 16-lowercase-hex regex (OTLP spanId).
 _SPAN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
-ServerHandler = Callable[[types.ClientRequestType], Awaitable[types.ServerResult]]
+ServerHandler = Callable[[types.ClientRequest], Awaitable[types.ServerResult]]
 
 
 @pytest.fixture

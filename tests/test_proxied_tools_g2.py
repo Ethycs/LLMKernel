@@ -30,7 +30,7 @@ from llm_kernel.mcp_server import (
 )
 
 
-ServerHandler = Callable[[types.ClientRequestType], Awaitable[types.ServerResult]]
+ServerHandler = Callable[[types.ClientRequest], Awaitable[types.ServerResult]]
 
 
 @pytest.fixture
