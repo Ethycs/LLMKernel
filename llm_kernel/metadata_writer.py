@@ -1444,6 +1444,135 @@ class MetadataWriter:
                 self._dirty = True
             return existed
 
+    # -- PLAN-S5.0.1b §3.6 — hash-mode config + contamination schema --
+
+    #: Config keys living at ``metadata.rts.config[key]`` (not under
+    #: ``recoverable``/``volatile``). Hash-mode settings are kernel-
+    #: scoped and round-trip through ``get_config_setting`` /
+    #: ``set_hash_mode``. The pin itself is NEVER stored in the
+    #: notebook — only the fingerprint (a one-way hash). See
+    #: :func:`llm_kernel.magic_hash.magic_pin_fingerprint`.
+    _HASH_MODE_CONFIG_KEYS: FrozenSet[str] = frozenset({
+        "magic_hash_enabled",
+        "magic_pin_fingerprint",
+    })
+
+    def get_config_setting(self, name: str) -> Any:
+        """Read a top-level ``metadata.rts.config[name]`` setting.
+
+        PLAN-S5.0.1b §3.6 — convenience accessor used by S5.0.1a's
+        contamination detector (``agent_supervisor._magic_hash_enabled``)
+        and the parser/dispatcher hash-mode plumbing in 5.0.1b. Returns
+        the stored value or ``None`` if absent. The reader is
+        forward-compatible: callers must coerce to bool / str as
+        appropriate.
+
+        Defaults: ``magic_hash_enabled`` defaults to ``False``;
+        ``magic_pin_fingerprint`` defaults to ``None``. All other keys
+        return ``None`` when unset.
+        """
+        if not isinstance(name, str) or not name:
+            return None
+        with self._lock:
+            if name == "magic_hash_enabled":
+                return bool(self._config.get("magic_hash_enabled", False))
+            if name == "magic_pin_fingerprint":
+                return self._config.get("magic_pin_fingerprint")
+            return self._config.get(name)
+
+    def set_hash_mode(
+        self, enabled: bool, fingerprint: Optional[str],
+    ) -> None:
+        """Atomically set the hash-mode pair under ``metadata.rts.config``.
+
+        PLAN-S5.0.1b §3.6 — used by ``@auth set`` / ``@auth rotate`` /
+        ``@auth off``. Both fields move together: enabling without a
+        fingerprint, or disabling while leaving a fingerprint, is a
+        contract violation by the caller (the auth handlers enforce
+        the invariant).
+
+        Idempotent: writing the same pair twice is a no-op apart from
+        the dirty flag (already-dirty stays dirty).
+        """
+        if not isinstance(enabled, bool):
+            raise TypeError(
+                f"enabled must be bool; got {type(enabled).__name__}"
+            )
+        if fingerprint is not None and not isinstance(fingerprint, str):
+            raise TypeError(
+                f"fingerprint must be str|None; got "
+                f"{type(fingerprint).__name__}"
+            )
+        with self._lock:
+            self._config["magic_hash_enabled"] = bool(enabled)
+            if fingerprint is None:
+                # Clear the fingerprint entirely when hash mode is off
+                # so a stale pin can't survive.
+                self._config.pop("magic_pin_fingerprint", None)
+            else:
+                self._config["magic_pin_fingerprint"] = fingerprint
+            self._dirty = True
+
+    def flag_cells_contaminated_by_agent(
+        self,
+        *,
+        agent_id: str,
+        line: str,
+        source: str,
+        layer: str,
+    ) -> List[str]:
+        """Mark every cell bound to ``agent_id`` as contaminated.
+
+        PLAN-S5.0.1b §3.6 — first-class realization of the duck-typed
+        method S5.0.1a's ``agent_supervisor._flag_contaminated``
+        already calls (it falls back to ``_diagnostics.mark`` when the
+        method is missing). This implementation:
+
+        * Walks ``self._cells`` for entries where
+          ``record["bound_agent_id"] == agent_id``.
+        * Sets ``record["contaminated"] = True``.
+        * Appends a ``{detected_at, line, reason, layer}`` entry to
+          ``record["contamination_log"]`` (append-only audit; the
+          caller passes a ``layer`` of ``"plain"`` /
+          ``"hashed_emission_ban"``).
+        * Returns the list of cell_ids that were flagged.
+
+        The line is truncated to 256 chars before storage (mirrors
+        ``agent_supervisor._flag_contaminated``'s own bound) so a
+        flooded contamination path can't unbounded-grow the notebook.
+
+        Cell-Manager precondition gates that *use* the contaminated
+        flag (K3E, K3F) are 5.0.1c scope; this slice only adds the
+        schema + writer method.
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            return []
+        truncated = line[:256] if isinstance(line, str) else ""
+        flagged: List[str] = []
+        ts = _utc_now_iso()
+        with self._lock:
+            for cell_id, record in self._cells.items():
+                if not isinstance(record, dict):
+                    continue
+                if record.get("bound_agent_id") != agent_id:
+                    continue
+                record["contaminated"] = True
+                log = record.get("contamination_log")
+                if not isinstance(log, list):
+                    log = []
+                log.append({
+                    "detected_at": ts,
+                    "line": truncated,
+                    "reason": f"agent_emit:{source}",
+                    "layer": layer,
+                })
+                record["contamination_log"] = log
+                self._cells[cell_id] = record
+                flagged.append(cell_id)
+            if flagged:
+                self._dirty = True
+        return flagged
+
     def cell_view(self, cell_id: str):
         """Return the parsed :class:`cell_text.ParsedCell` for ``cell_id``.
 

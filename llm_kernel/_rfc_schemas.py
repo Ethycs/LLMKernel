@@ -422,6 +422,26 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
             "@mark <kind> target is not a known cell-magic kind."
         ),
     },
+    # PLAN-S5.0.1b §3.5 — parser sees a hashed-magic-shaped line whose
+    # hash does NOT validate against the operator's pin (or whose
+    # ``<name>`` is not a registered magic). Treated as body, NOT
+    # dispatched. Distinguished from K35 (which fires on PLAIN
+    # ``@@<known>`` lines in hash mode) so the audit trail can tell
+    # operator typos (K35) apart from likely replay attempts /
+    # copy-paste from a different-pin notebook (K33).
+    "K33": {
+        "name": "magic_hash_mismatch",
+        "fires_in": "cell_text.parse_cell",
+        "description": (
+            "Hash mode is enabled and the parser saw a line shaped "
+            "like @@<hash>:<name> but the hash failed validation "
+            "against the operator's pin OR <name> was not in the "
+            "registered magic-name set. Treated as body, NOT "
+            "dispatched. Distinct from K35 (plain magic in hash "
+            "mode) so audit consumers can separate operator typos "
+            "from likely replay / cross-notebook paste attempts."
+        ),
+    },
     # PLAN-S5.0.1 §3.9 — slice 5.0.1a wires K35 + K36.
     "K35": {
         "name": "plain_magic_in_hash_mode",
