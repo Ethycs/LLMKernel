@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "First envelope on any connection. Negotiates wire version, declares the driver's capabilities, and (for TCP) carries bearer-token auth. See PLAN-S5.0.3 \u00a74.3 and docs/atoms/protocols/wire-handshake.md.",
+  "properties": {
+    "payload": {
+      "additionalProperties": true,
+      "properties": {
+        "auth": {
+          "additionalProperties": true,
+          "properties": {
+            "scheme": {
+              "const": "bearer",
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scheme",
+            "token"
+          ],
+          "type": "object"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "client_name": {
+          "type": "string"
+        },
+        "client_version": {
+          "type": "string"
+        },
+        "transport": {
+          "enum": [
+            "pty",
+            "unix",
+            "tcp"
+          ],
+          "type": "string"
+        },
+        "wire_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "client_name",
+        "client_version",
+        "wire_version",
+        "transport"
+      ],
+      "type": "object"
+    },
+    "type": {
+      "const": "kernel.handshake",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "payload"
+  ],
+  "title": "kernel.handshake (driver -> kernel)",
+  "type": "object",
+  "wire_version": "1.0.0"
+}

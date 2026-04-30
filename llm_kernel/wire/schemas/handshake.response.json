@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Kernel response to a driver handshake. On success: kernel_version + session_id + accepted_capabilities. On failure: ``error`` set; transport closes after this frame. See docs/atoms/protocols/wire-handshake.md.",
+  "properties": {
+    "payload": {
+      "additionalProperties": true,
+      "properties": {
+        "accepted_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "error": {
+          "description": "One of: version_mismatch_major | auth_failed | kernel_busy | wire-failure",
+          "type": "string"
+        },
+        "kernel_version": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wire_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "wire_version"
+      ],
+      "type": "object"
+    },
+    "type": {
+      "const": "kernel.handshake",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "payload"
+  ],
+  "title": "kernel.handshake (kernel -> driver)",
+  "type": "object",
+  "wire_version": "1.0.0"
+}
