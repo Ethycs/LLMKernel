@@ -46,6 +46,7 @@ __all__ = (
     "K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED",
     "K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED",
     "K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH",
+    "K3J_GENERATOR_PROVENANCE_MISSING",
 )
 
 
@@ -56,6 +57,7 @@ K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED: str = "K3C"
 K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED: str = "K3D"
 K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED: str = "K3E"
 K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH: str = "K3F"
+K3J_GENERATOR_PROVENANCE_MISSING: str = "K3J"
 
 
 # In-process active-run state set: agent states that count as "the
@@ -587,6 +589,127 @@ class CellManager:
             except Exception:  # pragma: no cover - diagnostics best-effort
                 pass
         self._writer.set_cell_text(cell_id, text)
+
+    def insert_cells_with_provenance(
+        self,
+        after_cell_id: str,
+        magic_texts: List[str],
+        generated_by: str,
+        generated_at: str,
+    ) -> List[str]:
+        """Insert each fragment as a new cell after ``after_cell_id``.
+
+        PLAN-S5.0.2 §3 / §4. The dispatcher's structural-write path:
+
+        * Each fragment is parsed via :func:`cell_text.parse_cell` to
+          validate syntax BEFORE any cell is created (atomic — a bad
+          fragment raises K30 and inserts nothing).
+        * New cell_ids are minted (``c_gen_<timestamp>_<idx>``); ids
+          are appended in insertion order to the layout tree's root
+          ``children`` so the cells appear after the generator cell.
+        * Each new cell record carries ``generated_by`` and
+          ``generated_at`` per PLAN §6.
+
+        Respects the S5.0.1c precondition gates: if ``after_cell_id``
+        is running OR contaminated, raises K3C / K3E. Each generated
+        cell is fresh — it inherits no flags or bound agent.
+
+        ``generated_by`` MUST be the cell_id of the generator cell.
+        ``None`` / empty raises K3J (defense-in-depth — happy-path
+        callers always set it).
+        """
+        if not isinstance(generated_by, str) or not generated_by:
+            raise CellManagerPreconditionError(
+                K3J_GENERATOR_PROVENANCE_MISSING,
+                "insert_cells_with_provenance: generated_by required",
+                cell_id=after_cell_id,
+            )
+        if not isinstance(generated_at, str) or not generated_at:
+            raise CellManagerPreconditionError(
+                K3J_GENERATOR_PROVENANCE_MISSING,
+                "insert_cells_with_provenance: generated_at required",
+                cell_id=after_cell_id,
+            )
+        # Precondition gates on the generator cell itself.
+        self._check_structural_op_preconditions(
+            after_cell_id, "insert_generated_cells",
+        )
+        if not isinstance(magic_texts, list):
+            raise ValueError(
+                "insert_cells_with_provenance: magic_texts must be a list"
+            )
+        # Pre-flight: parse every fragment FIRST so a bad fragment in
+        # the middle of the list rejects the entire invocation
+        # atomically. We use the legacy/permissive parse — generator
+        # output emits canonical magic, the hash-mode validation is the
+        # dispatcher's _validate_fragment_hashes step.
+        from .cell_text import CellParseError
+        for idx, frag in enumerate(magic_texts):
+            if not isinstance(frag, str) or not frag.strip():
+                # Empty fragments wouldn't survive the splitter; treat
+                # as K30 input invalid for symmetry with the handler
+                # error class.
+                from .cell_text import K30_MULTIPLE_KINDS
+                raise CellParseError(
+                    K30_MULTIPLE_KINDS,
+                    f"insert_cells_with_provenance: fragment {idx} empty",
+                )
+            # Parse for syntax check. Use the permissive (non-hash-mode)
+            # parser — handler output is canonical text; hash-mode
+            # validation is the dispatcher's separate sweep.
+            parse_cell(frag)
+        # Atomic insert. Mint fresh cell ids; minting is local to this
+        # call so two concurrent generator dispatches don't collide.
+        import time
+
+        ts_token = format(int(time.time() * 1_000_000), "x")
+        new_ids: List[str] = []
+        for idx, frag in enumerate(magic_texts):
+            new_id = f"c_gen_{ts_token}_{idx}"
+            # Defensive: avoid collision with an existing cell id (the
+            # writer's record dict is the source of truth).
+            existing_records = getattr(self._writer, "_cells", {})
+            n = 0
+            while new_id in existing_records:
+                n += 1
+                new_id = f"c_gen_{ts_token}_{idx}_{n}"
+            self._writer.insert_generated_cell(
+                new_id,
+                frag,
+                after_cell_id=after_cell_id,
+                generated_by=generated_by,
+                generated_at=generated_at,
+            )
+            new_ids.append(new_id)
+        # Update layout tree to position new cells after the generator
+        # cell. The notebook substrate uses ``layout.tree.children`` as
+        # the root list; a generator cell may live deeper in the tree
+        # but for V1 we simply append to the root children — the
+        # extension's serializer relies on cells[<id>] order rather
+        # than nested-tree position for cell-magic notebooks.
+        self._append_to_layout_root(new_ids)
+        return new_ids
+
+    def _append_to_layout_root(self, cell_ids: List[str]) -> None:
+        """Append cell_ids as children of the layout tree's root.
+
+        Best-effort: when the writer doesn't expose layout-tree
+        mutation, this is a no-op (the cells still exist in
+        ``cells[<id>]``; renderers without layout-walk fall through to
+        dict-insertion order).
+        """
+        layout = getattr(self._writer, "_layout", None)
+        if not isinstance(layout, dict):
+            return
+        tree = layout.get("tree")
+        if not isinstance(tree, dict):
+            return
+        children = tree.get("children")
+        if not isinstance(children, list):
+            children = []
+            tree["children"] = children
+        for cid in cell_ids:
+            children.append({"id": cid, "type": "cell"})
 
     def view(self, cell_id: str) -> Optional[object]:
         """Return the parsed view for ``cell_id`` (or None if absent)."""
