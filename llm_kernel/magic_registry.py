@@ -317,10 +317,10 @@ LINE_MAGICS: Dict[str, LineMagicHandler] = {
     # apply (no flag mutation) — the side effect is operator-typed
     # and runs through the runtime dispatch surface.
     "auth": LineMagicHandler(name="auth"),
-    # S5 stubs — register so the name reserves; apply is a no-op.
-    "revert": LineMagicHandler(
-        name="revert", status="stub", pending_slice="S5",
-    ),
+    # S5b — @revert active: apply records to cell.line_magics; the kernel
+    # routing layer ships an operator.action envelope {action_type:
+    # "agent_revert", parameters: {agent_id, target_turn_id, cell_id}}.
+    "revert": LineMagicHandler(name="revert"),
     "stop": LineMagicHandler(
         name="stop", status="stub", pending_slice="S5",
     ),

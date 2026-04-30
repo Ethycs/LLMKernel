@@ -897,6 +897,159 @@ class AgentSupervisor:
         )
         return {"agent_id": agent_id, "status": "interrupted"}
 
+    # ------------------------------------------------------------------
+    # PLAN-S5b: revert operation
+    # ------------------------------------------------------------------
+
+    #: K-class for revert target not in agent ancestry (BSP-002 §7).
+    K22_INVALID_REVERT_TARGET: str = "K22"
+
+    def revert(self, agent_id: str, target_turn_id: str) -> None:
+        """Move ``agent_id``'s HEAD backward to ``target_turn_id``.
+
+        PLAN-S5b / `revert-agent.md`:
+
+        1. Validate agent exists (K20 if not).
+        2. Validate ``target_turn_id`` is in the agent's ancestry by
+           walking ``parent_id`` from the current head through
+           ``self._turns`` (K22 if not found).
+        3. SIGTERM the live process if ``runtime_status == "alive"``
+           (i.e. the process has not yet exited).  Watchdog handles
+           cleanup; exit code 0 treated as expected.
+        4. Submit ``move_agent_head`` intent to writer:
+           ``agent.head_turn_id = target_turn_id``,
+           ``agent.last_seen_turn_id = target_turn_id``.
+           ``move_agent_head`` is in ``_PENDING_SLICE``; the writer
+           raises ``ValueError`` for it, so we log a no-op diagnostic
+           (same pattern as S4's ``update_agent_session`` best-effort
+           path) — the in-memory state is still updated.
+        5. Submit ``record_event`` intent with ``kind: "agent_ref_move"``,
+           ``reason: "operator_revert"``.
+        6. Mint a fresh ``claude_session_id`` for next continue; the old
+           one stays attached to historical turns.
+
+        Args:
+            agent_id: The agent whose HEAD to move.
+            target_turn_id: The turn to revert to; MUST be in the
+                agent's ancestry (reachable via ``parent_id`` walk).
+
+        Raises:
+            RuntimeError: K20 if the agent is unknown; K22 if
+                ``target_turn_id`` is not in the agent's ancestry.
+        """
+        from . import _diagnostics
+
+        with self._lock:
+            handle = self._agents.get(agent_id)
+            if handle is None:
+                raise RuntimeError(
+                    f"K20: agent {agent_id!r} not found in supervisor. "
+                    "Spawn or respawn the agent before calling revert."
+                )
+
+            # --- ancestry walk -----------------------------------------
+            # Walk parent_id from the agent's last-known head turn back
+            # through self._turns looking for target_turn_id.  The
+            # supervisor's ``_head_turn_id`` is the notebook head (all
+            # agents); the agent's own head is the most recent turn
+            # recorded for it.  We use the notebook head as the starting
+            # point since the turn chain is global and the agent's turns
+            # are embedded in it.
+            current_head = self._head_turn_id
+            found = False
+            visited: set = set()
+            cursor = current_head
+            depth = 0
+            while cursor is not None and depth < self._HANDOFF_MAX_DEPTH:
+                if cursor in visited:
+                    break  # cycle guard
+                visited.add(cursor)
+                if cursor == target_turn_id:
+                    found = True
+                    break
+                turn_rec = self._turns.get(cursor)
+                if turn_rec is None:
+                    break
+                cursor = turn_rec.get("parent_id")
+                depth += 1
+
+            if not found:
+                raise RuntimeError(
+                    f"{self.K22_INVALID_REVERT_TARGET}: "
+                    f"turn {target_turn_id!r} is not in agent "
+                    f"{agent_id!r}'s ancestry.  Use @branch to reach a "
+                    "turn outside this agent's lineage."
+                )
+
+            prior_head = self._head_turn_id
+
+            # --- SIGTERM live process -----------------------------------
+            if handle.popen.poll() is None:
+                try:
+                    handle.popen.terminate()
+                except (OSError, ProcessLookupError):  # pragma: no cover
+                    pass
+                _diagnostics.mark(
+                    "revert_sigterm_sent",
+                    agent_id=agent_id, target_turn_id=target_turn_id,
+                )
+
+            # --- in-memory head update ---------------------------------
+            handle.last_seen_turn_id = target_turn_id
+            self._head_turn_id = target_turn_id
+
+            # --- mint fresh claude_session_id for next continue --------
+            handle.claude_session_id = str(uuid.uuid4())
+
+        # --- writer intents (outside lock; best-effort) ----------------
+        if self._metadata_writer is not None:
+            # move_agent_head is _PENDING_SLICE in the writer; it raises
+            # ValueError.  Log as no-op; in-memory state was already
+            # updated above.
+            try:
+                self._metadata_writer.submit_intent({
+                    "intent_kind": "move_agent_head",
+                    "parameters": {
+                        "agent_id": agent_id,
+                        "head_turn_id": target_turn_id,
+                        "last_seen_turn_id": target_turn_id,
+                    },
+                })
+            except Exception:
+                _diagnostics.mark(
+                    "revert_move_agent_head_pending_slice",
+                    agent_id=agent_id, target_turn_id=target_turn_id,
+                )
+
+            # agent_ref_move event log — BSP-002 §8.5.  The MetadataWriter
+            # does not yet have a first-class agent_ref_move handler (the
+            # BSP-002 turn-graph slice is _PENDING_SLICE).  We attempt the
+            # submit and log a diagnostic if the writer rejects it, so the
+            # intent is recorded in the writer's intent_log regardless of
+            # whether a handler fires.
+            try:
+                self._metadata_writer.submit_intent({
+                    "intent_kind": "agent_ref_move",
+                    "parameters": {
+                        "kind": "agent_ref_move",
+                        "reason": "operator_revert",
+                        "agent_id": agent_id,
+                        "from_turn_id": prior_head,
+                        "to_turn_id": target_turn_id,
+                    },
+                })
+            except Exception:
+                _diagnostics.mark(
+                    "revert_agent_ref_move_pending_slice",
+                    agent_id=agent_id,
+                )
+
+        _diagnostics.mark(
+            "revert_complete",
+            agent_id=agent_id,
+            target_turn_id=target_turn_id,
+        )
+
     def terminate_all(self, grace_seconds: float = 10.0) -> None:
         """Graceful shutdown of every active agent (RFC-002 §6)."""
         with self._lock:

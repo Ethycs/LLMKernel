@@ -765,3 +765,85 @@ def test_send_user_turn_strips_hashes_in_handoff_prefix(tmp_path: Path) -> None:
     assert "hashed_body" not in prefix_content  # not the variable name
     fake_alpha.terminate()
     fake_beta.terminate()
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S5b: AgentSupervisor.revert tests
+# ---------------------------------------------------------------------------
+
+
+def test_revert_validates_agent_exists_raises_k20(tmp_path: Path) -> None:
+    """revert() raises K20 RuntimeError when agent_id is unknown."""
+    sup = _make_supervisor()
+    with pytest.raises(RuntimeError, match="K20"):
+        sup.revert("nonexistent", "t_1")
+
+
+def test_revert_validates_target_in_ancestry_raises_k22(tmp_path: Path) -> None:
+    """revert() raises K22 RuntimeError when target_turn_id is not in ancestry."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # Record a turn so there is a head, but target "t_orphan" is not in it.
+    sup.record_turn("t_1", "alpha", "assistant", "first turn", parent_id=None)
+    with pytest.raises(RuntimeError, match="K22"):
+        sup.revert("alpha", "t_orphan")
+    handle.terminate()
+
+
+def test_revert_sigterms_live_process(tmp_path: Path) -> None:
+    """revert() calls terminate() on a live process (popen.poll() is None)."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    # Process is alive (returncode is None).
+    assert fake.returncode is None
+    sup.revert("alpha", "t_1")
+    # After SIGTERM the fake popen should have its terminate() called;
+    # FakePopen.terminate sets returncode != None.
+    assert fake.returncode is not None
+    handle.terminate()
+
+
+def test_revert_resets_last_seen_to_target(tmp_path: Path) -> None:
+    """revert() updates handle.last_seen_turn_id to target_turn_id."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    sup.record_turn("t_2", "alpha", "assistant", "turn two", parent_id="t_1")
+    # After two turns head is t_2; revert to t_1.
+    sup.revert("alpha", "t_1")
+    assert handle.last_seen_turn_id == "t_1"
+    assert sup._head_turn_id == "t_1"
+    handle.terminate()
+
+
+def test_revert_emits_agent_ref_move_event(tmp_path: Path) -> None:
+    """revert() submits move_agent_head + agent_ref_move intents to the writer."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    mock_writer = MagicMock()
+    # Both intents are best-effort; allow them to succeed or fail.
+    mock_writer.submit_intent = MagicMock(return_value={"ok": True})
+    sup.set_metadata_writer(mock_writer)
+
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    sup.revert("alpha", "t_1")
+
+    # submit_intent should have been called twice: move_agent_head + agent_ref_move.
+    assert mock_writer.submit_intent.call_count == 2
+    calls = [c[0][0] for c in mock_writer.submit_intent.call_args_list]
+    kinds = [c["intent_kind"] for c in calls]
+    assert "move_agent_head" in kinds
+    assert "agent_ref_move" in kinds
+    # Confirm agent_ref_move carries the right payload.
+    ref_move = next(c for c in calls if c["intent_kind"] == "agent_ref_move")
+    assert ref_move["parameters"]["reason"] == "operator_revert"
+    assert ref_move["parameters"]["to_turn_id"] == "t_1"
+    handle.terminate()
+
+
+def test_revert_mints_new_claude_session_id_for_next_continue(tmp_path: Path) -> None:
+    """revert() replaces claude_session_id on the handle so next continue uses a fresh session."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    original_session_id = handle.claude_session_id
+    sup.revert("alpha", "t_1")
+    assert handle.claude_session_id != original_session_id
+    assert handle.claude_session_id  # non-empty UUID
+    handle.terminate()

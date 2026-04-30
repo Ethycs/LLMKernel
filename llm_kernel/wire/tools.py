@@ -428,6 +428,20 @@ def validate_tool_output(tool_name: str, result: Dict[str, Any]) -> Optional[str
 # meaning before it appears in a marker.
 
 K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
+    # S5b -- revert-agent.
+    "K22": {
+        "name": "cell_directive_invalid_revert_target",
+        "fires_in": "agent_supervisor.revert",
+        "description": (
+            "The ``target_turn_id`` supplied to ``AgentSupervisor.revert`` "
+            "is not reachable by walking ``parent_id`` from the agent's "
+            "current ``head_turn_id``.  The target may belong to a different "
+            "lineage; the operator should use ``@branch`` instead of "
+            "``@revert`` to reach a turn outside the agent's ancestry.  "
+            "Also fired by ``fork`` (Case B) when the branch target is not "
+            "in the source agent's ancestry."
+        ),
+    },
     # S4 -- cross-agent context handoff.
     "K26": {
         "name": "cross_agent_handoff_failed",
@@ -637,6 +651,7 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
 }
 
 # Convenience constants for K-class codes (avoids magic strings at call sites).
+K22_INVALID_REVERT_TARGET: str = "K22"
 K26_CROSS_AGENT_HANDOFF_FAILED: str = "K26"
 K30_MULTIPLE_KINDS: str = "K30"
 K31_UNKNOWN_CELL_MAGIC: str = "K31"
@@ -686,6 +701,7 @@ __all__ = [
     "K_CLASS_REGISTRY",
     "k_class_info",
     # K-code string constants
+    "K22_INVALID_REVERT_TARGET",
     "K26_CROSS_AGENT_HANDOFF_FAILED",
     "K30_MULTIPLE_KINDS",
     "K31_UNKNOWN_CELL_MAGIC",

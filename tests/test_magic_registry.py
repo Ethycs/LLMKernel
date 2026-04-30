@@ -130,3 +130,19 @@ def test_mark_line_magic_unknown_kind_raises_k34() -> None:
     with pytest.raises(CellParseError) as ei:
         parse_cell("@@agent alpha\n@mark xyzzy\nbody")
     assert ei.value.code == K34_INCOMPATIBLE_KIND_CHANGE
+
+
+# --- S5b: @revert line-magic is active -----------------------------------
+
+
+def test_revert_line_magic_dispatches_agent_revert_envelope() -> None:
+    """``@revert alpha to t_2`` is active: recorded to cell.line_magics."""
+    # @revert is now active (not stub); parse_cell on a cell containing
+    # @revert should record ("revert", "alpha to t_2") in cell.line_magics
+    # so the kernel routing layer can ship an agent_revert envelope.
+    cell = parse_cell("@@agent alpha\n@revert alpha to t_2\nbody text")
+    assert ("revert", "alpha to t_2") in cell.line_magics, cell.line_magics
+    # Confirm status is active (no _pending flag injected by the handler).
+    # The handler does not set _pending when status == "active".
+    assert MR.LINE_MAGICS["revert"].status == "active"
+    assert not getattr(MR.LINE_MAGICS["revert"], "pending_slice", None)
