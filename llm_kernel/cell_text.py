@@ -298,7 +298,18 @@ def parse_cell(
         FLAG_SETTING_LINE_MAGICS,
     )
 
-    rewritten, was_legacy = rewrite_legacy_directives(text)
+    # Hash-mode prelude (must come BEFORE legacy rewrite — the legacy
+    # @<id>:<msg> rewrite would otherwise mangle a hashed-magic line
+    # whose shape ``@@<hex>:<name> ...`` accidentally matches the
+    # legacy pattern). When hash mode is on we skip the legacy
+    # rewrite entirely; legacy directives predate hash mode and a
+    # hash-mode notebook is canonical-only.
+    ctx_probe = parser_context
+    _hash_on_probe = bool(ctx_probe is not None and ctx_probe.hash_mode_on)
+    if _hash_on_probe:
+        rewritten, was_legacy = text, False
+    else:
+        rewritten, was_legacy = rewrite_legacy_directives(text)
     cell = ParsedCell()
     cell.legacy_alias_used = was_legacy
 
