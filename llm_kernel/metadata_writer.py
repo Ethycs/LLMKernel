@@ -1573,6 +1573,152 @@ class MetadataWriter:
                 self._dirty = True
         return flagged
 
+    # -- PLAN-S5.0.1c §3.10 — contamination flag query / clear ---------
+
+    #: Verbatim acceptance string format (PLAN-S5.0.1c §3.11). The
+    #: prefix is FIXED — every operator opening the notebook in any
+    #: text editor sees the same plain-English statement. The
+    #: validator below rejects any other shape so a proxied write
+    #: cannot smuggle arbitrary text into this slot.
+    _INJECTION_ACCEPTANCE_PREFIX: str = (
+        "The Operator Has Accepted Arbitrary Code Injection at "
+    )
+
+    def is_cell_contaminated(self, cell_id: str) -> bool:
+        """Return True iff ``cells[cell_id].contaminated == True``.
+
+        PLAN-S5.0.1c §3.10 helper consumed by ``CellManager``'s
+        precondition gates. Read-only, lock-protected, returns False
+        for unknown cell ids (callers don't need to check first).
+        """
+        if not isinstance(cell_id, str) or not cell_id:
+            return False
+        with self._lock:
+            record = self._cells.get(cell_id)
+            if not isinstance(record, dict):
+                return False
+            return bool(record.get("contaminated", False))
+
+    def reset_cell_contamination(self, cell_id: str) -> bool:
+        """Clear ``cells[cell_id].contaminated`` + ``contamination_log``.
+
+        PLAN-S5.0.1c §3.10. Operator-click entry point exposed via
+        ``CellManager.reset_contamination``; this is the writer-side
+        implementation. Returns True iff a flag was actually flipped
+        from True to False (idempotent on already-clean cells:
+        returns False, no mutation, no dirty-flag flip).
+
+        AMBIGUITY-FLAG: PLAN §3.10 says the operator click "resets"
+        the flag but does not specify log retention. We chose **full
+        clear** (delete the ``contamination_log`` list) so a fresh
+        contamination event after reset starts from empty — operator
+        intent on click is "this cell is clean now, treat it as such".
+        Audit history of the original detection lives in the kernel
+        diagnostics marker stream (``_diagnostics.mark`` calls in
+        ``agent_supervisor._flag_contaminated``), not in the per-cell
+        log.
+        """
+        if not isinstance(cell_id, str) or not cell_id:
+            return False
+        with self._lock:
+            record = self._cells.get(cell_id)
+            if not isinstance(record, dict):
+                return False
+            if not record.get("contaminated"):
+                return False
+            record["contaminated"] = False
+            record.pop("contamination_log", None)
+            self._cells[cell_id] = record
+            self._dirty = True
+            return True
+
+    # -- PLAN-S5.0.1c §3.11 — verbatim injection-acceptance flag -------
+
+    def get_injection_acceptance(self) -> Optional[str]:
+        """Return the ``injection_acceptance`` string or None.
+
+        PLAN-S5.0.1c §3.11. Read-only accessor. Returns the verbatim
+        string previously written by :meth:`accept_injection_risk`,
+        or ``None`` when the operator has never accepted.
+        """
+        with self._lock:
+            value = self._config.get("injection_acceptance")
+        if isinstance(value, str) and value.startswith(
+            self._INJECTION_ACCEPTANCE_PREFIX
+        ):
+            return value
+        return None
+
+    def accept_injection_risk(self) -> str:
+        """Persist the verbatim operator-acceptance string. Returns it.
+
+        PLAN-S5.0.1c §3.11. Writes the literal phrase
+
+            ``"The Operator Has Accepted Arbitrary Code Injection at <ISO8601>"``
+
+        to ``metadata.rts.config.injection_acceptance``. The verbatim
+        format is FIXED — the validator below rejects any other shape
+        so a proxied write attempting to smuggle arbitrary text fails.
+
+        **Idempotent on first set**: if the field is already populated
+        with a valid verbatim string, this method is a NO-OP and
+        returns the EXISTING string (preserving the original "accepted
+        at" timestamp). The caller-side K3G emit should also be
+        skipped on the no-op branch — callers can compare the returned
+        string against a pre-call ``get_injection_acceptance()`` to
+        detect the first-set case.
+        """
+        with self._lock:
+            existing = self._config.get("injection_acceptance")
+            if isinstance(existing, str) and existing.startswith(
+                self._INJECTION_ACCEPTANCE_PREFIX
+            ):
+                # Idempotent: return the original record verbatim.
+                return existing
+            new_value = (
+                f"{self._INJECTION_ACCEPTANCE_PREFIX}{_utc_now_iso()}"
+            )
+            # Validator: ensure the constructed string round-trips
+            # through our own verifier (defense against a future
+            # refactor that breaks the format invariant).
+            if not self._validate_injection_acceptance(new_value):
+                raise RuntimeError(
+                    "accept_injection_risk: constructed string failed "
+                    "format validator (kernel bug, not operator input)"
+                )
+            self._config["injection_acceptance"] = new_value
+            self._dirty = True
+            return new_value
+
+    @classmethod
+    def _validate_injection_acceptance(cls, value: Any) -> bool:
+        """Return True iff ``value`` is a valid verbatim acceptance string.
+
+        PLAN-S5.0.1c §3.11. Format: the literal prefix
+        ``"The Operator Has Accepted Arbitrary Code Injection at "``
+        followed by an ISO-8601 timestamp. Rejects ``None``, empty
+        strings, and any other prose — the wording is intentionally
+        un-localizable so operator searches across a corpus surface a
+        single canonical phrase.
+        """
+        if not isinstance(value, str):
+            return False
+        if not value.startswith(cls._INJECTION_ACCEPTANCE_PREFIX):
+            return False
+        ts_part = value[len(cls._INJECTION_ACCEPTANCE_PREFIX):]
+        if not ts_part:
+            return False
+        # Sanity-check the timestamp parses as ISO-8601.
+        try:
+            from datetime import datetime
+            # Trim trailing 'Z' (datetime.fromisoformat doesn't accept
+            # it on Python < 3.11) for portability.
+            normalized = ts_part[:-1] if ts_part.endswith("Z") else ts_part
+            datetime.fromisoformat(normalized)
+        except (ValueError, ImportError):
+            return False
+        return True
+
     def cell_view(self, cell_id: str):
         """Return the parsed :class:`cell_text.ParsedCell` for ``cell_id``.
 
