@@ -21,6 +21,11 @@ Subcommand dispatch (additive across Stage 2 tracks):
     ``python -m llm_kernel pty-mode-smoke``           -> RFC-008 end-to-end smoke against a
                                                          UDS server in the same process.
                                                          No node-pty required.
+    ``python -m llm_kernel serve --transport tcp ...`` -> PLAN-S5.0.3d TCP transport with
+                                                         bearer-token auth + handshake
+                                                         envelope. Default bind
+                                                         127.0.0.1:7474; token from
+                                                         ``LLMNB_AUTH_TOKEN`` env var.
 
 The historical top-level imports below are wrapped in a try/except so that
 the subcommands can still be dispatched in a kernel environment that does
@@ -662,6 +667,13 @@ if __name__ == '__main__':
         sys.exit(_run_agent_supervisor_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "metadata-writer-smoke":
         sys.exit(_run_metadata_writer_smoke())
+    elif len(sys.argv) > 1 and sys.argv[1] == "serve":
+        # PLAN-S5.0.3d: TCP transport + bearer-token auth + handshake
+        # envelope. Default bind 127.0.0.1; token is read from
+        # ``--auth-token-env`` (default LLMNB_AUTH_TOKEN). See
+        # ``llm_kernel.serve_mode.main`` for full security surface.
+        from .serve_mode import main as _serve_main
+        sys.exit(_serve_main(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode":
         # Legacy synchronous dispatch — the known-good V1 path. BSP-004
         # was attempted twice (V1: read loop in executor pool, regressed

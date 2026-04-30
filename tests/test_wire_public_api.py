@@ -124,13 +124,17 @@ def test_all_schema_files_parseable() -> None:
 def test_schema_file_count() -> None:
     """wire/schemas/ has the expected number of files.
 
-    13 tools * 2 (input + output) + 5 families = 31 JSON files.
+    13 tools * 2 (input + output) + 5 families + 2 handshake (request +
+    response, S5.0.3d) = 33 JSON files.
     """
     schemas_dir = _schemas_dir()
     json_files = list(schemas_dir.glob("*.json"))
     expected_tool_count = 13  # per RFC-001 / TOOL_CATALOG
     expected_family_count = 5  # A, B, C, F, G
-    expected_total = expected_tool_count * 2 + expected_family_count
+    expected_handshake_count = 2  # handshake.request, handshake.response (S5.0.3d)
+    expected_total = (
+        expected_tool_count * 2 + expected_family_count + expected_handshake_count
+    )
     assert len(json_files) == expected_total, (
         f"Expected {expected_total} schema files, found {len(json_files)}: "
         f"{sorted(f.name for f in json_files)}"
@@ -145,6 +149,17 @@ def test_tool_schema_names_match_catalog() -> None:
         for kind in ("input", "output"):
             fname = schemas_dir / f"tool.{tool_name}.{kind}.json"
             assert fname.exists(), f"Missing schema file: {fname.name}"
+
+
+def test_handshake_schema_files_exist() -> None:
+    """Handshake request + response schema files exist (S5.0.3d)."""
+    schemas_dir = _schemas_dir()
+    for kind in ("request", "response"):
+        fname = schemas_dir / f"handshake.{kind}.json"
+        assert fname.exists(), f"Missing schema file: {fname.name}"
+        # Ensure it's a real JSON Schema with the kernel.handshake type const.
+        data = json.loads(fname.read_text(encoding="utf-8"))
+        assert data["properties"]["type"]["const"] == "kernel.handshake"
 
 
 def test_family_schema_files_exist() -> None:
