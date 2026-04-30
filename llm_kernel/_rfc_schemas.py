@@ -1,590 +1,68 @@
-"""RFC-001 v1.0.0 tool input/output JSON Schemas.
+"""Deprecated: prefer ``llm_kernel.wire``.
 
-JSON Schemas (Draft 2020-12) for the thirteen RFC-001 tools — ten native
-operator-interaction primitives and three proxied system tools — extracted
-verbatim from ``docs/rfcs/RFC-001-mcp-tool-taxonomy.md``. The MCP server
-in :mod:`llm_kernel.mcp_server` registers these as the ``inputSchema`` /
-``outputSchema`` for each tool.
+Aliases retained for in-repo back-compat (S5.0.3a).  Every existing
+import of this module continues to work unchanged.  New code MUST use
+``llm_kernel.wire.tools`` directly.
 
-Per RFC-001 common conventions, every schema sets
-``$schema = "https://json-schema.org/draft/2020-12/schema"``,
-``additionalProperties = False``, and includes the optional
-``_rfc_version`` field defaulting to ``"1.0.0"``. Section anchors below
-(``# RFC-001 §...``) point at the headings in the RFC where each schema
-was lifted from.
+Ship note: promoted to public API in S5.0.3a — see
+``llm_kernel/wire/`` package.  Commit pin: <TBD-after-commit>.
 """
 
 from __future__ import annotations
 
-import copy
-from typing import Any, Dict, Optional, Tuple
-
-JSONSchema = Dict[str, Any]
-
-_DRAFT: str = "https://json-schema.org/draft/2020-12/schema"
-_VER: Dict[str, Any] = {"type": "string", "default": "1.0.0"}
-_RID: Dict[str, str] = {"type": "string", "format": "uuid"}
-_VS: Dict[str, str] = {"type": "string"}
-
-
-def _obj(required: list, props: Dict[str, Any]) -> JSONSchema:
-    """Return a Draft-2020-12 object schema with strict additionalProperties."""
-    return {"$schema": _DRAFT, "type": "object", "required": required,
-            "additionalProperties": False, "properties": props}
-
-
-# Shared output shape — RFC-001 reuses the acknowledged/run_id pair across
-# report_progress, report_completion, report_problem, and notify.
-_ACK: JSONSchema = _obj(["acknowledged", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "acknowledged": {"type": "boolean", "const": True}})
-
-
-def _ack() -> JSONSchema:
-    """Fresh copy of the shared acknowledged/run_id output schema."""
-    return copy.deepcopy(_ACK)
-
-
-# ---- Native tools --------------------------------------------------------
-
-# RFC-001 §ask
-ASK_INPUT: JSONSchema = _obj(["question"], {
-    "_rfc_version": _VER,
-    "question": {"type": "string", "minLength": 1},
-    "context": _VS,
-    "options": _obj([], {
-        "timeout_ms": {"type": "integer", "minimum": 0, "default": 600000},
-        "allow_followup": {"type": "boolean", "default": True}})})
-ASK_OUTPUT: JSONSchema = _obj(["answer", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID, "answer": _VS,
-    "answered_at": {"type": "string", "format": "date-time"}})
-
-# RFC-001 §clarify
-CLARIFY_INPUT: JSONSchema = _obj(["question", "options"], {
-    "_rfc_version": _VER,
-    "question": {"type": "string", "minLength": 1},
-    "options": {"type": "array", "minItems": 2, "items": _obj(["id", "label"], {
-        "id": {"type": "string", "pattern": "^[a-z0-9_]+$"},
-        "label": _VS, "description": _VS})},
-    "default_id": _VS,
-    "timeout_ms": {"type": "integer", "minimum": 0, "default": 600000}})
-CLARIFY_OUTPUT: JSONSchema = _obj(["selected_id", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "selected_id": _VS, "free_text": _VS})
-
-# RFC-001 §propose
-PROPOSE_INPUT: JSONSchema = _obj(["action", "rationale"], {
-    "_rfc_version": _VER,
-    "action": {"type": "string", "minLength": 1},
-    "rationale": {"type": "string", "minLength": 1},
-    "preview": _obj([], {
-        "kind": {"type": "string", "enum": ["text", "diff", "plan", "code", "json"]},
-        "body": _VS}),
-    "scope": {"type": "string",
-              "enum": ["one_shot", "this_file", "this_zone", "session"],
-              "default": "one_shot"},
-    "timeout_ms": {"type": "integer", "minimum": 0, "default": 1800000}})
-PROPOSE_OUTPUT: JSONSchema = _obj(["decision", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "decision": {"type": "string", "enum": ["accept", "reject", "modify", "defer"]},
-    "modification": _VS,
-    "scope_granted": {"type": "string",
-                      "enum": ["one_shot", "this_file", "this_zone", "session"]}})
-
-# RFC-001 §request_approval
-REQUEST_APPROVAL_INPUT: JSONSchema = _obj(["action", "diff_preview", "risk_level"], {
-    "_rfc_version": _VER,
-    "action": {"type": "string", "minLength": 1},
-    "diff_preview": _obj(["kind", "body"], {
-        "kind": {"type": "string", "enum": ["unified_diff", "text", "code", "command"]},
-        "body": _VS, "file_a": _VS, "file_b": _VS}),
-    "risk_level": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-    "alternatives": {"type": "array", "items": _obj(["label", "description"], {
-        "label": _VS, "description": _VS})},
-    "timeout_ms": {"type": "integer", "minimum": 0, "default": 1800000}})
-REQUEST_APPROVAL_OUTPUT: JSONSchema = _obj(["decision", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "decision": {"type": "string",
-                 "enum": ["approve", "approve_with_modification", "deny", "defer"]},
-    "modification": _VS, "alternative_label": _VS})
-
-# RFC-001 §report_progress
-REPORT_PROGRESS_INPUT: JSONSchema = _obj(["status"], {
-    "_rfc_version": _VER,
-    "status": {"type": "string", "minLength": 1},
-    "percent": {"type": "number", "minimum": 0, "maximum": 100},
-    "blockers": {"type": "array", "items": _VS},
-    "display_id": _VS})
-REPORT_PROGRESS_OUTPUT: JSONSchema = _ack()
-
-# RFC-001 §report_completion
-# ``task_id`` is additive (V1 mega-round): the kernel uses it to enforce
-# RFC-001 §report_completion's "exactly one per task" invariant.
-REPORT_COMPLETION_INPUT: JSONSchema = _obj(["summary"], {
-    "_rfc_version": _VER,
-    "summary": {"type": "string", "minLength": 1},
-    "artifacts": {"type": "array", "items": _obj(["uri", "kind"], {
-        "uri": _VS,
-        "kind": {"type": "string", "enum": ["file", "diff", "plan", "url", "log"]},
-        "title": _VS})},
-    "outcome": {"type": "string",
-                "enum": ["success", "partial", "aborted"], "default": "success"},
-    "task_id": _VS})
-REPORT_COMPLETION_OUTPUT: JSONSchema = _ack()
-
-# RFC-001 §report_problem
-REPORT_PROBLEM_INPUT: JSONSchema = _obj(["severity", "description"], {
-    "_rfc_version": _VER,
-    "severity": {"type": "string", "enum": ["info", "warning", "error", "fatal"]},
-    "description": {"type": "string", "minLength": 1},
-    "suggested_remediation": _VS,
-    "related_artifacts": {"type": "array", "items": _VS}})
-REPORT_PROBLEM_OUTPUT: JSONSchema = _ack()
-
-# RFC-001 §present
-# ``artifact_id`` is additive (V1 mega-round): when supplied, the
-# kernel returns the cached response for that id instead of minting a
-# fresh one (RFC-001 §present idempotency).
-PRESENT_INPUT: JSONSchema = _obj(["artifact", "kind", "summary"], {
-    "_rfc_version": _VER,
-    "artifact": _obj(["body"], {
-        "body": _VS, "uri": _VS, "language": _VS,
-        "encoding": {"type": "string", "enum": ["utf-8", "base64"], "default": "utf-8"}}),
-    "kind": {"type": "string", "enum": ["code", "plan", "diff", "doc", "json", "image"]},
-    "summary": {"type": "string", "minLength": 1},
-    "artifact_id": _VS})
-PRESENT_OUTPUT: JSONSchema = _obj(["artifact_id", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID, "artifact_id": _VS})
-
-# RFC-001 §notify
-NOTIFY_INPUT: JSONSchema = _obj(["observation", "importance"], {
-    "_rfc_version": _VER,
-    "observation": {"type": "string", "minLength": 1},
-    "importance": {"type": "string", "enum": ["trace", "info", "warn"]},
-    "tags": {"type": "array", "items": _VS}})
-NOTIFY_OUTPUT: JSONSchema = _ack()
-
-# RFC-001 §escalate
-ESCALATE_INPUT: JSONSchema = _obj(["reason", "severity"], {
-    "_rfc_version": _VER,
-    "reason": {"type": "string", "minLength": 1},
-    "severity": {"type": "string", "enum": ["medium", "high", "critical"]},
-    "context": _VS,
-    "timeout_ms": {"type": "integer", "minimum": 0, "default": 300000}})
-ESCALATE_OUTPUT: JSONSchema = _obj(["acknowledged", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "acknowledged": {"type": "boolean", "const": True},
-    "operator_response": _VS})
-
-# ---- Proxied tools -------------------------------------------------------
-
-# RFC-001 §read_file
-READ_FILE_INPUT: JSONSchema = _obj(["path"], {
-    "_rfc_version": _VER,
-    "path": {"type": "string", "minLength": 1},
-    "encoding": {"type": "string", "enum": ["utf-8", "base64"], "default": "utf-8"},
-    "max_bytes": {"type": "integer", "minimum": 1, "default": 1048576}})
-READ_FILE_OUTPUT: JSONSchema = _obj(["content", "encoding", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID, "content": _VS,
-    "encoding": {"type": "string", "enum": ["utf-8", "base64"]},
-    "truncated": {"type": "boolean"},
-    "size_bytes": {"type": "integer", "minimum": 0}})
-
-# RFC-001 §write_file
-WRITE_FILE_INPUT: JSONSchema = _obj(["path", "content"], {
-    "_rfc_version": _VER,
-    "path": {"type": "string", "minLength": 1},
-    "content": _VS,
-    "encoding": {"type": "string", "enum": ["utf-8", "base64"], "default": "utf-8"},
-    "mode": {"type": "string",
-             "enum": ["create", "overwrite", "append"], "default": "overwrite"}})
-WRITE_FILE_OUTPUT: JSONSchema = _obj(["bytes_written", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "bytes_written": {"type": "integer", "minimum": 0},
-    "created": {"type": "boolean"}})
-
-# RFC-001 §run_command
-RUN_COMMAND_INPUT: JSONSchema = _obj(["command"], {
-    "_rfc_version": _VER,
-    "command": {"type": "string", "minLength": 1},
-    "args": {"type": "array", "items": _VS},
-    "cwd": _VS,
-    "timeout_ms": {"type": "integer", "minimum": 1, "default": 60000},
-    "env": {"type": "object", "additionalProperties": _VS}})
-RUN_COMMAND_OUTPUT: JSONSchema = _obj(["exit_code", "stdout", "stderr", "run_id"], {
-    "_rfc_version": _VS, "run_id": _RID,
-    "exit_code": {"type": "integer"},
-    "stdout": _VS, "stderr": _VS,
-    "timed_out": {"type": "boolean"},
-    "duration_ms": {"type": "integer", "minimum": 0}})
-
-
-# Public catalog: tool name -> (input_schema, output_schema, description).
-# Order matches RFC-002's mcpServers.allowedTools array exactly.
-TOOL_CATALOG: Dict[str, Tuple[JSONSchema, JSONSchema, str]] = {
-    "ask": (ASK_INPUT, ASK_OUTPUT, "Operator-targeted free-form question."),
-    "clarify": (CLARIFY_INPUT, CLARIFY_OUTPUT, "Typed clarification with a discrete option set."),
-    "propose": (PROPOSE_INPUT, PROPOSE_OUTPUT, "Proposed action with rationale, optional preview, and scope."),
-    "request_approval": (REQUEST_APPROVAL_INPUT, REQUEST_APPROVAL_OUTPUT, "Hard gate before performing an executable operation."),
-    "report_progress": (REPORT_PROGRESS_INPUT, REPORT_PROGRESS_OUTPUT, "Status update during long-running work; non-blocking."),
-    "report_completion": (REPORT_COMPLETION_INPUT, REPORT_COMPLETION_OUTPUT, "Final completion signal for a unit of agent work."),
-    "report_problem": (REPORT_PROBLEM_INPUT, REPORT_PROBLEM_OUTPUT, "Blocking issue the agent encountered."),
-    "present": (PRESENT_INPUT, PRESENT_OUTPUT, "Generated content lifted to the artifacts surface."),
-    "notify": (NOTIFY_INPUT, NOTIFY_OUTPUT, "Fire-and-forget annotation."),
-    "escalate": (ESCALATE_INPUT, ESCALATE_OUTPUT, "Demands operator attention urgently."),
-    "read_file": (READ_FILE_INPUT, READ_FILE_OUTPUT, "Proxied: returns file contents from the workspace."),
-    "write_file": (WRITE_FILE_INPUT, WRITE_FILE_OUTPUT, "Proxied: writes file contents inside the workspace."),
-    "run_command": (RUN_COMMAND_INPUT, RUN_COMMAND_OUTPUT, "Proxied: executes a shell command in the zone workspace."),
-}
-
-# Tools whose handlers are real (B1-stub) implementations.
-NATIVE_TOOLS: Tuple[str, ...] = (
-    "ask", "clarify", "propose", "request_approval",
-    "report_progress", "report_completion", "report_problem",
-    "present", "notify", "escalate")
-
-# Tools that are proxied; B1 leaves them unimplemented and raises NotImplementedError.
-PROXIED_TOOLS: Tuple[str, ...] = ("read_file", "write_file", "run_command")
-
-
-# ---- Input validation -----------------------------------------------------
-
-# JSON Schema -> Python type-check map.  Used by the hand-rolled fallback
-# checker if ``jsonschema`` is unavailable.  ``"integer"`` accepts ``bool``
-# rejection because Python booleans subclass ``int``.
-_TYPE_PY: Dict[str, Tuple[type, ...]] = {
-    "string": (str,),
-    "integer": (int,),
-    "number": (int, float),
-    "boolean": (bool,),
-    "array": (list,),
-    "object": (dict,),
-}
-
-
-def _hand_validate(schema: JSONSchema, value: Any, path: str = "$") -> Optional[str]:
-    """Tiny hand-rolled checker covering the subset RFC-001 schemas use.
-
-    Validates: ``type``, ``required``, ``additionalProperties`` (bool),
-    ``minLength``, ``minItems``, ``minimum``, ``maximum``, ``enum``,
-    ``items``, nested ``properties``.  Returns ``None`` on success or a
-    human-readable error string on first failure.  The structure matches
-    Draft-2020-12's behavior closely enough for the RFC-001 schemas, but
-    falls short of full conformance — which is why ``validate_tool_input``
-    prefers ``jsonschema`` when available.
-    """
-    expected = schema.get("type")
-    if expected:
-        py_types = _TYPE_PY.get(expected)
-        if py_types is not None:
-            # ``bool`` is a subclass of ``int``; reject it for "integer"
-            # / "number" to match JSON Schema semantics.
-            if expected in ("integer", "number") and isinstance(value, bool):
-                return f"{path}: expected {expected}, got boolean"
-            if not isinstance(value, py_types):
-                got = type(value).__name__
-                return f"{path}: expected {expected}, got {got}"
-
-    if expected == "object" and isinstance(value, dict):
-        required = schema.get("required") or []
-        for key in required:
-            if key not in value:
-                return f"{path}: missing required property {key!r}"
-        props: Dict[str, Any] = schema.get("properties") or {}
-        if schema.get("additionalProperties") is False:
-            for key in value:
-                if key not in props:
-                    return f"{path}: unexpected property {key!r}"
-        for key, sub_value in value.items():
-            sub_schema = props.get(key)
-            if sub_schema is None:
-                continue
-            err = _hand_validate(sub_schema, sub_value, f"{path}.{key}")
-            if err is not None:
-                return err
-
-    if expected == "array" and isinstance(value, list):
-        min_items = schema.get("minItems")
-        if min_items is not None and len(value) < min_items:
-            return f"{path}: expected at least {min_items} items, got {len(value)}"
-        item_schema = schema.get("items")
-        if isinstance(item_schema, dict):
-            for idx, item in enumerate(value):
-                err = _hand_validate(item_schema, item, f"{path}[{idx}]")
-                if err is not None:
-                    return err
-
-    if expected == "string" and isinstance(value, str):
-        min_len = schema.get("minLength")
-        if min_len is not None and len(value) < min_len:
-            return f"{path}: string shorter than minLength={min_len}"
-
-    if expected in ("integer", "number") and isinstance(value, (int, float)) \
-            and not isinstance(value, bool):
-        minimum = schema.get("minimum")
-        if minimum is not None and value < minimum:
-            return f"{path}: {value} < minimum {minimum}"
-        maximum = schema.get("maximum")
-        if maximum is not None and value > maximum:
-            return f"{path}: {value} > maximum {maximum}"
-
-    enum = schema.get("enum")
-    if enum is not None and value not in enum:
-        return f"{path}: {value!r} not in enum {enum}"
-
-    return None
-
-
-def validate_tool_input(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
-    """Validate ``args`` against the RFC-001 input schema for ``tool_name``.
-
-    Returns ``None`` if validation passes (or the tool is unknown — the
-    caller is responsible for routing unknown tools).  Returns a
-    human-readable error string when validation fails: the JSON Pointer
-    of the failing field plus the expected vs received shape.
-
-    Prefers the standard-library-grade ``jsonschema`` validator when
-    available; falls back to :func:`_hand_validate`, a small
-    hand-rolled subset that covers ``type`` / ``required`` /
-    ``additionalProperties`` / ``minLength`` / ``minItems`` /
-    ``minimum`` / ``maximum`` / ``enum`` / ``items`` / nested
-    ``properties`` — sufficient for the RFC-001 schemas this module
-    publishes.
-    """
-    entry = TOOL_CATALOG.get(tool_name)
-    if entry is None:
-        return None  # Unknown tool: routed elsewhere (-32601).
-    input_schema, _output_schema, _description = entry
-    if not isinstance(args, dict):
-        return f"$: expected object, got {type(args).__name__}"
-
-    try:
-        import jsonschema  # type: ignore[import-untyped]
-    except ImportError:
-        return _hand_validate(input_schema, args)
-
-    try:
-        jsonschema.validate(instance=args, schema=input_schema)
-    except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
-        path_parts = list(exc.absolute_path)
-        path = "$" + "".join(
-            f"[{p}]" if isinstance(p, int) else f".{p}" for p in path_parts
-        )
-        return f"{path}: {exc.message}"
-    except jsonschema.SchemaError as exc:  # type: ignore[attr-defined]
-        # The schema itself is malformed -- this is a kernel bug, not a
-        # client error.  Surface it but don't crash.
-        return f"$: schema error ({exc.message})"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# K-class registry — PLAN-S5.0.1 §3.9 cell-magic injection-defense codes
-# ---------------------------------------------------------------------------
-#
-# Slice 5.0.1a wires K35 + K36 only. The remaining K3C..K3G ship with
-# the precondition-gates / acceptance-flag slice (5.0.1c). This central
-# registry lets drift-detector / dispatcher consumers index the K-code
-# without scanning every module's local string constants — and gives
-# the audit pass a single place to confirm a code has a documented
-# meaning before it appears in a marker.
-
-K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
-    # K30/K31/K32/K34 — pre-S5.0.1 codes, registered here for
-    # completeness so a future audit pass can validate the full set
-    # in one place.
-    "K30": {
-        "name": "multiple_kinds",
-        "fires_in": "cell_text.parse_cell",
-        "description": (
-            "Two or more @@<cell_magic> declarations in a single cell."
-        ),
-    },
-    "K31": {
-        "name": "unknown_cell_magic",
-        "fires_in": "cell_text.parse_cell",
-        "description": (
-            "@@<unknown_name> at the kind position; not in CELL_MAGICS."
-        ),
-    },
-    "K32": {
-        "name": "reserved_magic_name",
-        "fires_in": "agent_supervisor.spawn",
-        "description": (
-            "agent_id collides with the cell-magic registry "
-            "(RESERVED_NAMES) or the llmnb_* future-reservation prefix."
-        ),
-    },
-    "K34": {
-        "name": "incompatible_kind_change",
-        "fires_in": "magic_registry._MarkLineMagic",
-        "description": (
-            "@mark <kind> target is not a known cell-magic kind."
-        ),
-    },
-    # PLAN-S5.0.1b §3.5 — parser sees a hashed-magic-shaped line whose
-    # hash does NOT validate against the operator's pin (or whose
-    # ``<name>`` is not a registered magic). Treated as body, NOT
-    # dispatched. Distinguished from K35 (which fires on PLAIN
-    # ``@@<known>`` lines in hash mode) so the audit trail can tell
-    # operator typos (K35) apart from likely replay attempts /
-    # copy-paste from a different-pin notebook (K33).
-    "K33": {
-        "name": "magic_hash_mismatch",
-        "fires_in": "cell_text.parse_cell",
-        "description": (
-            "Hash mode is enabled and the parser saw a line shaped "
-            "like @@<hash>:<name> but the hash failed validation "
-            "against the operator's pin OR <name> was not in the "
-            "registered magic-name set. Treated as body, NOT "
-            "dispatched. Distinct from K35 (plain magic in hash "
-            "mode) so audit consumers can separate operator typos "
-            "from likely replay / cross-notebook paste attempts."
-        ),
-    },
-    # PLAN-S5.0.1 §3.9 — slice 5.0.1a wires K35 + K36.
-    "K35": {
-        "name": "plain_magic_in_hash_mode",
-        "fires_in": "cell_text.parse_cell (slice 5.0.1b)",
-        "description": (
-            "Hash mode is enabled but the parser saw a plain @@<known> "
-            "line (no hash). Treated as body, NOT dispatched. Logged "
-            "so the operator surface can warn about a likely operator "
-            "typo or a reverted notebook from before hash mode was "
-            "enabled. The constant is registered here in 5.0.1a; the "
-            "parser hookup lands in slice 5.0.1b."
-        ),
-    },
-    "K36": {
-        "name": "hashed_magic_emission_blocked",
-        "fires_in": (
-            "agent_supervisor._scan_for_magic_contamination + "
-            "socket_writer.write_frame"
-        ),
-        "description": (
-            "Agent stdout / tool output / kernel-emitted span carried a "
-            "line matching the canonical hashed-magic shape "
-            "(^@@?[a-f0-9]+:<name>) while hash mode was on. The line "
-            "is escaped (@ -> \\@) before it lands in cell outputs so "
-            "it's never dispatchable. The receiving cell is flagged "
-            "contaminated. K36 fires from BOTH the agent_supervisor "
-            "scan path (Layer-2 emission ban in §3.2) AND the "
-            "socket_writer outbound sanitizer (defense-in-depth in "
-            "§3.3)."
-        ),
-    },
-    # PLAN-S5.0.1c §3.10 / §3.11 — Cell-Manager precondition gates
-    # and verbatim injection-acceptance flag. K3C / K3D distinguish
-    # the structural-vs-kind refusal classes for analytics; K3E is
-    # the contamination freeze; K3F is the info-level marker for the
-    # explicitly-allowed running-cell text-edit path; K3G is the
-    # one-shot acceptance-recorded marker.
-    "K3C": {
-        "name": "running_cell_structural_op_blocked",
-        "fires_in": "cell_manager.CellManager.<structural_op>",
-        "description": (
-            "Operator (or wire) attempted a structural op "
-            "(split / merge / delete / move / reset_contamination) on "
-            "a cell whose bound agent currently has an active run "
-            "(state in {starting, running, restarting}). The op is "
-            "refused with K3C. Operator must @stop the agent or wait "
-            "for natural completion before retrying. Edits to the "
-            "cell text itself remain allowed (see K3F)."
-        ),
-    },
-    "K3D": {
-        "name": "running_cell_kind_change_blocked",
-        "fires_in": "cell_manager.CellManager.set_cell_kind",
-        "description": (
-            "Kind-change attempt on a running cell. Distinct from K3C "
-            "(other structural ops) so analytics can separate the "
-            "kind-change refusal class — kind changes are the most "
-            "frequent operator request mid-run and the most informative "
-            "to surface as their own bucket."
-        ),
-    },
-    "K3E": {
-        "name": "contaminated_cell_structural_op_blocked",
-        "fires_in": "cell_manager.CellManager.<structural_op|set_cell_text>",
-        "description": (
-            "Structural op (or text edit) attempted on a cell whose "
-            "``contaminated`` flag is True. Refused with K3E. Only the "
-            "explicit operator-click ``reset_contamination(cell_id)`` "
-            "intent clears the flag and unfreezes the cell."
-        ),
-    },
-    "K3F": {
-        "name": "running_cell_edit_text_only_path",
-        "fires_in": "cell_manager.CellManager.set_cell_text",
-        "description": (
-            "Info-level marker: text was edited on a cell with an "
-            "active run. Per PLAN §3.10 this is explicitly ALLOWED "
-            "(text-only path applies on the next run; runtime spans "
-            "continue to land). Logged so the audit trail records the "
-            "edit-during-run event without raising."
-        ),
-    },
-    "K3G": {
-        "name": "operator_accepted_injection_persisted",
-        "fires_in": "metadata_writer.MetadataWriter.accept_injection_risk",
-        "description": (
-            "Operator declined hash-mode protection and accepted "
-            "arbitrary code injection. The verbatim string "
-            "``\"The Operator Has Accepted Arbitrary Code Injection at "
-            "<ISO8601>\"`` was written to "
-            "``metadata.rts.config.injection_acceptance``. Emitted "
-            "exactly once on first acceptance; subsequent calls are "
-            "no-ops and do NOT re-emit K3G."
-        ),
-    },
-    # PLAN-S5.0.2 §7 — magic code generators.
-    "K3H": {
-        "name": "agent_emitted_generator_magic_blocked",
-        "fires_in": "agent_supervisor._scan_for_magic_contamination",
-        "description": (
-            "Agent's contaminated stdout contained a generator-magic "
-            "call (`@@template`, `@@expand`, `@@import`, or a hashed "
-            "equivalent). Layered on top of K35's plain-magic "
-            "contamination flag: the cell is flagged contaminated AND "
-            "the line is escaped (Layer-2 in hash mode); no generator "
-            "dispatch happens. K3H is log-level — it does not raise; "
-            "it tags the contamination event so analytics can split "
-            "generator-class injection attempts from generic ones."
-        ),
-    },
-    "K3I": {
-        "name": "generator_handler_produced_invalid_hash",
-        "fires_in": "magic_generators.dispatch_generator",
-        "description": (
-            "A generator handler returned a fragment whose `@@<hash>` "
-            "prefix did NOT match `HMAC(pin, name)` against the "
-            "operator's pin. The dispatcher rejects ALL fragments "
-            "from the invocation atomically (no partial inserts). "
-            "K3I is log-level on the diagnostics stream and surfaces "
-            "to the operator as a structured `GeneratorError`. Likely "
-            "cause: handler bug or operator-registered custom "
-            "generator with a bad hash-stamp implementation."
-        ),
-    },
-    "K3J": {
-        "name": "generator_provenance_missing",
-        "fires_in": (
-            "cell_manager.CellManager.insert_cells_with_provenance / "
-            "metadata_writer.MetadataWriter.insert_generated_cell"
-        ),
-        "description": (
-            "Cell-Manager's ``insert_cells_with_provenance`` path was "
-            "called without a non-empty ``generated_by`` / "
-            "``generated_at`` pair. Defense-in-depth assertion: the "
-            "happy-path generator dispatcher always sets both fields. "
-            "Unreachable in normal operation; exists so a programmer "
-            "calling the API directly without provenance trips a loud "
-            "K3J instead of silently inserting orphan cells."
-        ),
-    },
-}
-
-
-def k_class_info(code: str) -> Optional[Dict[str, str]]:
-    """Look up a K-class registry entry. ``None`` for unknown codes."""
-    return K_CLASS_REGISTRY.get(code)
+# Re-export everything the old module exposed.  The star import covers
+# all public names; the explicit list covers the underscore-prefixed
+# private helpers that callers may have imported directly.
+from llm_kernel.wire.tools import *  # noqa: F401, F403
+from llm_kernel.wire.tools import (  # noqa: F401
+    # Private module helpers (re-exported for back-compat)
+    _DRAFT,
+    _VER,
+    _RID,
+    _VS,
+    _obj,
+    _ack,
+    _ACK,
+    _TYPE_PY,
+    _hand_validate,
+    # Public catalog + validators
+    TOOL_CATALOG,
+    validate_tool_input,
+    validate_tool_output,
+    # K-class registry
+    K_CLASS_REGISTRY,
+    k_class_info,
+    # K-code string constants (new in S5.0.3a; harmless additions)
+    K30_MULTIPLE_KINDS,
+    K31_UNKNOWN_CELL_MAGIC,
+    K32_RESERVED_MAGIC_NAME,
+    K33_MAGIC_HASH_MISMATCH,
+    K34_INCOMPATIBLE_KIND_CHANGE,
+    K35_PLAIN_MAGIC_IN_HASH_MODE,
+    K36_HASHED_MAGIC_EMISSION_BLOCKED,
+    K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED,
+    K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED,
+    K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED,
+    K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH,
+    K3G_OPERATOR_ACCEPTED_INJECTION_PERSISTED,
+    K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED,
+    K3I_GENERATOR_HANDLER_PRODUCED_INVALID_HASH,
+    K3J_GENERATOR_PROVENANCE_MISSING,
+    # Individual tool schemas
+    ASK_INPUT, ASK_OUTPUT,
+    CLARIFY_INPUT, CLARIFY_OUTPUT,
+    PROPOSE_INPUT, PROPOSE_OUTPUT,
+    REQUEST_APPROVAL_INPUT, REQUEST_APPROVAL_OUTPUT,
+    REPORT_PROGRESS_INPUT, REPORT_PROGRESS_OUTPUT,
+    REPORT_COMPLETION_INPUT, REPORT_COMPLETION_OUTPUT,
+    REPORT_PROBLEM_INPUT, REPORT_PROBLEM_OUTPUT,
+    PRESENT_INPUT, PRESENT_OUTPUT,
+    NOTIFY_INPUT, NOTIFY_OUTPUT,
+    ESCALATE_INPUT, ESCALATE_OUTPUT,
+    READ_FILE_INPUT, READ_FILE_OUTPUT,
+    WRITE_FILE_INPUT, WRITE_FILE_OUTPUT,
+    RUN_COMMAND_INPUT, RUN_COMMAND_OUTPUT,
+    NATIVE_TOOLS,
+    PROXIED_TOOLS,
+    JSONSchema,
+)
