@@ -473,6 +473,70 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
             "§3.3)."
         ),
     },
+    # PLAN-S5.0.1c §3.10 / §3.11 — Cell-Manager precondition gates
+    # and verbatim injection-acceptance flag. K3C / K3D distinguish
+    # the structural-vs-kind refusal classes for analytics; K3E is
+    # the contamination freeze; K3F is the info-level marker for the
+    # explicitly-allowed running-cell text-edit path; K3G is the
+    # one-shot acceptance-recorded marker.
+    "K3C": {
+        "name": "running_cell_structural_op_blocked",
+        "fires_in": "cell_manager.CellManager.<structural_op>",
+        "description": (
+            "Operator (or wire) attempted a structural op "
+            "(split / merge / delete / move / reset_contamination) on "
+            "a cell whose bound agent currently has an active run "
+            "(state in {starting, running, restarting}). The op is "
+            "refused with K3C. Operator must @stop the agent or wait "
+            "for natural completion before retrying. Edits to the "
+            "cell text itself remain allowed (see K3F)."
+        ),
+    },
+    "K3D": {
+        "name": "running_cell_kind_change_blocked",
+        "fires_in": "cell_manager.CellManager.set_cell_kind",
+        "description": (
+            "Kind-change attempt on a running cell. Distinct from K3C "
+            "(other structural ops) so analytics can separate the "
+            "kind-change refusal class — kind changes are the most "
+            "frequent operator request mid-run and the most informative "
+            "to surface as their own bucket."
+        ),
+    },
+    "K3E": {
+        "name": "contaminated_cell_structural_op_blocked",
+        "fires_in": "cell_manager.CellManager.<structural_op|set_cell_text>",
+        "description": (
+            "Structural op (or text edit) attempted on a cell whose "
+            "``contaminated`` flag is True. Refused with K3E. Only the "
+            "explicit operator-click ``reset_contamination(cell_id)`` "
+            "intent clears the flag and unfreezes the cell."
+        ),
+    },
+    "K3F": {
+        "name": "running_cell_edit_text_only_path",
+        "fires_in": "cell_manager.CellManager.set_cell_text",
+        "description": (
+            "Info-level marker: text was edited on a cell with an "
+            "active run. Per PLAN §3.10 this is explicitly ALLOWED "
+            "(text-only path applies on the next run; runtime spans "
+            "continue to land). Logged so the audit trail records the "
+            "edit-during-run event without raising."
+        ),
+    },
+    "K3G": {
+        "name": "operator_accepted_injection_persisted",
+        "fires_in": "metadata_writer.MetadataWriter.accept_injection_risk",
+        "description": (
+            "Operator declined hash-mode protection and accepted "
+            "arbitrary code injection. The verbatim string "
+            "``\"The Operator Has Accepted Arbitrary Code Injection at "
+            "<ISO8601>\"`` was written to "
+            "``metadata.rts.config.injection_acceptance``. Emitted "
+            "exactly once on first acceptance; subsequent calls are "
+            "no-ops and do NOT re-emit K3G."
+        ),
+    },
 }
 
 
