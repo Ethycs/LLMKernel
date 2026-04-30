@@ -24,7 +24,8 @@ single-mutation lock so concurrent edits don't tear.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, TYPE_CHECKING
+import re
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .cell_text import parse_cell
 
@@ -38,6 +39,7 @@ __all__ = (
     "insert_line_magic_text",
     "remove_line_magic_text",
     "set_cell_kind_text",
+    "restamp_text",
     "CellManager",
 )
 
@@ -163,6 +165,121 @@ def set_cell_kind_text(text: str, kind: str, args: str = "") -> str:
     return "\n".join(new_lines)
 
 
+# --- PLAN-S5.0.1b §3.7 — pin re-stamping primitives -----------------
+
+
+def restamp_text(
+    text: str,
+    *,
+    old_pin: Optional[str],
+    new_pin: Optional[str],
+    known_cell_magics: "set[str]",
+    known_line_magics: "set[str]",
+    hash_length: int = 8,
+) -> Tuple[str, int, List[Dict[str, str]]]:
+    """Walk one cell's ``text`` and re-stamp magic lines per pin transition.
+
+    PLAN-S5.0.1b §3.7 transition table:
+
+    * **Enable** (``old_pin=None``, ``new_pin=PIN``): plain
+      ``@@<name>`` → ``@@<hash>:<name>``. Pre-existing
+      ``@@<hash>:<name>`` lines (e.g. copy-pasted from another
+      notebook) cannot be reliably re-stamped (their hash is keyed
+      against an unknown old pin); we LEAVE them verbatim and
+      return a K33 marker per line so the dispatcher / extension
+      can surface them. AMBIGUITY-FLAG: plan §3.7 doesn't explicitly
+      state behavior on enable-with-pre-existing-hashes; this is
+      the conservative choice.
+    * **Rotate** (both pins set): ``@@<old_hash>:<name>`` →
+      ``@@<new_hash>:<name>``. Plain ``@@<name>`` lines (if any
+      survived from a partial enable) are also stamped to the new
+      hash. Hashed lines that don't validate against old_pin emit
+      a K33 marker and stay verbatim.
+    * **Disable** (``old_pin=PIN``, ``new_pin=None``): per spec —
+      hashed lines stay verbatim (they decompose to body on next
+      parse without hash mode). Returns ``(text, 0, [])`` — no
+      mutation.
+
+    Returns ``(new_text, restamped_count, k_emissions)`` where
+    ``k_emissions`` is a list of ``{"code": "K33", "line": <str>,
+    "reason": <str>}`` records for lines that couldn't be stamped.
+    """
+    # Disable path is a no-op on text per the spec.
+    if old_pin is not None and new_pin is None:
+        return text, 0, []
+
+    # Enable / rotate paths both need the magic_hash module.
+    from .magic_hash import (
+        magic_hash, HASHED_MAGIC_LINE, validate_hashed_magic,
+    )
+
+    known_all = set(known_cell_magics) | set(known_line_magics)
+    out_lines: List[str] = []
+    count = 0
+    emissions: List[Dict[str, str]] = []
+    for line in text.splitlines():
+        # Probe hashed shape first — it's a stricter pattern.
+        hm = HASHED_MAGIC_LINE.match(line) if line.startswith(("@@", "@")) else None
+        if hm is not None:
+            # Rotate path: re-stamp using both pins.
+            if old_pin is not None and new_pin is not None:
+                ok, recovered = validate_hashed_magic(
+                    line, old_pin, known_all, length=hash_length,
+                )
+                if ok and recovered is not None:
+                    sigil = "@@" if line.startswith("@@") else "@"
+                    new_hash = magic_hash(
+                        new_pin, recovered, length=hash_length,
+                    )
+                    tail = line[hm.end():]
+                    out_lines.append(
+                        f"{sigil}{new_hash}:{recovered}{tail}"
+                    )
+                    count += 1
+                    continue
+                # Hashed shape but didn't validate against old_pin →
+                # K33 + leave verbatim.
+                emissions.append({
+                    "code": "K33", "line": line[:256],
+                    "reason": "rotate_old_hash_invalid",
+                })
+                out_lines.append(line)
+                continue
+            # Enable path: pre-existing hashed line; leave verbatim.
+            emissions.append({
+                "code": "K33", "line": line[:256],
+                "reason": "enable_with_preexisting_hash",
+            })
+            out_lines.append(line)
+            continue
+        # Not a hashed line — try plain @@<name> / @<name>.
+        if line.startswith("@@"):
+            m = re.match(r"^@@([A-Za-z_][\w]*)(\s.*)?$", line)
+            if m is not None and m.group(1) in known_cell_magics and new_pin is not None:
+                name = m.group(1)
+                tail = m.group(2) or ""
+                new_hash = magic_hash(new_pin, name, length=hash_length)
+                out_lines.append(f"@@{new_hash}:{name}{tail}")
+                count += 1
+                continue
+        elif line.startswith("@"):
+            m = re.match(r"^@([A-Za-z_][\w]*)(\s.*)?$", line)
+            if m is not None and m.group(1) in known_line_magics and new_pin is not None:
+                name = m.group(1)
+                tail = m.group(2) or ""
+                new_hash = magic_hash(new_pin, name, length=hash_length)
+                out_lines.append(f"@{new_hash}:{name}{tail}")
+                count += 1
+                continue
+        out_lines.append(line)
+    new_text = "\n".join(out_lines)
+    # Preserve a trailing newline if the input had one (splitlines
+    # drops it).
+    if text.endswith("\n") and not new_text.endswith("\n"):
+        new_text += "\n"
+    return new_text, count, emissions
+
+
 # --- Adapter to MetadataWriter ---------------------------------------
 
 
@@ -224,3 +341,69 @@ class CellManager:
         if text is None:
             return None
         return parse_cell(text)
+
+    def restamp_magics(
+        self,
+        old_pin: Optional[str],
+        new_pin: Optional[str],
+        *,
+        hash_length: int = 8,
+    ) -> Tuple[int, List[Dict[str, str]]]:
+        """Walk every cell's text and re-stamp magic lines per pin transition.
+
+        PLAN-S5.0.1b §3.7. Three modes per the (old_pin, new_pin) pair:
+
+        * ``(None, PIN)`` enable: plain ``@@<name>`` →
+          ``@@<hash>:<name>``. Pre-existing hashed lines (e.g.
+          copy-paste from a different-pin notebook) cannot be reliably
+          re-stamped — we leave them verbatim and emit K33 per line.
+        * ``(OLD, NEW)`` rotate: ``@@<old_hash>:<name>`` →
+          ``@@<new_hash>:<name>``. Plain magics also stamp.
+          Hashed lines that don't validate against ``old_pin`` emit
+          K33 + stay verbatim.
+        * ``(PIN, None)`` disable: per spec, no-op on text — the
+          hashed lines stay verbatim and decompose to body on next
+          parse without hash mode.
+
+        Returns ``(total_restamped_count, k_emissions)``. The caller
+        (auth handler) decides how to surface the K33 emissions
+        (operator notify, drift marker, etc.).
+
+        AMBIGUITY-FLAG: plan §3.7 specifies disable behavior on hashed
+        lines (stay valid as text) but does NOT specify enable
+        behavior on pre-existing hashed lines. We chose K33 + leave
+        verbatim; flagged in the report.
+        """
+        # Resolve the registered magic-name sets once (lazy import to
+        # avoid a circular dep through magic_registry).
+        from .magic_registry import CELL_MAGICS, LINE_MAGICS
+
+        cell_magics = set(CELL_MAGICS.keys())
+        line_magics = set(LINE_MAGICS.keys())
+        total = 0
+        emissions: List[Dict[str, str]] = []
+
+        # Walk every cell. The writer exposes _cells privately; we
+        # iterate via the public id list so we don't break the
+        # encapsulation invariant. For the writer this slice ships
+        # with we expose a small helper inline.
+        cell_ids = list(getattr(self._writer, "_cells", {}).keys())
+        for cell_id in cell_ids:
+            text = self._writer.get_cell_text(cell_id) or ""
+            if not text:
+                continue
+            new_text, count, emit = restamp_text(
+                text,
+                old_pin=old_pin, new_pin=new_pin,
+                known_cell_magics=cell_magics,
+                known_line_magics=line_magics,
+                hash_length=hash_length,
+            )
+            if count > 0 or emit:
+                total += count
+                for e in emit:
+                    e["cell_id"] = cell_id
+                    emissions.append(e)
+            if new_text != text:
+                self._writer.set_cell_text(cell_id, new_text)
+        return total, emissions
