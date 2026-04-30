@@ -41,7 +41,44 @@ __all__ = (
     "set_cell_kind_text",
     "restamp_text",
     "CellManager",
+    "CellManagerPreconditionError",
+    "K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED",
+    "K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED",
+    "K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED",
+    "K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH",
 )
+
+
+# PLAN-S5.0.1c §3.10 / §3.11 K-class identifiers. Mirrors the entries
+# in ``_rfc_schemas.K_CLASS_REGISTRY`` so callers can reference the
+# canonical name without a registry round-trip on the hot path.
+K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED: str = "K3C"
+K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED: str = "K3D"
+K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED: str = "K3E"
+K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH: str = "K3F"
+
+
+# In-process active-run state set: agent states that count as "the
+# bound agent is doing something". Terminated / failed are treated as
+# safe-to-edit (the cell isn't actually executing).
+_ACTIVE_AGENT_STATES: frozenset = frozenset({
+    "starting", "running", "restarting",
+})
+
+
+class CellManagerPreconditionError(RuntimeError):
+    """Raised by ``CellManager`` structural ops when a precondition fails.
+
+    PLAN-S5.0.1c §3.10. Carries the K-class code (one of K3C/K3D/K3E)
+    plus a human-readable reason. The dispatcher catches and surfaces
+    to the operator surface (extension toast, drift marker emit).
+    """
+
+    def __init__(self, k_code: str, message: str, *, cell_id: str = "") -> None:
+        super().__init__(f"{k_code}: {message}")
+        self.k_code: str = k_code
+        self.cell_id: str = cell_id
+        self.reason: str = message
 
 
 # --- String-level primitives -----------------------------------------
@@ -291,8 +328,123 @@ class CellManager:
     ``MetadataWriter.set_cell_text(cell_id, new_text)``.
     """
 
-    def __init__(self, writer: "MetadataWriter") -> None:
+    def __init__(
+        self,
+        writer: "MetadataWriter",
+        supervisor: Optional[object] = None,
+    ) -> None:
+        """Bind to a writer and (optionally) the agent supervisor.
+
+        ``supervisor`` is consumed read-only by the precondition gates
+        (PLAN-S5.0.1c §3.10) to query whether a cell's bound agent
+        currently has an active run. When ``None`` the predicate
+        falls back to "no cell is running" (back-compat for tests
+        and S5.0.1a/b call sites that don't wire a supervisor).
+        """
         self._writer = writer
+        self._supervisor = supervisor
+
+    # -- PLAN-S5.0.1c §3.10 — read-only predicate helpers -------------
+
+    def _is_cell_running(self, cell_id: str) -> bool:
+        """Return True iff the bound agent for ``cell_id`` is active.
+
+        AMBIGUITY-FLAG: the plan suggests either
+        ``agent_supervisor.active_runs`` or
+        ``metadata.rts.runs[].state`` as the ground-truth. Neither
+        exposes a ready-made ``is_running_in(cell_id)`` predicate
+        today, so we use the cleanest available signal:
+
+          * Read ``cells[cell_id].bound_agent_id`` from the writer.
+          * If the supervisor is wired AND has a handle for that
+            agent_id whose ``state`` is in
+            ``{"starting", "running", "restarting"}``, the cell is
+            running.
+
+        Read-only: never mutates writer or supervisor state.
+        """
+        if self._supervisor is None:
+            return False
+        if not isinstance(cell_id, str) or not cell_id:
+            return False
+        # Pull the bound_agent_id from the writer's cell record.
+        bound_agent_id: Optional[str] = None
+        getter = getattr(self._writer, "get_cell_record", None)
+        if callable(getter):
+            record = getter(cell_id)
+            if isinstance(record, dict):
+                bound_agent_id = record.get("bound_agent_id")
+        else:
+            # Fallback: peek at the writer's private cell store.
+            cells = getattr(self._writer, "_cells", None)
+            if isinstance(cells, dict):
+                record = cells.get(cell_id)
+                if isinstance(record, dict):
+                    bound_agent_id = record.get("bound_agent_id")
+        if not isinstance(bound_agent_id, str) or not bound_agent_id:
+            return False
+        # Query the supervisor for the handle's state.
+        get_handle = getattr(self._supervisor, "get", None)
+        if not callable(get_handle):
+            return False
+        handle = get_handle(bound_agent_id)
+        if handle is None:
+            return False
+        state = getattr(handle, "state", None)
+        return isinstance(state, str) and state in _ACTIVE_AGENT_STATES
+
+    def _is_cell_contaminated(self, cell_id: str) -> bool:
+        """Return True iff ``cells[cell_id].contaminated == True``.
+
+        Delegates to the writer's
+        :meth:`MetadataWriter.is_cell_contaminated` accessor (also
+        added in 5.0.1c). Read-only.
+        """
+        checker = getattr(self._writer, "is_cell_contaminated", None)
+        if callable(checker):
+            return bool(checker(cell_id))
+        # Fallback for back-compat shims.
+        cells = getattr(self._writer, "_cells", None)
+        if not isinstance(cells, dict):
+            return False
+        record = cells.get(cell_id)
+        if not isinstance(record, dict):
+            return False
+        return bool(record.get("contaminated", False))
+
+    def _check_structural_op_preconditions(
+        self,
+        cell_id: str,
+        op_name: str,
+        *,
+        running_code: str = K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED,
+    ) -> None:
+        """Raise ``CellManagerPreconditionError`` on a blocked op.
+
+        PLAN-S5.0.1c §3.10. Order of checks:
+
+          1. Running-cell freeze (K3C / K3D depending on op).
+          2. Contaminated-cell freeze (K3E).
+
+        Running takes precedence so a cell that is BOTH running and
+        contaminated surfaces the running diagnostic first — operator
+        usually wants to ``@stop`` first and the contamination clear
+        is irrelevant until the agent quiesces.
+        """
+        if self._is_cell_running(cell_id):
+            raise CellManagerPreconditionError(
+                running_code,
+                f"cell_running_cannot_{op_name} (cell_id={cell_id!r})",
+                cell_id=cell_id,
+            )
+        if self._is_cell_contaminated(cell_id):
+            raise CellManagerPreconditionError(
+                K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED,
+                f"contaminated_cell_cannot_{op_name} "
+                f"(cell_id={cell_id!r}); call reset_contamination "
+                f"to unfreeze",
+                cell_id=cell_id,
+            )
 
     def split_at_break(self, cell_id: str, position: int) -> Tuple[str, str]:
         """Split ``cell_id``'s text at ``position``; return new cell IDs.
@@ -300,18 +452,76 @@ class CellManager:
         Returns the (left_text, right_text) tuple — actually persisting
         the second cell as a new cell entry is left to the higher-level
         caller (which knows the notebook's cell-id allocation policy).
+
+        PLAN-S5.0.1c §3.10: refuses with K3C if the cell is running,
+        K3E if it is contaminated.
         """
+        self._check_structural_op_preconditions(cell_id, "split")
         text = self._writer.get_cell_text(cell_id) or ""
         return split_at_break_text(text, position)
 
     def merge_cells(self, a_id: str, b_id: str) -> str:
-        """Merge ``b_id`` into ``a_id``; remove ``b_id``."""
+        """Merge ``b_id`` into ``a_id``; remove ``b_id``.
+
+        PLAN-S5.0.1c §3.10: refuses with K3C if EITHER cell is
+        running, K3E if EITHER is contaminated.
+        """
+        self._check_structural_op_preconditions(a_id, "merge")
+        self._check_structural_op_preconditions(b_id, "merge")
         a_text = self._writer.get_cell_text(a_id) or ""
         b_text = self._writer.get_cell_text(b_id) or ""
         merged = merge_cells_text(a_text, b_text)
         self._writer.set_cell_text(a_id, merged)
         self._writer.delete_cell(b_id)
         return merged
+
+    def delete_cell(self, cell_id: str) -> bool:
+        """Delete ``cell_id``. PLAN-S5.0.1c §3.10 K3C/K3E gated.
+
+        Returns True iff the cell existed and was removed (mirrors
+        :meth:`MetadataWriter.delete_cell`'s contract).
+        """
+        self._check_structural_op_preconditions(cell_id, "delete")
+        return bool(self._writer.delete_cell(cell_id))
+
+    def move_cell(self, cell_id: str, new_index: int) -> int:
+        """Move ``cell_id`` to ``new_index`` in the cell ordering.
+
+        PLAN-S5.0.1c §3.10 K3C/K3E gated. Returns the new index.
+        AMBIGUITY-FLAG: the writer does not currently expose an
+        ordered-cells API; this method validates the precondition and
+        delegates to ``self._writer.move_cell`` if available, else
+        records the request as a no-op return of ``new_index``. The
+        gate is the load-bearing semantic in this slice; the actual
+        reorder ships when the writer exposes the API.
+        """
+        self._check_structural_op_preconditions(cell_id, "move")
+        mover = getattr(self._writer, "move_cell", None)
+        if callable(mover):
+            return int(mover(cell_id, new_index))
+        return int(new_index)
+
+    def reset_contamination(self, cell_id: str) -> bool:
+        """Operator-only: clear ``cells[cell_id].contaminated``.
+
+        PLAN-S5.0.1c §3.10. Refuses with K3C when the cell is
+        currently running (operator must @stop first; reset on a
+        live-running cell would race the contamination scanner).
+        Does NOT refuse on K3E — this is the unblock path.
+
+        Returns True iff a flag was actually flipped (idempotent).
+        """
+        if self._is_cell_running(cell_id):
+            raise CellManagerPreconditionError(
+                K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED,
+                f"cell_running_cannot_reset_contamination "
+                f"(cell_id={cell_id!r})",
+                cell_id=cell_id,
+            )
+        resetter = getattr(self._writer, "reset_cell_contamination", None)
+        if not callable(resetter):
+            return False
+        return bool(resetter(cell_id))
 
     def insert_line_magic(
         self, cell_id: str, magic_name: str, args: str = "",
@@ -330,10 +540,53 @@ class CellManager:
     def set_cell_kind(
         self, cell_id: str, kind: str, args: str = "",
     ) -> str:
+        """Replace / insert the leading ``@@<kind>`` declaration.
+
+        PLAN-S5.0.1c §3.10: kind-change on a running cell raises
+        **K3D** (separate code from K3C so analytics can split out the
+        kind-change refusal class). Contaminated cells refuse with
+        K3E.
+        """
+        self._check_structural_op_preconditions(
+            cell_id,
+            "set_cell_kind",
+            running_code=K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED,
+        )
         text = self._writer.get_cell_text(cell_id) or ""
         new_text = set_cell_kind_text(text, kind, args)
         self._writer.set_cell_text(cell_id, new_text)
         return new_text
+
+    def set_cell_text(self, cell_id: str, text: str) -> None:
+        """Set canonical cell text. PLAN-S5.0.1c §3.10 text-only gate.
+
+        * Contaminated cell → refuse with K3E (the operator must
+          first ``reset_contamination``).
+        * Running cell → ALLOWED. Emit K3F at info level so the audit
+          trail records the edit-during-run event but the text write
+          proceeds.
+        """
+        # Contamination check first — it's strict.
+        if self._is_cell_contaminated(cell_id):
+            raise CellManagerPreconditionError(
+                K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED,
+                f"contaminated_cell_cannot_set_cell_text "
+                f"(cell_id={cell_id!r}); call reset_contamination "
+                f"to unfreeze",
+                cell_id=cell_id,
+            )
+        # Running cells: edit allowed; emit K3F info marker.
+        if self._is_cell_running(cell_id):
+            try:
+                from . import _diagnostics  # type: ignore
+                _diagnostics.mark(
+                    "cell_manager_running_cell_edit_text_only",
+                    cell_id=cell_id,
+                    k_class=K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH,
+                )
+            except Exception:  # pragma: no cover - diagnostics best-effort
+                pass
+        self._writer.set_cell_text(cell_id, text)
 
     def view(self, cell_id: str) -> Optional[object]:
         """Return the parsed view for ``cell_id`` (or None if absent)."""
