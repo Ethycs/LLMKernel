@@ -70,6 +70,15 @@ K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED: str = "K3H"
 AgentState = str  # starting | running | restarting | failed | terminated
 
 
+class _HandoffCycleError(Exception):
+    """Raised by ``_missed_turns`` when the DAG walker detects a cycle.
+
+    PLAN-S4 K26 ``cycle_detected``: the turn chain exceeded the max-depth
+    guard or a ``parent_id`` loop was detected.  The supervisor converts
+    this into a K26 RuntimeError surfaced as a ``report_problem`` span.
+    """
+
+
 @dataclass
 class AgentHandle:
     """Per-spawn handle returned by :meth:`AgentSupervisor.spawn`.
@@ -113,6 +122,14 @@ class AgentHandle:
     #: can thread the conversation back to where the prior process left
     #: off. Empty string when unset (legacy callers, fixtures).
     claude_session_id: str = ""
+    #: PLAN-S4: the most recent turn-id this agent's claude session has
+    #: been fed.  ``None`` for fresh spawns (agent has seen no turns
+    #: yet).  After a successful ``send_user_turn`` this advances to
+    #: the notebook head turn-id so subsequent calls can compute the
+    #: missed-turn delta.  Mirrored into
+    #: ``metadata.rts.zone.agents.<id>.session.last_seen_turn_id`` via
+    #: the ``update_agent_session`` intent (BSP-002 §4.6 / agent.md).
+    last_seen_turn_id: Optional[str] = None
 
     def poll(self) -> Optional[int]:
         """Return the process exit code if it has exited, else ``None``."""
@@ -203,6 +220,54 @@ class AgentSupervisor:
         # detector still runs (logging via ``_diagnostics.mark``)
         # so the audit trail is preserved without a wired writer.
         self._metadata_writer: Optional[Any] = None
+        # PLAN-S4: in-memory turn store keyed by turn_id.  Each entry is a
+        # dict with at minimum: {"id": str, "agent_id": str, "parent_id":
+        # str|None, "role": str, "content": str}.  Populated by callers
+        # (typically the mcp_server dispatcher) via ``record_turn``; consumed
+        # by ``_missed_turns``.  Protected by ``_lock``.
+        self._turns: Dict[str, Dict[str, Any]] = {}
+        #: PLAN-S4: id of the most recently recorded turn — the notebook head.
+        #: ``None`` when no turns have been recorded yet.  Protected by
+        #: ``_lock``.  Updated by ``record_turn`` on every new turn.
+        self._head_turn_id: Optional[str] = None
+
+    def record_turn(
+        self,
+        turn_id: str,
+        agent_id: str,
+        role: str,
+        content: str,
+        parent_id: Optional[str] = None,
+    ) -> None:
+        """Register one turn in the supervisor's in-memory DAG.
+
+        PLAN-S4: called by the mcp_server dispatcher (or tests) after a
+        turn completes so the cross-agent handoff walker has a complete
+        picture of the zone's turn history.
+
+        Args:
+            turn_id: Unique id for this turn (e.g. ``"t_<ulid>"``).
+            agent_id: The agent whose session produced this turn.
+            role: ``"assistant"`` for agent responses; ``"user"`` for
+                operator messages.
+            content: The text body of the turn.
+            parent_id: The id of the preceding turn in the DAG chain, or
+                ``None`` for the root turn.
+        """
+        with self._lock:
+            self._turns[turn_id] = {
+                "id": turn_id,
+                "agent_id": agent_id,
+                "role": role,
+                "content": content,
+                "parent_id": parent_id,
+            }
+            self._head_turn_id = turn_id
+
+    def _notebook_head_turn_id(self) -> Optional[str]:
+        """Return the current notebook-head turn-id under lock."""
+        with self._lock:
+            return self._head_turn_id
 
     def spawn(
         self, zone_id: str, agent_id: str, task: str, work_dir: Path,
@@ -564,6 +629,27 @@ class AgentSupervisor:
                 )
                 status = "spawned_fresh"
 
+        # PLAN-S4: cross-agent context handoff — walk the turn DAG
+        # between handle.last_seen_turn_id and the current notebook head,
+        # synthesize prefix lines for missed sibling turns, and inject
+        # them before the operator's message.
+        head_turn_id = self._notebook_head_turn_id()
+        try:
+            missed = self._missed_turns(agent_id, head_turn_id)
+            prefix_lines = self._synthesize_handoff_prefix(missed)
+        except _HandoffCycleError as exc:
+            from .wire.tools import K26_CROSS_AGENT_HANDOFF_FAILED
+            _diagnostics.mark(
+                "send_user_turn_handoff_cycle_detected",
+                agent_id=agent_id, k_class=K26_CROSS_AGENT_HANDOFF_FAILED,
+                reason="cycle_detected",
+            )
+            raise RuntimeError(
+                f"{K26_CROSS_AGENT_HANDOFF_FAILED}: cross-agent handoff "
+                f"failed (reason: cycle_detected) for agent {agent_id!r}: "
+                f"{exc}"
+            ) from exc
+
         # Write the stream-json user turn. BSP-002 §4.1: claude reads
         # ``{"type":"user","message":{"role":"user","content":<text>}}``
         # from stdin when the process was launched with
@@ -572,7 +658,7 @@ class AgentSupervisor:
         # noted in S3 report); without it claude treats stdin as the
         # initial prompt only. The wire-side write is correct per the
         # atom; the argv-side completion is a separate amendment.
-        line = json.dumps({
+        operator_line = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": text},
         }) + "\n"
@@ -584,24 +670,151 @@ class AgentSupervisor:
                 f"stdin (was the popen built with stdin=PIPE?)"
             )
         try:
-            handle.popen.stdin.write(line)
+            # Write prefix lines (handoff context) before operator message.
+            for prefix_line in prefix_lines:
+                handle.popen.stdin.write(prefix_line + "\n")
+            handle.popen.stdin.write(operator_line)
             handle.popen.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
+            from .wire.tools import K26_CROSS_AGENT_HANDOFF_FAILED
             _diagnostics.mark(
                 "send_user_turn_stdin_write_failed",
                 agent_id=agent_id, error_type=type(exc).__name__,
+                k_class=K26_CROSS_AGENT_HANDOFF_FAILED if prefix_lines else None,
+                reason="stdin_write_failed" if prefix_lines else None,
             )
             raise
+        # PLAN-S4: advance last_seen_turn_id to the notebook head so the
+        # next call computes the correct missed-turn delta.
+        handle.last_seen_turn_id = head_turn_id
+        # Persist via update_agent_session intent if a writer is wired.
+        if self._metadata_writer is not None and head_turn_id is not None:
+            try:
+                self._metadata_writer.submit_intent({
+                    "intent_kind": "update_agent_session",
+                    "parameters": {
+                        "agent_id": agent_id,
+                        "last_seen_turn_id": head_turn_id,
+                    },
+                })
+            except Exception:  # pragma: no cover — writer errors are best-effort
+                _diagnostics.mark(
+                    "send_user_turn_update_session_intent_failed",
+                    agent_id=agent_id,
+                )
         _diagnostics.mark(
             "send_user_turn_stdin_written",
             agent_id=agent_id, status=status, cell_id=cell_id,
-            bytes_written=len(line),
+            bytes_written=len(operator_line),
+            handoff_prefix_count=len(prefix_lines),
         )
         return {
             "agent_id": agent_id,
             "status": status,
             "cell_id": cell_id,
+            "handoff_prefix_count": len(prefix_lines),
         }
+
+    # ------------------------------------------------------------------
+    # PLAN-S4: cross-agent context handoff helpers
+    # ------------------------------------------------------------------
+
+    #: Maximum DAG depth the missed-turn walker will traverse before
+    #: raising K26 ``cycle_detected``.  A zone with more turns than this
+    #: limit in a single chain is pathological; 1 000 is generous.
+    _HANDOFF_MAX_DEPTH: int = 1_000
+
+    def _missed_turns(
+        self,
+        agent_id: str,
+        head_turn_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Walk the turn DAG from ``head_turn_id`` back to ``agent.last_seen_turn_id``.
+
+        Returns the chain in chronological (root → head) order, filtered
+        to turns NOT authored by ``agent_id``.  Returns an empty list when
+        there are no turns, or when ``agent.last_seen_turn_id`` already
+        equals ``head_turn_id``.
+
+        Raises :class:`_HandoffCycleError` (K26 ``cycle_detected``) when
+        the chain exceeds :attr:`_HANDOFF_MAX_DEPTH` steps.
+        """
+        with self._lock:
+            handle = self._agents.get(agent_id)
+            last_seen = handle.last_seen_turn_id if handle is not None else None
+            turns_snapshot = dict(self._turns)
+
+        if head_turn_id is None:
+            # No turns in the zone yet.
+            return []
+        if head_turn_id == last_seen:
+            # Agent is already up to date.
+            return []
+
+        # Walk backward from head to last_seen (exclusive).
+        chain: List[Dict[str, Any]] = []
+        current_id: Optional[str] = head_turn_id
+        visited: set = set()
+        depth = 0
+        while current_id is not None and current_id != last_seen:
+            if depth > self._HANDOFF_MAX_DEPTH:
+                raise _HandoffCycleError(
+                    f"DAG walk exceeded max depth {self._HANDOFF_MAX_DEPTH} "
+                    f"starting from {head_turn_id!r}; possible cycle."
+                )
+            if current_id in visited:
+                raise _HandoffCycleError(
+                    f"Cycle detected at turn {current_id!r} while walking "
+                    f"DAG from {head_turn_id!r}."
+                )
+            visited.add(current_id)
+            turn = turns_snapshot.get(current_id)
+            if turn is None:
+                # Turn referenced but not in store; stop here (partial DAG).
+                break
+            chain.append(turn)
+            current_id = turn.get("parent_id")
+            depth += 1
+
+        # Reverse so the list is chronological (root → head).
+        chain.reverse()
+        # Filter out turns authored by this agent.
+        return [t for t in chain if t.get("agent_id") != agent_id]
+
+    def _synthesize_handoff_prefix(
+        self,
+        turns: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Build stream-json prefix lines for ``turns``.
+
+        One line per turn in the format::
+
+            {"type":"user","message":{"role":"user","content":"<role> <agent_id> said: <body>"}}
+
+        Body content passes through ``magic_hash.strip_hashes_from_text``
+        before the JSON wrap so agents never observe ``@@<hash>:<name>``
+        patterns.
+
+        Returns a list of JSON strings (WITHOUT trailing newlines; the
+        caller appends ``"\\n"`` when writing to stdin).
+        """
+        from .magic_hash import strip_hashes_from_text
+        from .magic_registry import CELL_MAGICS, LINE_MAGICS
+        known_names: set = set(CELL_MAGICS) | set(LINE_MAGICS)
+
+        result: List[str] = []
+        for turn in turns:
+            role = turn.get("role", "assistant")
+            author = turn.get("agent_id", "unknown")
+            raw_body = turn.get("content", "")
+            stripped_body = strip_hashes_from_text(raw_body, known_names)
+            content = f"{role} {author} said: {stripped_body}"
+            line = json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": content},
+            })
+            result.append(line)
+        return result
 
     # BSP-005 S9 — interrupt method paired with the X-EXT cell-toolbar
     # interrupt button (commit 5de3401 sends ``{action_type:
@@ -1136,12 +1349,19 @@ class AgentSupervisor:
             and isinstance(runtime_status, str)
             and runtime_status in self._RESUMABLE_RUNTIME_STATUSES
         )
+        # PLAN-S4: restore last_seen_turn_id from the config entry so the
+        # handoff walker knows where to start after a notebook reopen.
+        last_seen_turn_id: Optional[str] = entry.get("last_seen_turn_id")
+
         if not is_resume:
-            return self.spawn(
+            handle = self.spawn(
                 zone_id=zone_id, agent_id=agent_id, task=task,
                 work_dir=work_dir, api_key=api_key,
                 model=model, use_bare=use_bare,
             )
+            if last_seen_turn_id:
+                handle.last_seen_turn_id = last_seen_turn_id
+            return handle
 
         handle = self.spawn(
             zone_id=zone_id, agent_id=agent_id, task=task,
@@ -1165,6 +1385,8 @@ class AgentSupervisor:
                 work_dir=work_dir, api_key=api_key,
                 model=model, use_bare=use_bare,
             )
+        if last_seen_turn_id:
+            handle.last_seen_turn_id = last_seen_turn_id
         return handle
 
     def _resume_failed(self, handle: AgentHandle) -> bool:

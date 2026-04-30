@@ -428,6 +428,20 @@ def validate_tool_output(tool_name: str, result: Dict[str, Any]) -> Optional[str
 # meaning before it appears in a marker.
 
 K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
+    # S4 -- cross-agent context handoff.
+    "K26": {
+        "name": "cross_agent_handoff_failed",
+        "fires_in": "agent_supervisor.send_user_turn",
+        "description": (
+            "The cross-agent context handoff failed before or during prefix "
+            "write to the target agent's stdin.  The agent is left in an "
+            "indeterminate session state.  Raised with "
+            "``reason: 'cycle_detected'`` when the turn-DAG walker exceeds "
+            "its max-depth guard, or with ``reason: 'stdin_write_failed'`` "
+            "when a prefix line could not be delivered.  Surfaced as a "
+            "synthetic ``report_problem`` span on the cell."
+        ),
+    },
     # K30/K31/K32/K34 -- pre-S5.0.1 codes, registered here for
     # completeness so a future audit pass can validate the full set
     # in one place.
@@ -623,6 +637,7 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
 }
 
 # Convenience constants for K-class codes (avoids magic strings at call sites).
+K26_CROSS_AGENT_HANDOFF_FAILED: str = "K26"
 K30_MULTIPLE_KINDS: str = "K30"
 K31_UNKNOWN_CELL_MAGIC: str = "K31"
 K32_RESERVED_MAGIC_NAME: str = "K32"
@@ -671,6 +686,7 @@ __all__ = [
     "K_CLASS_REGISTRY",
     "k_class_info",
     # K-code string constants
+    "K26_CROSS_AGENT_HANDOFF_FAILED",
     "K30_MULTIPLE_KINDS",
     "K31_UNKNOWN_CELL_MAGIC",
     "K32_RESERVED_MAGIC_NAME",

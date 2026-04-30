@@ -511,3 +511,257 @@ def test_supervisor_terminate_sets_state_terminated(tmp_path: Path) -> None:
     # Watchdog has chance to observe exit and tag terminated.
     time.sleep(0.05)
     assert handle.state in {"terminated", "running"}  # depends on timing
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S4 cross-agent context handoff tests
+# ---------------------------------------------------------------------------
+
+import io as _io
+
+
+class _FakeStdin:
+    """Captures write/flush calls for handoff prefix tests."""
+
+    def __init__(self) -> None:
+        self._buf = _io.StringIO()
+
+    def write(self, s: str) -> int:
+        return self._buf.write(s)
+
+    def flush(self) -> None:
+        pass  # no-op
+
+    def written(self) -> str:
+        return self._buf.getvalue()
+
+    def lines(self) -> List[str]:
+        return [ln for ln in self.written().splitlines() if ln]
+
+
+class _FakePopenWithStdin(_FakePopen):
+    """_FakePopen variant that provides a writable stdin buffer."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.stdin = _FakeStdin()
+
+
+def _make_supervisor_with_alpha(tmp_path: Path) -> tuple:
+    """Spawn alpha in a supervisor; return (supervisor, handle, fake_popen)."""
+    sup = _make_supervisor()
+    fake = _FakePopenWithStdin(stdout_lines=[])
+    fake.returncode = None  # keep process alive
+    with _patch_health(), patch("subprocess.Popen", return_value=fake):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="hello",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+    return sup, handle, fake
+
+
+def test_send_user_turn_no_missed_turns(tmp_path: Path) -> None:
+    """Single agent, no sibling turns — operator message goes straight through with no prefix."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    result = sup.send_user_turn("alpha", "hello from operator")
+    lines = fake.stdin.lines()
+    # Only one line: the operator message itself.
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["message"]["content"] == "hello from operator"
+    assert result["handoff_prefix_count"] == 0
+    handle.terminate()
+
+
+def test_send_user_turn_with_one_missed_sibling_turn(tmp_path: Path) -> None:
+    """Two agents; beta produced 1 turn; alpha gets 1 prefix line then the operator message."""
+    sup = _make_supervisor()
+    fake_alpha = _FakePopenWithStdin(stdout_lines=[])
+    fake_alpha.returncode = None
+    fake_beta = _FakePopenWithStdin(stdout_lines=[])
+    fake_beta.returncode = None
+
+    def _popen_factory(*args: Any, **kwargs: Any) -> Any:
+        # Return alpha's popen first, then beta's.
+        return _popen_factory._queue.pop(0)
+    _popen_factory._queue = [fake_alpha, fake_beta]
+
+    with _patch_health(), patch("subprocess.Popen", side_effect=_popen_factory):
+        sup.spawn(zone_id="z1", agent_id="alpha", task="t", work_dir=tmp_path, api_key="sk-x")
+        sup.spawn(zone_id="z1", agent_id="beta", task="t", work_dir=tmp_path, api_key="sk-x")
+
+    # Record a beta turn.
+    sup.record_turn("t1", "beta", "assistant", "beta reply one", parent_id=None)
+
+    result = sup.send_user_turn("alpha", "operator to alpha")
+    lines = fake_alpha.stdin.lines()
+    # Expect: 1 prefix line + 1 operator line = 2 total.
+    assert len(lines) == 2, lines
+    prefix = json.loads(lines[0])
+    assert prefix["type"] == "user"
+    assert "beta" in prefix["message"]["content"]
+    assert "beta reply one" in prefix["message"]["content"]
+    operator_msg = json.loads(lines[1])
+    assert operator_msg["message"]["content"] == "operator to alpha"
+    assert result["handoff_prefix_count"] == 1
+    fake_alpha.terminate()
+    fake_beta.terminate()
+
+
+def test_send_user_turn_with_three_missed_sibling_turns(tmp_path: Path) -> None:
+    """Chronological order preserved; 3 prefix lines asserted exact strings."""
+    sup = _make_supervisor()
+    fake_alpha = _FakePopenWithStdin(stdout_lines=[])
+    fake_alpha.returncode = None
+    fake_beta = _FakePopenWithStdin(stdout_lines=[])
+    fake_beta.returncode = None
+
+    def _factory(*a: Any, **kw: Any) -> Any:
+        return _factory._q.pop(0)
+    _factory._q = [fake_alpha, fake_beta]
+
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        sup.spawn(zone_id="z1", agent_id="alpha", task="t", work_dir=tmp_path, api_key="sk-x")
+        sup.spawn(zone_id="z1", agent_id="beta", task="t", work_dir=tmp_path, api_key="sk-x")
+
+    # Record 3 turns in a chain: t1 -> t2 -> t3.
+    sup.record_turn("t1", "beta", "assistant", "first", parent_id=None)
+    sup.record_turn("t2", "beta", "assistant", "second", parent_id="t1")
+    sup.record_turn("t3", "beta", "assistant", "third", parent_id="t2")
+
+    result = sup.send_user_turn("alpha", "go")
+    lines = fake_alpha.stdin.lines()
+    # 3 prefix + 1 operator = 4
+    assert len(lines) == 4, lines
+    contents = [json.loads(ln)["message"]["content"] for ln in lines[:3]]
+    assert "first" in contents[0]
+    assert "second" in contents[1]
+    assert "third" in contents[2]
+    assert result["handoff_prefix_count"] == 3
+    fake_alpha.terminate()
+    fake_beta.terminate()
+
+
+def test_send_user_turn_unknown_agent_raises_k20(tmp_path: Path) -> None:
+    """Supervisor lookup miss raises KeyError (maps to K20 at dispatcher)."""
+    sup = _make_supervisor()
+    with pytest.raises(KeyError):
+        sup.send_user_turn("no_such_agent", "hello")
+
+
+def test_send_user_turn_dead_agent_resumes_first(tmp_path: Path) -> None:
+    """Idle agent (popen reaped) is resumed before handoff + message are sent."""
+    sup = _make_supervisor()
+    fake_first = _FakePopenWithStdin(stdout_lines=[])
+    fake_first.returncode = None
+    fake_resumed = _FakePopenWithStdin(stdout_lines=[])
+    fake_resumed.returncode = None  # resume succeeds
+
+    popped: List[Any] = [fake_first, fake_resumed]
+
+    def _factory(*a: Any, **kw: Any) -> Any:
+        return popped.pop(0)
+
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        handle = sup.spawn(
+            zone_id="z1", agent_id="alpha", task="t",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+
+    # Simulate process death.
+    fake_first.returncode = 0
+    fake_first._exited.set()
+
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        result = sup.send_user_turn("alpha", "after resume")
+
+    assert result["status"] in {"resumed_then_sent", "spawned_fresh"}
+    # The resumed popen's stdin should have the operator message.
+    assert fake_resumed.stdin.lines()
+    fake_resumed.terminate()
+
+
+def test_send_user_turn_advances_last_seen_turn_id(tmp_path: Path) -> None:
+    """After success, handle.last_seen_turn_id == notebook head turn id."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t99", "alpha", "assistant", "alpha self turn", parent_id=None)
+    # Self-authored turn is filtered — no prefix — but head advances.
+    sup.send_user_turn("alpha", "msg")
+    assert handle.last_seen_turn_id == "t99"
+    handle.terminate()
+
+
+def test_send_user_turn_handoff_failure_raises_k26(tmp_path: Path) -> None:
+    """Cycle in turn DAG raises K26 RuntimeError with cycle_detected reason."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # Create a turn cycle: t1 -> t2 -> t1 (via parent_id loop)
+    # Inject turns manually to bypass record_turn's linear ordering.
+    with sup._lock:
+        sup._turns["t1"] = {
+            "id": "t1", "agent_id": "beta", "role": "assistant",
+            "content": "beta msg", "parent_id": "t2",
+        }
+        sup._turns["t2"] = {
+            "id": "t2", "agent_id": "beta", "role": "assistant",
+            "content": "beta msg2", "parent_id": "t1",
+        }
+        sup._head_turn_id = "t2"
+
+    with pytest.raises(RuntimeError, match="K26"):
+        sup.send_user_turn("alpha", "trigger cycle")
+    handle.terminate()
+
+
+def test_send_user_turn_persists_last_seen_via_writer(tmp_path: Path) -> None:
+    """update_agent_session intent submitted with last_seen_turn_id after success."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    mock_writer = MagicMock()
+    mock_writer.submit_intent = MagicMock(return_value={"ok": True})
+    sup.set_metadata_writer(mock_writer)
+
+    sup.record_turn("t77", "alpha", "assistant", "self turn", parent_id=None)
+    sup.send_user_turn("alpha", "persist test")
+
+    # Writer must have received update_agent_session with last_seen_turn_id.
+    mock_writer.submit_intent.assert_called_once()
+    envelope = mock_writer.submit_intent.call_args[0][0]
+    assert envelope["intent_kind"] == "update_agent_session"
+    assert envelope["parameters"]["last_seen_turn_id"] == "t77"
+    assert envelope["parameters"]["agent_id"] == "alpha"
+    handle.terminate()
+
+
+def test_send_user_turn_strips_hashes_in_handoff_prefix(tmp_path: Path) -> None:
+    """Sibling turn body with hashed-magic survives as plain magic in prefix."""
+    sup = _make_supervisor()
+    fake_alpha = _FakePopenWithStdin(stdout_lines=[])
+    fake_alpha.returncode = None
+    fake_beta = _FakePopenWithStdin(stdout_lines=[])
+    fake_beta.returncode = None
+
+    def _factory(*a: Any, **kw: Any) -> Any:
+        return _factory._q.pop(0)
+    _factory._q = [fake_alpha, fake_beta]
+
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        sup.spawn(zone_id="z1", agent_id="alpha", task="t", work_dir=tmp_path, api_key="sk-x")
+        sup.spawn(zone_id="z1", agent_id="beta", task="t", work_dir=tmp_path, api_key="sk-x")
+
+    # Body contains a hashed-magic line (fake hash + registered name "agent").
+    # The strip helper removes the hash; the test asserts the prefix content
+    # does NOT contain the hashed form.
+    hashed_body = "@@deadbeef1234:agent hello"
+    sup.record_turn("t1", "beta", "assistant", hashed_body, parent_id=None)
+
+    sup.send_user_turn("alpha", "check strip")
+    lines = fake_alpha.stdin.lines()
+    # At least the prefix line exists.
+    assert len(lines) >= 2, lines
+    prefix_content = json.loads(lines[0])["message"]["content"]
+    # The hashed form "@@deadbeef1234:agent" must NOT appear in the prefix.
+    assert "@@deadbeef1234:agent" not in prefix_content, prefix_content
+    # The plain form OR the raw body text should appear (strip_hashes_from_text
+    # strips to @@agent when "agent" is in known_names, otherwise leaves as-is).
+    assert "hashed_body" not in prefix_content  # not the variable name
+    fake_alpha.terminate()
+    fake_beta.terminate()

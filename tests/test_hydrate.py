@@ -158,6 +158,159 @@ def test_hydrate_rejects_forbidden_secret_in_config() -> None:
     assert "DO_NOT_LOG" not in str(ei.value)
 
 
+# ---------------------------------------------------------------------------
+# PLAN-S4: hydrate + handoff tests
+# ---------------------------------------------------------------------------
+
+import io as _io
+import threading as _threading
+import uuid as _uuid
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from llm_kernel.agent_supervisor import AgentSupervisor
+
+
+class _FakeStdinH:
+    """Captures write/flush calls for hydrate handoff tests."""
+
+    def __init__(self) -> None:
+        self._buf = _io.StringIO()
+
+    def write(self, s: str) -> int:
+        return self._buf.write(s)
+
+    def flush(self) -> None:
+        pass
+
+    def lines(self) -> list:
+        return [ln for ln in self._buf.getvalue().splitlines() if ln]
+
+
+class _FakePopenH:
+    """Minimal Popen double with writable stdin."""
+
+    def __init__(self) -> None:
+        self.stdout = iter([""])
+        self.stderr = iter([""])
+        self.returncode: Any = None
+        self._exited = _threading.Event()
+        self.pid = 99999
+        self.stdin = _FakeStdinH()
+
+    def poll(self) -> Any:
+        return self.returncode
+
+    def wait(self, timeout: Any = None) -> int:
+        self._exited.wait(timeout=timeout or 0.2)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = 0
+        self._exited.set()
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self._exited.set()
+
+
+def _make_sup_h() -> AgentSupervisor:
+    from llm_kernel.run_tracker import RunTracker
+
+    class _Sink:
+        def emit(self, e: Any) -> None:
+            pass
+
+    tracker = RunTracker(
+        trace_id=str(_uuid.uuid4()), sink=_Sink(),
+        agent_id="alpha", zone_id="z1",
+    )
+    return AgentSupervisor(
+        run_tracker=tracker,
+        dispatcher=MagicMock(),
+        litellm_endpoint_url="http://127.0.0.1:9999/v1",
+    )
+
+
+def _patch_health_h(status_code: int = 200):
+    fake = MagicMock()
+    fake.status_code = status_code
+    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+
+
+def test_hydrate_restores_last_seen_turn_id_per_agent(tmp_path: Path) -> None:
+    """respawn_from_config restores last_seen_turn_id from the config entry."""
+    sup = _make_sup_h()
+    fake = _FakePopenH()
+
+    entry = {
+        "agent_id": "alpha",
+        "zone_id": "z1",
+        "task": "hello",
+        "work_dir": str(tmp_path),
+        "api_key": "sk-x",
+        "last_seen_turn_id": "t_hydrated_99",
+    }
+
+    with _patch_health_h(), patch("subprocess.Popen", return_value=fake):
+        results = sup.respawn_from_config([entry])
+
+    assert results.get("alpha") == "spawned"
+    with sup._lock:
+        handle = sup._agents.get("alpha")
+    assert handle is not None
+    # The handle's last_seen_turn_id should be restored from the config entry.
+    assert handle.last_seen_turn_id == "t_hydrated_99"
+    fake.terminate()
+
+
+def test_handoff_after_hydrate_replays_correctly(tmp_path: Path) -> None:
+    """After hydrate with last_seen_turn_id set, send_user_turn injects only newer turns."""
+    sup = _make_sup_h()
+    fake_alpha = _FakePopenH()
+    fake_beta = _FakePopenH()
+
+    popped_h: list = [fake_alpha, fake_beta]
+
+    def _factory_h(*a: Any, **kw: Any) -> Any:
+        return popped_h.pop(0)
+
+    entry = {
+        "agent_id": "alpha",
+        "zone_id": "z1",
+        "task": "hello",
+        "work_dir": str(tmp_path),
+        "api_key": "sk-x",
+        "last_seen_turn_id": "t_old",
+    }
+
+    with _patch_health_h(), patch("subprocess.Popen", side_effect=_factory_h):
+        sup.respawn_from_config([entry])
+        # Also spawn beta directly.
+        sup.spawn(
+            zone_id="z1", agent_id="beta", task="t",
+            work_dir=tmp_path, api_key="sk-x",
+        )
+
+    # Record turns: t_old (already seen) and t_new (missed).
+    sup.record_turn("t_old", "beta", "assistant", "old beta msg", parent_id=None)
+    sup.record_turn("t_new", "beta", "assistant", "new beta msg", parent_id="t_old")
+
+    # send_user_turn for alpha should inject only t_new (t_old was last_seen).
+    result = sup.send_user_turn("alpha", "after hydrate")
+    lines = fake_alpha.stdin.lines()
+    # Expect: 1 prefix (t_new only) + 1 operator = 2 lines.
+    assert len(lines) == 2, lines
+    prefix_content = json.loads(lines[0])["message"]["content"]
+    assert "new beta msg" in prefix_content, prefix_content
+    assert "old beta msg" not in prefix_content, prefix_content
+    assert result["handoff_prefix_count"] == 1
+    fake_alpha.terminate()
+    fake_beta.terminate()
+
+
 def test_hydrate_replaces_state_not_merges() -> None:
     """Hydrate replaces -- pre-existing layout edits are wiped."""
     snap = _baseline_snapshot()
