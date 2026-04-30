@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "type": "string"
+    },
+    "decision": {
+      "enum": [
+        "accept",
+        "reject",
+        "modify",
+        "defer"
+      ],
+      "type": "string"
+    },
+    "modification": {
+      "type": "string"
+    },
+    "run_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "scope_granted": {
+      "enum": [
+        "one_shot",
+        "this_file",
+        "this_zone",
+        "session"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision",
+    "run_id"
+  ],
+  "type": "object"
+}

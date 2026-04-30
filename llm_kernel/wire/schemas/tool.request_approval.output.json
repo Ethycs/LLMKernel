@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "type": "string"
+    },
+    "alternative_label": {
+      "type": "string"
+    },
+    "decision": {
+      "enum": [
+        "approve",
+        "approve_with_modification",
+        "deny",
+        "defer"
+      ],
+      "type": "string"
+    },
+    "modification": {
+      "type": "string"
+    },
+    "run_id": {
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision",
+    "run_id"
+  ],
+  "type": "object"
+}

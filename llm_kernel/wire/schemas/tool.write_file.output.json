@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "type": "string"
+    },
+    "bytes_written": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "created": {
+      "type": "boolean"
+    },
+    "run_id": {
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "required": [
+    "bytes_written",
+    "run_id"
+  ],
+  "type": "object"
+}

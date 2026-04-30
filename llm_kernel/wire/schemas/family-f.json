@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Family F: notebook metadata snapshots / patches / hydrate (RFC-006 \u00a78). Bidirectional in v2.0.2.",
+  "properties": {
+    "correlation_id": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "type": {
+      "const": "notebook.metadata",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "payload"
+  ],
+  "title": "Family F envelope",
+  "type": "object",
+  "wire_version": "1.0.0"
+}

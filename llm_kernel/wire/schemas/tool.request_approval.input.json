@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "action": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "alternatives": {
+      "items": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "description"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "diff_preview": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "file_a": {
+          "type": "string"
+        },
+        "file_b": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "unified_diff",
+            "text",
+            "code",
+            "command"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "body"
+      ],
+      "type": "object"
+    },
+    "risk_level": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "timeout_ms": {
+      "default": 1800000,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "action",
+    "diff_preview",
+    "risk_level"
+  ],
+  "type": "object"
+}

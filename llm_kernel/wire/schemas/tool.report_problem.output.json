@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "type": "string"
+    },
+    "acknowledged": {
+      "const": true,
+      "type": "boolean"
+    },
+    "run_id": {
+      "format": "uuid",
+      "type": "string"
+    }
+  },
+  "required": [
+    "acknowledged",
+    "run_id"
+  ],
+  "type": "object"
+}

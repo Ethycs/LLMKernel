@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "description": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "related_artifacts": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "severity": {
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "fatal"
+      ],
+      "type": "string"
+    },
+    "suggested_remediation": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "severity",
+    "description"
+  ],
+  "type": "object"
+}

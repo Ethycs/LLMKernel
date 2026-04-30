@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "encoding": {
+      "default": "utf-8",
+      "enum": [
+        "utf-8",
+        "base64"
+      ],
+      "type": "string"
+    },
+    "mode": {
+      "default": "overwrite",
+      "enum": [
+        "create",
+        "overwrite",
+        "append"
+      ],
+      "type": "string"
+    },
+    "path": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "path",
+    "content"
+  ],
+  "type": "object"
+}

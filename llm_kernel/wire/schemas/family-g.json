@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Family G: lifecycle envelopes (RFC-006 \u00a77). Includes kernel.shutdown_request, heartbeat.kernel, kernel.handshake (V1.5+).",
+  "properties": {
+    "correlation_id": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "type": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "payload"
+  ],
+  "title": "Family G envelope",
+  "type": "object",
+  "wire_version": "1.0.0"
+}

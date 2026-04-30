@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "default_id": {
+      "type": "string"
+    },
+    "options": {
+      "items": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^[a-z0-9_]+$",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "type": "object"
+      },
+      "minItems": 2,
+      "type": "array"
+    },
+    "question": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "timeout_ms": {
+      "default": 600000,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "question",
+    "options"
+  ],
+  "type": "object"
+}

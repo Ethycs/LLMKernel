@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "artifact": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "encoding": {
+          "default": "utf-8",
+          "enum": [
+            "utf-8",
+            "base64"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "body"
+      ],
+      "type": "object"
+    },
+    "artifact_id": {
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "code",
+        "plan",
+        "diff",
+        "doc",
+        "json",
+        "image"
+      ],
+      "type": "string"
+    },
+    "summary": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "artifact",
+    "kind",
+    "summary"
+  ],
+  "type": "object"
+}

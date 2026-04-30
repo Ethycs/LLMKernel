@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "type": "string"
+    },
+    "free_text": {
+      "type": "string"
+    },
+    "run_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "selected_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "selected_id",
+    "run_id"
+  ],
+  "type": "object"
+}

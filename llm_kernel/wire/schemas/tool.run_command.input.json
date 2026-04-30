@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "args": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "command": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "env": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "timeout_ms": {
+      "default": 60000,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "command"
+  ],
+  "type": "object"
+}
