@@ -52,7 +52,7 @@ import uuid
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     from .custom_messages import CustomMessageDispatcher
@@ -1689,6 +1689,184 @@ class MetadataWriter:
             self._config["injection_acceptance"] = new_value
             self._dirty = True
             return new_value
+
+    # -- PLAN-S5.0.2 — magic code generator config + provenance --------
+
+    #: Built-in V1 generator names. Operators may extend this in V2+
+    #: via the registration intent (deferred slice). The list lives at
+    #: ``metadata.rts.config.magic_code_generators``.
+    _DEFAULT_GENERATORS: Tuple[str, ...] = ("template", "expand", "import")
+
+    def read_config_generators(self) -> List[str]:
+        """Read ``metadata.rts.config.magic_code_generators``.
+
+        PLAN-S5.0.2 §6. Defaults to the V1 built-ins when the field is
+        unset (so an operator who hasn't pinned the list still gets
+        ``@@template`` / ``@@expand`` / ``@@import``). Returns a copy
+        so callers can mutate without racing the writer.
+        """
+        with self._lock:
+            value = self._config.get("magic_code_generators")
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return list(value)
+        return list(self._DEFAULT_GENERATORS)
+
+    def read_config_templates(self) -> Dict[str, str]:
+        """Read ``metadata.rts.config.templates``.
+
+        PLAN-S5.0.2 §6 — operator-defined named templates that
+        ``@@template <name>`` looks up. Returns a fresh dict.
+        """
+        with self._lock:
+            value = self._config.get("templates")
+        if isinstance(value, dict):
+            return {
+                k: v for k, v in value.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+        return {}
+
+    def set_config_template(self, name: str, body: str) -> None:
+        """Write one template under ``metadata.rts.config.templates``.
+
+        PLAN-S5.0.2 §6 — operator helper for tests / programmatic
+        seeding. The operator-typed path is editing
+        ``metadata.rts.config.templates`` directly via the canonical
+        notebook editor; this method is the kernel-side mirror.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("set_config_template: name must be a non-empty str")
+        if not isinstance(body, str):
+            raise ValueError("set_config_template: body must be a str")
+        with self._lock:
+            templates = self._config.get("templates")
+            if not isinstance(templates, dict):
+                templates = {}
+            templates[name] = body
+            self._config["templates"] = templates
+            self._dirty = True
+
+    def get_operator_pin(self) -> Optional[str]:
+        """Return the operator pin when hash mode is on, else None.
+
+        PLAN-S5.0.2 §4.2. The pin itself is NEVER stored in the
+        notebook (only its fingerprint, per S5.0.1b). V1 sources the
+        pin from the ``LLMNB_OPERATOR_PIN`` env var; V1.5+ may add an
+        OS-keychain integration. Returns None when hash mode is off
+        OR when the env var is unset / empty.
+        """
+        if not bool(self.get_config_setting("magic_hash_enabled")):
+            return None
+        import os
+
+        pin = os.environ.get("LLMNB_OPERATOR_PIN")
+        if isinstance(pin, str) and pin:
+            return pin
+        return None
+
+    def get_workspace_root(self) -> Path:
+        """Return the workspace root path. PLAN-S5.0.2 §4.2 helper."""
+        return self._workspace_root
+
+    def get_cell_record(self, cell_id: str) -> Optional[Dict[str, Any]]:
+        """Return a shallow copy of ``cells[cell_id]`` (or None).
+
+        PLAN-S5.0.2 — convenience accessor used by the cell-manager
+        precondition checks and by tests asserting on provenance
+        fields. Read-only; mutations on the returned dict don't
+        affect the writer.
+        """
+        if not isinstance(cell_id, str) or not cell_id:
+            return None
+        with self._lock:
+            record = self._cells.get(cell_id)
+            if record is None:
+                return None
+            return dict(record)
+
+    def get_cell_layout_order(self) -> List[str]:
+        """Return cell ids in layout-walk order, fallback dict order.
+
+        PLAN-S5.0.2 §3 — used by ``CellManager.insert_cells_with_provenance``
+        to find the position of ``after_cell_id`` and append new cells
+        right after it. We walk ``layout.tree.children`` recursively
+        collecting any node whose ``id`` is a known cell key; cells
+        not referenced from the layout fall to the end in
+        dict-insertion order.
+        """
+        with self._lock:
+            tree = self._layout.get("tree")
+            cell_keys: List[str] = list(self._cells.keys())
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        if isinstance(tree, dict):
+            stack: List[Any] = [tree]
+            while stack:
+                node = stack.pop(0)
+                if isinstance(node, dict):
+                    nid = node.get("id")
+                    if isinstance(nid, str) and nid in cell_keys and nid not in seen:
+                        ordered.append(nid)
+                        seen.add(nid)
+                    children = node.get("children")
+                    if isinstance(children, list):
+                        stack = list(children) + stack
+        for cid in cell_keys:
+            if cid not in seen:
+                ordered.append(cid)
+                seen.add(cid)
+        return ordered
+
+    def insert_generated_cell(
+        self,
+        new_cell_id: str,
+        text: str,
+        *,
+        after_cell_id: str,
+        generated_by: str,
+        generated_at: str,
+    ) -> None:
+        """Persist a generator-emitted cell with provenance.
+
+        PLAN-S5.0.2 §3 / §6. Writes the canonical fields:
+
+        * ``cells[new_cell_id].text = text``
+        * ``cells[new_cell_id].generated_by = generated_by``
+        * ``cells[new_cell_id].generated_at = generated_at``
+
+        Validates: ``generated_by`` (when non-null) must reference a
+        known cell id; the ISO timestamp must parse. Marks the writer
+        dirty.
+
+        Raises ``ValueError`` (mapped to K3J at the dispatch boundary)
+        when ``generated_by`` is None / empty.
+        """
+        if not isinstance(new_cell_id, str) or not new_cell_id:
+            raise ValueError("insert_generated_cell: new_cell_id required")
+        if not isinstance(text, str):
+            raise ValueError("insert_generated_cell: text must be a str")
+        if not isinstance(generated_by, str) or not generated_by:
+            raise ValueError(
+                "insert_generated_cell: generated_by required (K3J)"
+            )
+        if not isinstance(generated_at, str) or not generated_at:
+            raise ValueError(
+                "insert_generated_cell: generated_at required"
+            )
+        with self._lock:
+            if generated_by not in self._cells:
+                raise ValueError(
+                    "insert_generated_cell: generated_by references "
+                    f"unknown cell {generated_by!r}"
+                )
+            record = dict(self._cells.get(new_cell_id, {}))
+            record["text"] = text
+            record["generated_by"] = generated_by
+            record["generated_at"] = generated_at
+            self._cells[new_cell_id] = record
+            if hasattr(self, "_cell_view_cache"):
+                self._cell_view_cache.pop(new_cell_id, None)
+            self._dirty = True
 
     @classmethod
     def _validate_injection_acceptance(cls, value: Any) -> bool:
