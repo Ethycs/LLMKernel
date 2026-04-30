@@ -299,6 +299,14 @@ LINE_MAGICS: Dict[str, LineMagicHandler] = {
     "affinity": LineMagicHandler(name="affinity"),
     "handoff": LineMagicHandler(name="handoff"),
     "status": LineMagicHandler(name="status"),
+    # PLAN-S5.0.1b §3.5 — pin lifecycle line magic. Subcommands
+    # (set / rotate / off / verify) are dispatched at runtime via
+    # ``llm_kernel.auth_handlers.apply_auth_command``; the parser's
+    # job is just to record the line in ``cell.line_magics`` so the
+    # dispatcher sees it. The handler is intentionally a no-op on
+    # apply (no flag mutation) — the side effect is operator-typed
+    # and runs through the runtime dispatch surface.
+    "auth": LineMagicHandler(name="auth"),
     # S5 stubs — register so the name reserves; apply is a no-op.
     "revert": LineMagicHandler(
         name="revert", status="stub", pending_slice="S5",
