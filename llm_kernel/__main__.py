@@ -662,10 +662,28 @@ if __name__ == '__main__':
     elif len(sys.argv) > 1 and sys.argv[1] == "litellm-proxy":
         _run_litellm_proxy(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "paper-telephone-smoke":
+        print(
+            "DEPRECATION (one-time): `python -m llm_kernel paper-telephone-smoke`"
+            " will be removed in V2. Use `llmnb smoke paper-telephone` instead.",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(_run_paper_telephone_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "agent-supervisor-smoke":
+        print(
+            "DEPRECATION (one-time): `python -m llm_kernel agent-supervisor-smoke`"
+            " will be removed in V2. Use `llmnb smoke supervisor` instead.",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(_run_agent_supervisor_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "metadata-writer-smoke":
+        print(
+            "DEPRECATION (one-time): `python -m llm_kernel metadata-writer-smoke`"
+            " will be removed in V2. Use `llmnb smoke metadata-writer` instead.",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(_run_metadata_writer_smoke())
     elif len(sys.argv) > 1 and sys.argv[1] == "serve":
         # PLAN-S5.0.3d: TCP transport + bearer-token auth + handshake
@@ -694,6 +712,12 @@ if __name__ == '__main__':
         from .pty_mode import main as _pty_main
         sys.exit(_pty_main(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode-smoke":
+        print(
+            "DEPRECATION (one-time): `python -m llm_kernel pty-mode-smoke`"
+            " will be removed in V2. Use `llmnb smoke pty` instead.",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(_run_pty_mode_smoke())
     else:
         main()
