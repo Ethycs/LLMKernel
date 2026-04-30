@@ -35,9 +35,24 @@ import logging
 import socket
 import sys
 import threading
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 logger: logging.Logger = logging.getLogger("llm_kernel.socket_writer")
+
+
+#: PLAN-S5.0.1 §3.3 — string fields inside outbound frames whose
+#: payload may flow into a cell's outputs and therefore must be
+#: scanned for the canonical hashed-magic line shape when hash mode
+#: is enabled. The list is kept short (only fields the kernel emits
+#: into cell-visible spans) so the per-frame walk is O(small) — not
+#: a regex over every JSON property.
+_OUTPUT_TEXT_FIELDS: Tuple[str, ...] = (
+    "emit_content",
+    "text",
+    "observation",
+    "preview",
+    "message",
+)
 
 #: Address-prefix tokens that disambiguate the transport. Unprefixed
 #: addresses are treated as UDS on POSIX and as ``pipe:`` on win32 only
@@ -73,6 +88,18 @@ class SocketWriter:
         self._sock: Optional[socket.socket] = None
         self._closed: bool = False
         self._address: Optional[str] = None
+        # PLAN-S5.0.1 §3.3 — defense-in-depth output sanitizer. When
+        # hash mode is on, every outbound frame's text fields are
+        # scanned for the canonical hashed-magic line shape; matches
+        # are escaped before transmission so the kernel can never
+        # accidentally emit a valid hashed-magic into a cell's
+        # outputs through any path.
+        #
+        # ``_hash_mode_provider`` is a zero-arg callable returning a
+        # bool. When None (the V1 default until slice 5.0.1b wires
+        # the writer's config field), the sanitizer no-ops — fully
+        # backwards-compatible with pre-S5.0.1 callers.
+        self._hash_mode_provider: Optional[Callable[[], bool]] = None
 
     # -- Connection lifecycle ---------------------------------------
 
@@ -137,6 +164,32 @@ class SocketWriter:
 
     # -- Frame I/O ---------------------------------------------------
 
+    def set_hash_mode_provider(
+        self, provider: Optional[Callable[[], bool]],
+    ) -> None:
+        """Wire the hash-mode lookup for outbound sanitization.
+
+        PLAN-S5.0.1 §3.3 — when hash mode is on, every outbound
+        frame's text fields are scanned for the canonical
+        hashed-magic line shape and escaped before transmission.
+        The provider is a zero-arg callable so the writer doesn't
+        depend on the metadata-writer module directly (avoids an
+        import cycle); the kernel binds the callable at startup.
+
+        Set to ``None`` to disable sanitization (test isolation).
+        """
+        self._hash_mode_provider = provider
+
+    def _hash_mode_enabled(self) -> bool:
+        """Best-effort hash-mode lookup. Defaults False on any error."""
+        provider = self._hash_mode_provider
+        if provider is None:
+            return False
+        try:
+            return bool(provider())
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     def write_frame(self, record: Dict[str, Any]) -> None:
         """Encode ``record`` as one newline-terminated JSON line and send it.
 
@@ -144,7 +197,17 @@ class SocketWriter:
         interleave bytes mid-frame. JSON encoding raises ``TypeError``
         on un-serializable values; we let that propagate so producers
         learn about bad payloads at emission time, not on the wire.
+
+        PLAN-S5.0.1 §3.3 — defense-in-depth sanitization: when hash
+        mode is on, the record's known text fields (per
+        :data:`_OUTPUT_TEXT_FIELDS`) are scanned for the canonical
+        hashed-magic line shape; matches are escaped (``@`` → ``\\@``)
+        before encoding so the wire never carries a valid hashed-
+        magic line into a cell's outputs through any kernel-emitted
+        path.
         """
+        if self._hash_mode_enabled():
+            record = sanitize_outbound_record(record)
         # Encode first so a producer-side ``TypeError`` doesn't leave
         # the socket holding a partial frame. The encode itself is
         # CPU-bound and lock-free.
@@ -245,4 +308,86 @@ def _json_default(value: Any) -> Any:
     return repr(value)
 
 
-__all__ = ["SocketWriter", "parse_address"]
+# ---------------------------------------------------------------------------
+# PLAN-S5.0.1 §3.3 — outbound sanitizer
+# ---------------------------------------------------------------------------
+
+
+def sanitize_outbound_line(line: str) -> str:
+    """Escape a single line if it matches the canonical hashed-magic shape.
+
+    Helper for callers that already operate at the line level
+    (renderers, ContextPacker, kernel-emitted notify spans). Idempotent
+    on already-escaped or non-matching lines.
+
+    See :func:`magic_hash.escape_leading_at` for the escape semantics.
+    """
+    # Lazy import: socket_writer otherwise has no magic_hash dep.
+    from .magic_hash import escape_leading_at, looks_like_hashed_magic
+
+    if not isinstance(line, str) or not line:
+        return line
+    if looks_like_hashed_magic(line):
+        return escape_leading_at(line)
+    return line
+
+
+def sanitize_outbound_text(text: str) -> str:
+    """Apply :func:`sanitize_outbound_line` to every line of ``text``.
+
+    Preserves the trailing newline if the original had one.
+    Multiline-safe; idempotent.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if "@" not in text:
+        return text  # fast path — no candidate lines
+    lines = text.splitlines()
+    rewritten = [sanitize_outbound_line(L) for L in lines]
+    if rewritten == lines:
+        return text  # identity short-circuit
+    suffix = "\n" if text.endswith("\n") else ""
+    return "\n".join(rewritten) + suffix
+
+
+def sanitize_outbound_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Walk a frame ``record`` and sanitize known text fields.
+
+    Walks the record dict (and nested ``metadata`` / ``attributes`` /
+    ``data`` sub-dicts when present) looking for keys in
+    :data:`_OUTPUT_TEXT_FIELDS`. String values are run through
+    :func:`sanitize_outbound_text`; non-string values are passed
+    through unchanged.
+
+    Returns a new dict on rewrite, or the input dict on identity
+    short-circuit. The function is shallow-copy at the top level
+    when a rewrite happens, deep enough to not mutate the caller's
+    data.
+    """
+    if not isinstance(record, dict):
+        return record
+    out = record  # may rebind to a shallow copy below
+    rewrote = False
+    for key, value in record.items():
+        if key in _OUTPUT_TEXT_FIELDS and isinstance(value, str):
+            new_value = sanitize_outbound_text(value)
+            if new_value is not value:
+                if not rewrote:
+                    out = dict(record)
+                    rewrote = True
+                out[key] = new_value
+        elif isinstance(value, dict):
+            new_value = sanitize_outbound_record(value)
+            if new_value is not value:
+                if not rewrote:
+                    out = dict(record)
+                    rewrote = True
+                out[key] = new_value
+    return out
+
+
+__all__ = [
+    "SocketWriter", "parse_address",
+    "sanitize_outbound_line", "sanitize_outbound_text",
+    "sanitize_outbound_record",
+]
