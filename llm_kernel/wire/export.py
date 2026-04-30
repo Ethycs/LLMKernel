@@ -86,6 +86,96 @@ FAMILY_SCHEMAS: Dict[str, Dict[str, Any]] = {
 }
 
 
+HANDSHAKE_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "handshake.request": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "kernel.handshake (driver -> kernel)",
+        "description": (
+            "First envelope on any connection. Negotiates wire version, "
+            "declares the driver's capabilities, and (for TCP) carries "
+            "bearer-token auth. See PLAN-S5.0.3 §4.3 and "
+            "docs/atoms/protocols/wire-handshake.md."
+        ),
+        "wire_version": WIRE_VERSION,
+        "type": "object",
+        "required": ["type", "payload"],
+        "additionalProperties": True,
+        "properties": {
+            "type": {"type": "string", "const": "kernel.handshake"},
+            "payload": {
+                "type": "object",
+                "required": ["client_name", "client_version", "wire_version", "transport"],
+                "additionalProperties": True,
+                "properties": {
+                    "client_name": {"type": "string"},
+                    "client_version": {"type": "string"},
+                    "wire_version": {"type": "string"},
+                    "transport": {
+                        "type": "string",
+                        "enum": ["pty", "unix", "tcp"],
+                    },
+                    "auth": {
+                        "type": "object",
+                        "required": ["scheme", "token"],
+                        "additionalProperties": True,
+                        "properties": {
+                            "scheme": {"type": "string", "const": "bearer"},
+                            "token": {"type": "string"},
+                        },
+                    },
+                    "capabilities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+    "handshake.response": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "kernel.handshake (kernel -> driver)",
+        "description": (
+            "Kernel response to a driver handshake. On success: "
+            "kernel_version + session_id + accepted_capabilities. "
+            "On failure: ``error`` set; transport closes after this frame. "
+            "See docs/atoms/protocols/wire-handshake.md."
+        ),
+        "wire_version": WIRE_VERSION,
+        "type": "object",
+        "required": ["type", "payload"],
+        "additionalProperties": True,
+        "properties": {
+            "type": {"type": "string", "const": "kernel.handshake"},
+            "payload": {
+                "type": "object",
+                "required": ["wire_version"],
+                "additionalProperties": True,
+                "properties": {
+                    "kernel_version": {"type": "string"},
+                    "wire_version": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "accepted_capabilities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "warnings": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "error": {
+                        "type": "string",
+                        "description": (
+                            "One of: version_mismatch_major | auth_failed | "
+                            "kernel_busy | wire-failure"
+                        ),
+                    },
+                },
+            },
+        },
+    },
+}
+
+
 def export_schemas(out_dir: Path) -> list[Path]:
     """Export all schemas to ``out_dir``. Returns list of written paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,6 +193,15 @@ def export_schemas(out_dir: Path) -> list[Path]:
 
     # Family envelope schemas
     for name, schema in FAMILY_SCHEMAS.items():
+        fname = out_dir / f"{name}.json"
+        fname.write_text(
+            json.dumps(schema, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        written.append(fname)
+
+    # Handshake envelope schemas (S5.0.3d).
+    for name, schema in HANDSHAKE_SCHEMAS.items():
         fname = out_dir / f"{name}.json"
         fname.write_text(
             json.dumps(schema, indent=2, sort_keys=True) + "\n",

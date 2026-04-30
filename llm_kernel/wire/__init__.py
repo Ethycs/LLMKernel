@@ -16,8 +16,11 @@ from .families import (
     FamilyC_AgentGraphCommand,
     FamilyF_NotebookSnapshot,
     FamilyG_Lifecycle,
+    HandshakeAuth,
     HandshakeRequest,
+    HandshakeRequestPayload,
     HandshakeResponse,
+    HandshakeResponsePayload,
 )
 from .tools import TOOL_CATALOG, validate_tool_input, validate_tool_output
 
@@ -34,8 +37,11 @@ __all__ = [
     "FamilyC_AgentGraphCommand",
     "FamilyF_NotebookSnapshot",
     "FamilyG_Lifecycle",
+    "HandshakeAuth",
     "HandshakeRequest",
+    "HandshakeRequestPayload",
     "HandshakeResponse",
+    "HandshakeResponsePayload",
     # Tool catalog + validators
     "TOOL_CATALOG",
     "validate_tool_input",

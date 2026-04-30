@@ -110,25 +110,72 @@ class FamilyG_Lifecycle(TypedDict, total=False):
 
 
 # ---------------------------------------------------------------------------
-# Handshake shapes (referenced by wire-handshake protocol; implemented in
-# S5.0.3d -- these are forward-declared stubs so families.py is importable
-# without import errors in slice a).
+# Handshake envelope (S5.0.3d).
+#
+# First envelope on any connection per docs/atoms/protocols/wire-handshake.md.
+# Negotiates wire version, declares the driver's capabilities, and (for TCP)
+# carries bearer-token auth. The kernel responds with its own version + a
+# session id + the accepted capability set. On mismatched WIRE_MAJOR or auth
+# failure the kernel sends an error envelope (HandshakeResponse with
+# ``error`` set in payload) and closes the transport. No Family A/B/C/F/G
+# frames flow until handshake succeeds.
 # ---------------------------------------------------------------------------
 
-class HandshakeRequest(TypedDict, total=False):
-    """Client -> Kernel handshake envelope (V1.5+, PLAN-S5.0.3d).
 
-    Declared here so ``wire/__init__.py`` can re-export the symbol per
-    PLAN §4.1; full implementation lands in slice S5.0.3d.
+class HandshakeAuth(TypedDict, total=False):
+    """Auth block on handshake request payload.
+
+    Present iff ``transport == "tcp"``; absent for ``pty``/``unix``.
+    Token comparison is constant-time (``hmac.compare_digest``); see
+    PLAN-S5.0.3 §5.2.
+    """
+    scheme: Literal["bearer"]
+    token: str
+
+
+class HandshakeRequestPayload(TypedDict, total=False):
+    """Driver -> kernel handshake payload."""
+    client_name: str            # "llmnb-cli" | "vscode-extension" | <custom>
+    client_version: str         # semver
+    wire_version: str           # semver; matched against kernel WIRE_VERSION
+    transport: Literal["pty", "unix", "tcp"]
+    auth: HandshakeAuth         # required for tcp; absent for pty/unix
+    capabilities: list[str]     # ["family_a", "family_b", ...] -- V1: full set
+
+
+class HandshakeResponsePayload(TypedDict, total=False):
+    """Kernel -> driver handshake payload (success).
+
+    On error, ``error`` is set instead of ``session_id`` /
+    ``accepted_capabilities``.  Known error codes (see
+    docs/atoms/protocols/wire-handshake.md):
+        ``version_mismatch_major`` -- WIRE_MAJOR differs
+        ``auth_failed``            -- TCP token missing/invalid
+        ``kernel_busy``            -- second client to single-client kernel
+        ``wire-failure``           -- malformed handshake payload
+    """
+    kernel_version: str
+    wire_version: str
+    session_id: str
+    accepted_capabilities: list[str]
+    warnings: list[str]
+    error: str                  # set iff handshake rejected
+
+
+class HandshakeRequest(TypedDict, total=False):
+    """Driver -> kernel handshake envelope.
+
+    First envelope on any connection per
+    [protocols/wire-handshake](../../../../docs/atoms/protocols/wire-handshake.md).
     """
     type: Literal["kernel.handshake"]
-    payload: dict[str, Any]
+    payload: HandshakeRequestPayload
 
 
 class HandshakeResponse(TypedDict, total=False):
-    """Kernel -> Client handshake response (V1.5+, PLAN-S5.0.3d)."""
+    """Kernel -> driver handshake response."""
     type: Literal["kernel.handshake"]
-    payload: dict[str, Any]
+    payload: HandshakeResponsePayload
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +196,9 @@ __all__ = [
     "FamilyC_AgentGraphCommand",
     "FamilyF_NotebookSnapshot",
     "FamilyG_Lifecycle",
+    "HandshakeAuth",
+    "HandshakeRequestPayload",
+    "HandshakeResponsePayload",
     "HandshakeRequest",
     "HandshakeResponse",
     "Envelope",
