@@ -58,6 +58,14 @@ _SILENCE_WATCHDOG_GRANULARITY_SEC: float = 5.0
 _RESTART_WINDOW_SEC: float = 300.0
 _RESTART_WINDOW_MAX: int = 3
 
+#: PLAN-S5.0.1 §3.9 K-class identifiers wired in slice 5.0.1a.
+#: The remaining K3C..K3G land with the precondition-gates +
+#: acceptance-flag slice (5.0.1c). K35 itself fires from the
+#: hash-aware parser in 5.0.1b — the constant ships here so the
+#: drift-marker emit path can reference the canonical name.
+K35_PLAIN_MAGIC_IN_HASH_MODE: str = "K35"
+K36_HASHED_MAGIC_EMISSION_BLOCKED: str = "K36"
+
 AgentState = str  # starting | running | restarting | failed | terminated
 
 
@@ -187,6 +195,13 @@ class AgentSupervisor:
         # supervisor's own lock must also be reentrant.
         self._lock: threading.RLock = threading.RLock()
         self._agents: Dict[str, AgentHandle] = {}
+        # PLAN-S5.0.1 §3.2 — contamination detector hook. The kernel
+        # wires its MetadataWriter in via ``set_metadata_writer`` so
+        # the supervisor can flag receiving cells when an agent emit
+        # carries a magic-shaped line. Optional: when None the
+        # detector still runs (logging via ``_diagnostics.mark``)
+        # so the audit trail is preserved without a wired writer.
+        self._metadata_writer: Optional[Any] = None
 
     def spawn(
         self, zone_id: str, agent_id: str, task: str, work_dir: Path,
@@ -1394,6 +1409,200 @@ class AgentSupervisor:
             return None, "top-level JSON is not an object"
         return obj, None
 
+    def _scan_and_rewrite_emit_content(
+        self, handle: AgentHandle, content: str, *, source: str,
+    ) -> str:
+        """Walk ``content`` line-by-line, flag contamination, escape on emission ban.
+
+        Returns the content with any hash-mode-banned lines escaped
+        (``@`` → ``\\@``) per :func:`magic_hash.escape_leading_at`.
+        Plain magic lines are flagged but **not** rewritten — the
+        emission ban is a hash-mode property; plain magics are
+        operator-typed text that the renderer surfaces as warning.
+        """
+        if not isinstance(content, str) or not content:
+            return content
+        # Fast path: avoid splitlines work when content is not even
+        # multiline AND has no leading ``@`` anywhere — covers the
+        # majority of agent stream-json system_message / result spans.
+        if "@" not in content:
+            return content
+        from .magic_hash import escape_leading_at
+
+        out_lines: List[str] = []
+        any_rewritten = False
+        for line in content.splitlines():
+            verdict = self._scan_for_magic_contamination(
+                handle, line, source=source,
+            )
+            if verdict == "ESCAPE_REQUIRED":
+                out_lines.append(escape_leading_at(line))
+                any_rewritten = True
+            else:
+                out_lines.append(line)
+        if not any_rewritten:
+            return content
+        # Preserve the trailing newline if the original had one.
+        suffix = "\n" if content.endswith("\n") else ""
+        return "\n".join(out_lines) + suffix
+
+    def set_metadata_writer(self, writer: Any) -> None:
+        """Wire a metadata writer for contamination flagging.
+
+        PLAN-S5.0.1 §3.2 — the always-on contamination detector flags
+        ``cells[<id>].contaminated = True`` on any cell whose
+        ``bound_agent_id`` matches the agent that just emitted a
+        magic-shaped line. The writer is supplied post-construction
+        (mirroring the dispatcher's ``set_metadata_writer`` plumbing).
+        Wiring is optional: when ``None``, the detector still runs
+        and emits a ``_diagnostics.mark`` so the audit trail survives.
+        """
+        self._metadata_writer = writer
+
+    def _scan_for_magic_contamination(
+        self, handle: AgentHandle, line: str, *, source: str,
+    ) -> Optional[str]:
+        """Scan one agent-emitted line for cell-magic injection patterns.
+
+        PLAN-S5.0.1 §3.2 — two layers:
+
+        * **Always-on plain detection**: ``^@@?<known_name>(\\s|:|$)``.
+          Sets ``contaminated`` on any cell bound to ``handle.agent_id``;
+          appends to ``contamination_log`` with ``layer="plain"``.
+        * **Hash-mode emission ban**: when
+          ``magic_hash_enabled`` is True AND the line matches the
+          canonical hashed-magic shape, flag the cell, append a
+          ``layer="hashed_emission_ban"`` log entry, AND signal the
+          caller that the line MUST be escaped before write
+          (``return "ESCAPE_REQUIRED"``).
+
+        Hash-mode is read from the writer's
+        ``metadata.rts.config.magic_hash_enabled`` setting. The schema
+        addition lands in slice 5.0.1b; until then the lookup returns
+        None and the hash-mode branch is dormant by design.
+
+        Returns:
+            ``"ESCAPE_REQUIRED"`` when the line matches the hashed-
+            magic shape under hash mode (caller must escape leading
+            ``@`` before push to outputs); ``None`` otherwise.
+        """
+        # Lazy import: this module otherwise has no dependency on the
+        # registry (preserves the pre-S5.0.1 import topology).
+        from .magic_hash import (
+            looks_like_hashed_magic, looks_like_plain_magic,
+        )
+        from .magic_registry import RESERVED_NAMES
+
+        if not isinstance(line, str) or not line:
+            return None
+
+        # Layer 1: plain magic detection (always on).
+        if looks_like_plain_magic(line, RESERVED_NAMES):
+            self._flag_contaminated(
+                handle.agent_id, line=line, source=source, layer="plain",
+            )
+
+        # Layer 2: hashed magic emission ban (hash-mode-only).
+        if self._magic_hash_enabled() and looks_like_hashed_magic(line):
+            self._flag_contaminated(
+                handle.agent_id, line=line, source=source,
+                layer="hashed_emission_ban",
+            )
+            self._emit_drift_marker(
+                handle.agent_id,
+                code=K36_HASHED_MAGIC_EMISSION_BLOCKED,
+                reason="hashed-magic pattern in agent output",
+                line=line,
+            )
+            return "ESCAPE_REQUIRED"
+        return None
+
+    def _magic_hash_enabled(self) -> bool:
+        """Best-effort lookup of ``metadata.rts.config.magic_hash_enabled``.
+
+        Defaults to ``False`` when the writer is unwired or the
+        config field is absent. The schema field itself lands in
+        slice 5.0.1b; this slice's reader is forward-compatible.
+        """
+        writer = self._metadata_writer
+        if writer is None:
+            return False
+        try:
+            getter = getattr(writer, "get_config_setting", None)
+            if callable(getter):
+                value = getter("magic_hash_enabled")
+                return bool(value)
+            # Fallback: probe a public ``_config`` dict if exposed.
+            config = getattr(writer, "_config", None)
+            if isinstance(config, dict):
+                return bool(config.get("magic_hash_enabled", False))
+        except Exception:  # pragma: no cover - defensive
+            return False
+        return False
+
+    def _flag_contaminated(
+        self,
+        agent_id: str,
+        *,
+        line: str,
+        source: str,
+        layer: str,
+    ) -> None:
+        """Mark every cell bound to ``agent_id`` as contaminated.
+
+        PLAN-S5.0.1 §3.6 schema — ``cells[<id>].contaminated`` and an
+        append-only ``contamination_log`` of ``{detected_at, line,
+        reason, layer}`` records. The line is truncated to a sane
+        bound (256 chars) before storage so a flooded contamination
+        path can't unbounded-grow the notebook.
+        """
+        from . import _diagnostics
+
+        truncated = line[:256] if isinstance(line, str) else ""
+        _diagnostics.mark(
+            "supervisor_magic_contamination_detected",
+            agent_id=agent_id, source=source, layer=layer,
+            line_prefix=truncated[:64],
+        )
+        writer = self._metadata_writer
+        if writer is None:
+            return
+        # The writer-side flag method is added in slice 5.0.1c; for
+        # this foundation slice we duck-type the call. When the
+        # method is missing the diagnostics-mark above is the audit
+        # trail.
+        flagger = getattr(writer, "flag_cells_contaminated_by_agent", None)
+        if not callable(flagger):
+            return
+        try:
+            flagger(
+                agent_id=agent_id, line=truncated,
+                source=source, layer=layer,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "supervisor: contamination flagger raised "
+                "(agent=%s, layer=%s)", agent_id, layer,
+            )
+
+    def _emit_drift_marker(
+        self, agent_id: str, *, code: str, reason: str, line: str,
+    ) -> None:
+        """Emit a K3x drift-log marker via ``_diagnostics.mark``.
+
+        Slice 5.0.1a wires K35/K36 only (the others — K3C..K3G —
+        belong to the precondition-gates / acceptance-flag slices).
+        The drift-detector path is fed by ``_diagnostics.mark``;
+        downstream consumers index on the ``code`` field.
+        """
+        from . import _diagnostics
+
+        _diagnostics.mark(
+            "supervisor_drift_marker",
+            agent_id=agent_id, code=code, reason=reason,
+            line_prefix=(line or "")[:64],
+        )
+
     def _emit_agent_emit(
         self,
         handle: AgentHandle,
@@ -1412,7 +1621,24 @@ class AgentSupervisor:
         guidance -- contents above the blob threshold are blob-
         extracted by ``metadata_writer.py`` on persistence; the wire
         carries the full content for in-cell rendering.
+
+        PLAN-S5.0.1 §3.2 — every emitted line is scanned for
+        cell-magic injection patterns. Plain ``@@<known>`` lines flag
+        bound cells as contaminated; hashed-magic-shaped lines (when
+        hash mode is on) trigger the emission-ban escape so the
+        offending leading ``@`` is replaced with ``\\@`` before the
+        span lands in cell outputs.
         """
+        # PLAN-S5.0.1 §3.2 contamination scan + emission-ban escape.
+        # The scan operates per-LINE on the emit_content (which may
+        # be a multi-line string for stream-json result/error
+        # records); we walk lines, flag on detection, and rebuild
+        # the content with escaped leading ``@`` characters where
+        # the hash-mode emission ban triggered.
+        scanned_content = self._scan_and_rewrite_emit_content(
+            handle, emit_content, source=f"agent_emit:{emit_kind}",
+        )
+        emit_content = scanned_content
         metadata: Dict[str, Any] = {
             "emit_kind": emit_kind,
             "emit_content": emit_content,
