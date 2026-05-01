@@ -616,6 +616,112 @@ class MetadataWriter:
         self._intent_log: List[Dict[str, Any]] = []
         self._intent_queue_lock: threading.RLock = threading.RLock()
 
+    # -- PLAN-S6.0 in-tree event-log substrate -----------------------
+    #
+    # ``metadata.rts.zone.event_log[]`` was introduced in PLAN-S4.1 as
+    # an ``agent_ref_move``-only array.  PLAN-S6.0 broadens it to carry
+    # the full RFC-006 envelope stream (the **internal v1 envelope**
+    # shape per ``run_envelope.make_envelope`` -- preserves
+    # ``rfc_version`` for replay branching).  Existing readers MUST
+    # filter by envelope ``kind``: pre-S6.0 entries carry
+    # ``kind == "agent_ref_move"`` (the legacy shape), post-S6.0
+    # envelope captures carry ``kind`` equal to the ``message_type``
+    # (e.g. ``operator.action``, ``layout.update``,
+    # ``notebook.metadata``).  Two filter helpers are exposed below.
+    #
+    # OTLP run.* lifecycle envelopes (Family A run.start | run.event |
+    # run.complete) are EXCLUDED from this log per PLAN-S6.0 §3.B
+    # non-goal -- they ride a separate observability sink and the
+    # closed span lands in ``metadata.rts.event_log.runs[]``.
+    #
+    # Family F ``mode: "patch"`` envelopes are also EXCLUDED -- they
+    # are transient deltas; replay reconstructs from
+    # ``mode: "snapshot"`` checkpoints + intermediate Family A/D
+    # events.
+
+    _EVENT_LOG_EXCLUDED_TYPES: FrozenSet[str] = frozenset({
+        "run.start", "run.event", "run.complete",
+    })
+
+    def capture_envelope(self, envelope: Dict[str, Any]) -> None:
+        """Append ``envelope`` to ``metadata.rts.zone.event_log[]``.
+
+        Honors ``metadata.rts.config.recoverable.kernel.event_log_enabled``
+        (default ``True``) and
+        ``metadata.rts.config.recoverable.kernel.event_log_max_entries``
+        (default ``None`` = unbounded).  When the cap is set and the
+        log exceeds it, the oldest entries are sliced off and appended
+        to ``zone.event_log_archive[]``.
+
+        Skips:
+          * Family A run.start/run.event/run.complete (PLAN-S6.0 §3.B
+            non-goal -- separate observability sink).
+          * Family F ``notebook.metadata`` envelopes whose
+            ``payload.mode == "patch"`` (transient deltas; replay
+            uses snapshots + Family A/D between them).
+
+        Validation: ``envelope`` MUST be a dict with the internal v1
+        shape (``message_type``, ``payload``, ``rfc_version``...).
+        Malformed inputs are silently dropped (defensive on the hot
+        path; the wire layer already validated).
+        """
+        if not isinstance(envelope, dict):
+            return
+        message_type = envelope.get("message_type")
+        if not isinstance(message_type, str):
+            return
+        if message_type in self._EVENT_LOG_EXCLUDED_TYPES:
+            return
+        # Family F mode=patch exclusion.
+        if message_type == "notebook.metadata":
+            payload = envelope.get("payload") or {}
+            if isinstance(payload, dict) and payload.get("mode") == "patch":
+                return
+        with self._lock:
+            kernel_cfg = (
+                self._config.get("recoverable", {}).get("kernel", {})
+                if isinstance(self._config, dict) else {}
+            )
+            enabled = kernel_cfg.get("event_log_enabled", True)
+            if not enabled:
+                return
+            max_entries = kernel_cfg.get("event_log_max_entries")
+            log = self._zone.setdefault("event_log", [])
+            log.append(_deepcopy_json(envelope))
+            if isinstance(max_entries, int) and max_entries > 0:
+                if len(log) > max_entries:
+                    overflow = len(log) - max_entries
+                    archived = log[:overflow]
+                    del log[:overflow]
+                    archive = self._zone.setdefault("event_log_archive", [])
+                    archive.extend(archived)
+            self._dirty = True
+
+    @staticmethod
+    def is_legacy_event_log_entry(entry: Dict[str, Any]) -> bool:
+        """Return True iff ``entry`` is a pre-S6.0 ``agent_ref_move`` record.
+
+        Filter helper for downstream readers of
+        ``zone.event_log[]``.  Post-S6.0 the array is mixed: legacy
+        entries (the ``agent_ref_move`` shape from PLAN-S4.1) and
+        captured envelopes (the v1 envelope shape from PLAN-S6.0).
+        Use this to filter to the legacy-only subset.
+        """
+        if not isinstance(entry, dict):
+            return False
+        return entry.get("kind") == "agent_ref_move" and "message_type" not in entry
+
+    @staticmethod
+    def is_envelope_event_log_entry(entry: Dict[str, Any]) -> bool:
+        """Return True iff ``entry`` is a captured-envelope (post-S6.0) record.
+
+        Filter helper for downstream readers.  Recognized by the
+        presence of ``message_type`` (the v1 envelope shape).
+        """
+        if not isinstance(entry, dict):
+            return False
+        return isinstance(entry.get("message_type"), str)
+
     # -- Public mutators ---------------------------------------------
 
     def update_layout(self, tree: Dict[str, Any]) -> None:

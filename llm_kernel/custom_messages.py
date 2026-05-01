@@ -272,6 +272,28 @@ class CustomMessageDispatcher:
             return self._drift_detector_override
         return getattr(self._kernel, "_llmnb_drift_detector", None)
 
+    def _tee_to_event_log(self, envelope: Dict[str, Any]) -> None:
+        """Append ``envelope`` to ``metadata.rts.zone.event_log[]`` via the writer.
+
+        PLAN-S6.0 §3.E.  Best-effort: when no MetadataWriter is bound
+        (early-boot, tests without writer), silently skip.  The writer
+        method itself enforces the OTLP run.* / Family F patch
+        exclusions, the ``event_log_enabled`` toggle, and the optional
+        ``event_log_max_entries`` cap.
+        """
+        writer = self._resolve_metadata_writer()
+        if writer is None:
+            return
+        capture = getattr(writer, "capture_envelope", None)
+        if not callable(capture):
+            return
+        try:
+            capture(envelope)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "event-log tee: capture_envelope raised; envelope dropped",
+            )
+
     def _collect_current_volatile(self) -> Dict[str, Any]:
         """Return the current-environment volatile-config dict.
 
@@ -353,8 +375,20 @@ class CustomMessageDispatcher:
         ride the Comm.  When no Comm is attached, the v2-projected
         envelope is buffered (oldest dropped beyond ``buffer_size``).
         Raises ``ValueError`` if validation fails (no IOPub emission).
+
+        PLAN-S6.0 in-tree event-log tee: after validation but BEFORE
+        ``_to_thin_v2`` flattens the version field, the **internal v1
+        envelope** is appended to ``metadata.rts.zone.event_log[]``
+        via ``MetadataWriter.capture_envelope`` (which itself enforces
+        the OTLP/patch exclusions and the optional max-entries cap).
         """
         validate_envelope(envelope)  # internal contract; see module docs.
+        # PLAN-S6.0 §3.E -- tee outbound envelopes to the in-tree
+        # event log.  Pre-``_to_thin_v2`` so the persisted form keeps
+        # ``rfc_version`` for replay branching.  The writer's own
+        # ``capture_envelope`` filters out Family A run.* lifecycle
+        # and Family F mode=patch.
+        self._tee_to_event_log(envelope)
         message_type = envelope["message_type"]
         if message_type in _RUN_LIFECYCLE_TYPES:
             # Stamp the most-recent ``run.complete`` time so the next
@@ -463,6 +497,11 @@ class CustomMessageDispatcher:
         except ValueError as exc:
             logger.warning("inbound envelope failed validation: %s; dropped", exc)
             return
+        # PLAN-S6.0 §3.E -- tee inbound envelopes to the in-tree
+        # event log so the log carries both directions.  The
+        # reconstructed v1 envelope shape is what we persist (the
+        # wire-side thin v2 form has already been re-inflated).
+        self._tee_to_event_log(envelope)
         message_type = envelope["message_type"]
         with self._lock:
             handlers = list(self._handlers.get(message_type, []))
