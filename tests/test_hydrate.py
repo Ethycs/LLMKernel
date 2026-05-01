@@ -375,3 +375,59 @@ def test_hydrate_serializes_to_baseline_via_serialize_snapshot() -> None:
     assert json.dumps(out_copy, sort_keys=True) == json.dumps(
         base_copy, sort_keys=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S4.1 §5: hydrate-rebuild test (was deferred in PLAN-S4 §9).
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_after_hydrate_walks_persisted_turns(tmp_path: Path) -> None:
+    """Close → reopen → addressed-agent replay reads from persisted turns[].
+
+    PLAN-S4.1: post-migration the supervisor's ``_missed_turns`` reads
+    directly from ``metadata.rts.zone.agents.<*>.turns[]``.  Even after
+    a snapshot round-trip (close → reopen) the persisted graph is the
+    source of truth — no in-memory cache to rebuild.
+    """
+    # Step 1: build state in writer-A and snapshot it.
+    sup_a = _make_sup_h()
+    fake_a_alpha = _FakePopenH()
+    fake_a_beta = _FakePopenH()
+    queue_a = [fake_a_alpha, fake_a_beta]
+
+    def _factory_a(*a: Any, **k: Any) -> Any:
+        return queue_a.pop(0)
+    with _patch_health_h(), patch("subprocess.Popen", side_effect=_factory_a):
+        sup_a.spawn(zone_id="z1", agent_id="alpha", task="t",
+                    work_dir=tmp_path, api_key="sk-x")
+        sup_a.spawn(zone_id="z1", agent_id="beta", task="t",
+                    work_dir=tmp_path, api_key="sk-x")
+    _seed_turn_h(sup_a, "t_pre1", "beta", "assistant", "pre-1", parent_id=None)
+    _seed_turn_h(sup_a, "t_pre2", "beta", "assistant", "pre-2", parent_id="t_pre1")
+    snap_a = sup_a._metadata_writer.snapshot()  # type: ignore[union-attr]
+    fake_a_alpha.terminate()
+    fake_a_beta.terminate()
+
+    # Step 2: open a fresh supervisor + writer; hydrate from snap_a.
+    sup_b = _make_sup_h()
+    sup_b._metadata_writer.hydrate(snap_a)  # type: ignore[union-attr]
+    fake_b_alpha = _FakePopenH()
+    fake_b_beta = _FakePopenH()
+    queue_b = [fake_b_alpha, fake_b_beta]
+
+    def _factory_b(*a: Any, **k: Any) -> Any:
+        return queue_b.pop(0)
+    entry = {"agent_id": "alpha", "zone_id": "z1", "task": "t",
+             "work_dir": str(tmp_path), "api_key": "sk-x",
+             "last_seen_turn_id": None}
+    with _patch_health_h(), patch("subprocess.Popen", side_effect=_factory_b):
+        sup_b.respawn_from_config([entry])
+        sup_b.spawn(zone_id="z1", agent_id="beta", task="t",
+                    work_dir=tmp_path, api_key="sk-x")
+    head = sup_b._notebook_head_turn_id()
+    assert head == "t_pre2"
+    missed = sup_b._missed_turns("alpha", head)
+    assert [t["id"] for t in missed] == ["t_pre1", "t_pre2"]
+    fake_b_alpha.terminate()
+    fake_b_beta.terminate()

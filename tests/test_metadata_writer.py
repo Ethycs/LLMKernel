@@ -347,3 +347,200 @@ def test_writer_session_id_and_created_at_persist_across_snapshots() -> None:
     assert a["session_id"] == b["session_id"]
     assert a["created_at"] == b["created_at"]
     assert b["snapshot_version"] == a["snapshot_version"] + 1
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S4.1 turn-graph persistence: append_turn / fork_agent /
+# move_agent_head / record_event reshape.
+# ---------------------------------------------------------------------------
+
+
+def _envelope(intent_kind: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a minimal BSP-003 §3 envelope for the writer."""
+    import uuid as _uuid
+    return {
+        "payload": {
+            "action_type": "zone_mutate",
+            "intent_kind": intent_kind,
+            "parameters": parameters,
+            "intent_id": f"test-{intent_kind}-{_uuid.uuid4().hex[:8]}",
+        },
+    }
+
+
+def test_append_turn_intent_round_trip() -> None:
+    """append_turn persists a turn into zone.agents.<id>.turns[]."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    result = writer.submit_intent(_envelope("append_turn", {
+        "id": "t_001", "agent_id": "alpha", "role": "agent",
+        "body": "hello world", "parent_id": None,
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    turns = snap["zone"]["agents"]["alpha"]["turns"]
+    assert len(turns) == 1
+    assert turns[0]["id"] == "t_001"
+    assert turns[0]["body"] == "hello world"
+    assert turns[0]["parent_id"] is None
+    assert turns[0]["provider"] == "claude-code"
+    assert turns[0]["created_at"]  # ISO timestamp
+
+
+def test_append_turn_rejects_unknown_parent_k42() -> None:
+    """append_turn rejects parent_id not present in any agent's turns[]."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    result = writer.submit_intent(_envelope("append_turn", {
+        "id": "t_002", "agent_id": "alpha", "role": "agent",
+        "body": "orphan", "parent_id": "t_does_not_exist",
+    }))
+    assert result["applied"] is False
+    assert result["error_code"] == "K42"
+    assert "unknown parent_id" in (result["error_reason"] or "")
+
+
+def test_append_turn_rejects_duplicate_turn_id_k42() -> None:
+    """append_turn rejects a duplicate turn id within the same zone."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    writer.submit_intent(_envelope("append_turn", {
+        "id": "t_dup", "agent_id": "alpha", "role": "agent",
+        "body": "first", "parent_id": None,
+    }))
+    result = writer.submit_intent(_envelope("append_turn", {
+        "id": "t_dup", "agent_id": "beta", "role": "agent",
+        "body": "second", "parent_id": None,
+    }))
+    assert result["applied"] is False
+    assert result["error_code"] == "K42"
+    assert "duplicate turn id" in (result["error_reason"] or "")
+
+
+def test_fork_agent_intent_round_trip() -> None:
+    """fork_agent creates the new-agent record with head_turn_id + session."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    writer.submit_intent(_envelope("append_turn", {
+        "id": "t_a1", "agent_id": "alpha", "role": "agent",
+        "body": "a1", "parent_id": None,
+    }))
+    result = writer.submit_intent(_envelope("fork_agent", {
+        "source_agent_id": "alpha",
+        "new_agent_id": "beta",
+        "at_turn_id": "t_a1",
+        "case": "A",
+        "claude_session_id": "sess-beta-1",
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    beta = snap["zone"]["agents"]["beta"]
+    assert beta["session"]["head_turn_id"] == "t_a1"
+    assert beta["session"]["last_seen_turn_id"] == "t_a1"
+    assert beta["session"]["claude_session_id"] == "sess-beta-1"
+    assert beta["session"]["runtime_status"] == "idle"
+    assert beta["turns"] == []
+
+
+def test_fork_agent_rejects_duplicate_agent_id_k42() -> None:
+    """fork_agent rejects new_agent_id that already exists."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    writer.submit_intent(_envelope("append_turn", {
+        "id": "t_a1", "agent_id": "alpha", "role": "agent",
+        "body": "a1", "parent_id": None,
+    }))
+    # First fork creates beta.
+    writer.submit_intent(_envelope("fork_agent", {
+        "source_agent_id": "alpha", "new_agent_id": "beta",
+        "at_turn_id": "t_a1", "case": "A",
+        "claude_session_id": "sess-1",
+    }))
+    # Second fork tries to re-create beta.
+    result = writer.submit_intent(_envelope("fork_agent", {
+        "source_agent_id": "alpha", "new_agent_id": "beta",
+        "at_turn_id": "t_a1", "case": "A",
+        "claude_session_id": "sess-2",
+    }))
+    assert result["applied"] is False
+    assert result["error_code"] == "K42"
+    assert "already exists" in (result["error_reason"] or "")
+
+
+def test_move_agent_head_intent_round_trip() -> None:
+    """move_agent_head sets session.{head_turn_id, last_seen_turn_id}."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    for tid, parent in [("t_1", None), ("t_2", "t_1"), ("t_3", "t_2")]:
+        writer.submit_intent(_envelope("append_turn", {
+            "id": tid, "agent_id": "alpha", "role": "agent",
+            "body": tid, "parent_id": parent,
+        }))
+    result = writer.submit_intent(_envelope("move_agent_head", {
+        "agent_id": "alpha", "head_turn_id": "t_1",
+        "last_seen_turn_id": "t_1",
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    sess = snap["zone"]["agents"]["alpha"]["session"]
+    assert sess["head_turn_id"] == "t_1"
+    assert sess["last_seen_turn_id"] == "t_1"
+
+
+def test_move_agent_head_rejects_target_outside_ancestry_k42() -> None:
+    """move_agent_head rejects a turn that is not in the agent's ancestry."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    writer.submit_intent(_envelope("append_turn", {
+        "id": "t_a1", "agent_id": "alpha", "role": "agent",
+        "body": "a1", "parent_id": None,
+    }))
+    # Create a sibling chain on beta.  t_b1 is not in alpha's ancestry.
+    writer.submit_intent(_envelope("append_turn", {
+        "id": "t_b1", "agent_id": "beta", "role": "agent",
+        "body": "b1", "parent_id": None,
+    }))
+    result = writer.submit_intent(_envelope("move_agent_head", {
+        "agent_id": "alpha", "head_turn_id": "t_b1",
+    }))
+    assert result["applied"] is False
+    assert result["error_code"] == "K42"
+    assert "not in agent" in (result["error_reason"] or "")
+
+
+def test_record_event_agent_ref_move_branch() -> None:
+    """record_event with kind=agent_ref_move appends to zone.event_log[]."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    result = writer.submit_intent(_envelope("record_event", {
+        "kind": "agent_ref_move",
+        "reason": "operator_revert",
+        "agent_id": "alpha",
+        "from_turn_id": "t_3",
+        "to_turn_id": "t_1",
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    log = snap["zone"]["event_log"]
+    assert len(log) == 1
+    assert log[0]["kind"] == "agent_ref_move"
+    assert log[0]["reason"] == "operator_revert"
+    assert log[0]["from_turn_id"] == "t_3"
+    assert log[0]["to_turn_id"] == "t_1"
+    assert log[0]["recorded_at"]
+    # Reject unknown reason.
+    bad = writer.submit_intent(_envelope("record_event", {
+        "kind": "agent_ref_move",
+        "reason": "operator_yolo",
+        "agent_id": "alpha",
+    }))
+    assert bad["applied"] is False
+    assert bad["error_code"] == "K42"
+
+
+def test_record_event_legacy_drift_path_preserved() -> None:
+    """record_event with field_path (legacy shape) routes to drift_log."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    result = writer.submit_intent(_envelope("record_event", {
+        "field_path": "config.kernel.example",
+        "previous_value": 1,
+        "current_value": 2,
+        "severity": "info",
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    drift = snap["drift_log"]
+    assert len(drift) == 1
+    assert drift[0]["field_path"] == "config.kernel.example"

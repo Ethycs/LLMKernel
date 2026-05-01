@@ -1114,3 +1114,111 @@ def test_fork_emits_agent_ref_move_event(tmp_path: Path) -> None:
     assert rec["parameters"]["reason"] == "operator_branch"
     assert rec["parameters"]["agent_id"] == "beta"
     handle.terminate()
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S4.1 §5: supervisor migration + lifted PLAN-S4 §9 deferred smokes.
+# ---------------------------------------------------------------------------
+
+
+def test_missed_turns_reads_from_metadata_rts(tmp_path: Path) -> None:
+    """_missed_turns walks zone.agents.<*>.turns[] (no in-memory _turns cache)."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    fake_beta = _FakePopenWithStdin(stdout_lines=[])
+    fake_beta.returncode = None
+    with _patch_health(), patch("subprocess.Popen", return_value=fake_beta):
+        sup.spawn(zone_id="z1", agent_id="beta", task="t",
+                  work_dir=tmp_path, api_key="sk-x")
+    # Seed a chain on beta via append_turn intents only.
+    _seed_turn(sup, "t_a", "beta", "assistant", "alpha-msg-A", parent_id=None)
+    _seed_turn(sup, "t_b", "beta", "assistant", "alpha-msg-B", parent_id="t_a")
+    # Confirm the supervisor has NO _turns attribute (deletion proof).
+    assert not hasattr(sup, "_turns"), "_turns cache must be deleted"
+    head = sup._notebook_head_turn_id()
+    assert head == "t_b"
+    missed = sup._missed_turns("alpha", head)
+    # alpha has not seen any turn; both beta turns are surfaced
+    # in chronological order.
+    assert [t["id"] for t in missed] == ["t_a", "t_b"]
+    handle.terminate()
+    fake_beta.terminate()
+
+
+def test_two_agent_end_to_end_handoff_smoke(tmp_path: Path) -> None:
+    """PLAN-S4 §9 lifted: alpha+beta exchange turns with handoff prefix."""
+    sup = _make_supervisor()
+    fake_alpha = _FakePopenWithStdin(stdout_lines=[])
+    fake_alpha.returncode = None
+    fake_beta = _FakePopenWithStdin(stdout_lines=[])
+    fake_beta.returncode = None
+    queue = [fake_alpha, fake_beta]
+
+    def _factory(*a: Any, **k: Any) -> Any:
+        return queue.pop(0)
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        sup.spawn(zone_id="z1", agent_id="alpha", task="t",
+                  work_dir=tmp_path, api_key="sk-x")
+        sup.spawn(zone_id="z1", agent_id="beta", task="t",
+                  work_dir=tmp_path, api_key="sk-x")
+    # beta produces 2 turns; alpha is then addressed.
+    _seed_turn(sup, "t1", "beta", "assistant", "first", parent_id=None)
+    _seed_turn(sup, "t2", "beta", "assistant", "second", parent_id="t1")
+    res = sup.send_user_turn("alpha", "go")
+    assert res["handoff_prefix_count"] == 2
+    fake_alpha.terminate()
+    fake_beta.terminate()
+
+
+def test_three_agent_stress_smoke(tmp_path: Path) -> None:
+    """PLAN-S4 §9 lifted: three-agent chain, all writer-driven."""
+    sup = _make_supervisor()
+    fakes = [_FakePopenWithStdin(stdout_lines=[]) for _ in range(3)]
+    for f in fakes:
+        f.returncode = None
+    queue = list(fakes)
+
+    def _factory(*a: Any, **k: Any) -> Any:
+        return queue.pop(0)
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        for aid in ("alpha", "beta", "gamma"):
+            sup.spawn(zone_id="z1", agent_id=aid, task="t",
+                      work_dir=tmp_path, api_key="sk-x")
+    # beta + gamma each contribute one turn.
+    _seed_turn(sup, "t_b", "beta", "assistant", "b-msg", parent_id=None)
+    _seed_turn(sup, "t_g", "gamma", "assistant", "g-msg", parent_id="t_b")
+    res = sup.send_user_turn("alpha", "review")
+    # Both sibling turns surface (filtered by author).
+    assert res["handoff_prefix_count"] == 2
+    for f in fakes:
+        f.terminate()
+
+
+def test_idle_resume_and_handoff_smoke(tmp_path: Path) -> None:
+    """PLAN-S4 §9 lifted: dead alpha resumes; handoff fires on next addressed turn."""
+    sup = _make_supervisor()
+    fake_alpha_first = _FakePopenWithStdin(stdout_lines=[])
+    fake_alpha_first.returncode = None
+    fake_beta = _FakePopenWithStdin(stdout_lines=[])
+    fake_beta.returncode = None
+    fake_alpha_resume = _FakePopenWithStdin(stdout_lines=[])
+    fake_alpha_resume.returncode = None
+
+    queue = [fake_alpha_first, fake_beta, fake_alpha_resume]
+
+    def _factory(*a: Any, **k: Any) -> Any:
+        return queue.pop(0)
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        sup.spawn(zone_id="z1", agent_id="alpha", task="t",
+                  work_dir=tmp_path, api_key="sk-x")
+        sup.spawn(zone_id="z1", agent_id="beta", task="t",
+                  work_dir=tmp_path, api_key="sk-x")
+    # alpha exits; beta produces a turn; alpha gets re-spawned with handoff.
+    fake_alpha_first.returncode = 0
+    fake_alpha_first._exited.set()
+    _seed_turn(sup, "t_b1", "beta", "assistant", "beta-msg", parent_id=None)
+    with _patch_health(), patch("subprocess.Popen", side_effect=_factory):
+        res = sup.send_user_turn("alpha", "wake up")
+    assert res["status"] in {"resumed_then_sent", "spawned_fresh"}
+    assert res["handoff_prefix_count"] == 1
+    fake_alpha_resume.terminate()
+    fake_beta.terminate()
