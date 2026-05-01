@@ -26,7 +26,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
 from ._provisioning import (
     EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION,
@@ -220,54 +220,71 @@ class AgentSupervisor:
         # detector still runs (logging via ``_diagnostics.mark``)
         # so the audit trail is preserved without a wired writer.
         self._metadata_writer: Optional[Any] = None
-        # PLAN-S4: in-memory turn store keyed by turn_id.  Each entry is a
-        # dict with at minimum: {"id": str, "agent_id": str, "parent_id":
-        # str|None, "role": str, "content": str}.  Populated by callers
-        # (typically the mcp_server dispatcher) via ``record_turn``; consumed
-        # by ``_missed_turns``.  Protected by ``_lock``.
-        self._turns: Dict[str, Dict[str, Any]] = {}
-        #: PLAN-S4: id of the most recently recorded turn — the notebook head.
-        #: ``None`` when no turns have been recorded yet.  Protected by
-        #: ``_lock``.  Updated by ``record_turn`` on every new turn.
-        self._head_turn_id: Optional[str] = None
+        # PLAN-S4.1: in-memory ``_turns`` cache REMOVED.  The turn graph
+        # is now read from ``metadata.rts.zone.agents.<id>.turns[]`` via
+        # the ``MetadataWriter``.  Tests and callers seed turns with
+        # ``submit_intent({intent_kind: "append_turn", ...})``.
 
-    def record_turn(
-        self,
-        turn_id: str,
-        agent_id: str,
-        role: str,
-        content: str,
-        parent_id: Optional[str] = None,
-    ) -> None:
-        """Register one turn in the supervisor's in-memory DAG.
+    # PLAN-S4.1: ``record_turn`` REMOVED.  Callers submit ``append_turn``
+    # intents to the writer; ``_missed_turns`` reads the persisted
+    # ``metadata.rts.zone.agents.<id>.turns[]`` arrays directly.
 
-        PLAN-S4: called by the mcp_server dispatcher (or tests) after a
-        turn completes so the cross-agent handoff walker has a complete
-        picture of the zone's turn history.
+    def _read_persisted_turns(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+        """Return ``(turn_index, notebook_head_id)`` from the writer snapshot.
 
-        Args:
-            turn_id: Unique id for this turn (e.g. ``"t_<ulid>"``).
-            agent_id: The agent whose session produced this turn.
-            role: ``"assistant"`` for agent responses; ``"user"`` for
-                operator messages.
-            content: The text body of the turn.
-            parent_id: The id of the preceding turn in the DAG chain, or
-                ``None`` for the root turn.
+        ``turn_index`` is keyed on turn-id and carries each persisted
+        turn dict (with normalized ``content`` field aliasing ``body``
+        for back-compat with the prior in-memory shape).
+        ``notebook_head_id`` is the most-recently-``created_at`` turn id
+        across all agents (deterministic tiebreak by id).  Returns
+        ``({}, None)`` when no writer is wired or no turns exist.
         """
-        with self._lock:
-            self._turns[turn_id] = {
-                "id": turn_id,
-                "agent_id": agent_id,
-                "role": role,
-                "content": content,
-                "parent_id": parent_id,
-            }
-            self._head_turn_id = turn_id
+        if self._metadata_writer is None:
+            return {}, None
+        try:
+            snap = self._metadata_writer.snapshot(trigger="save")
+        except Exception:  # pragma: no cover - defensive
+            return {}, None
+        zone = snap.get("zone") or {}
+        agents = zone.get("agents") or {}
+        index: Dict[str, Dict[str, Any]] = {}
+        for agent_state in agents.values():
+            if not isinstance(agent_state, dict):
+                continue
+            for t in agent_state.get("turns", []) or []:
+                if not isinstance(t, dict):
+                    continue
+                tid = t.get("id")
+                if not isinstance(tid, str):
+                    continue
+                # Normalize: callers historically used ``content``; the
+                # persisted shape uses ``body``.  Mirror ``body`` ->
+                # ``content`` so the _missed_turns / synthesize path
+                # keeps working without per-call adaptation.
+                norm = dict(t)
+                if "content" not in norm and "body" in norm:
+                    norm["content"] = norm["body"]
+                index[tid] = norm
+        # Compute notebook head: most-recent created_at, lex tiebreak on id.
+        head_id: Optional[str] = None
+        head_key: Optional[Tuple[str, str]] = None
+        for tid, t in index.items():
+            ca = t.get("created_at") or ""
+            key = (str(ca), tid)
+            if head_key is None or key > head_key:
+                head_key = key
+                head_id = tid
+        return index, head_id
 
     def _notebook_head_turn_id(self) -> Optional[str]:
-        """Return the current notebook-head turn-id under lock."""
-        with self._lock:
-            return self._head_turn_id
+        """Return the current notebook-head turn-id (PLAN-S4.1 §3.C).
+
+        Computed from ``metadata.rts.zone.agents.<*>.turns[]`` as the
+        most-recently-``created_at`` turn (lexicographic tiebreak on
+        ``id``).  Returns ``None`` when no turns are persisted.
+        """
+        _, head_id = self._read_persisted_turns()
+        return head_id
 
     def spawn(
         self, zone_id: str, agent_id: str, task: str, work_dir: Path,
@@ -742,7 +759,7 @@ class AgentSupervisor:
         with self._lock:
             handle = self._agents.get(agent_id)
             last_seen = handle.last_seen_turn_id if handle is not None else None
-            turns_snapshot = dict(self._turns)
+        turns_snapshot, _ = self._read_persisted_turns()
 
         if head_turn_id is None:
             # No turns in the zone yet.
@@ -947,15 +964,12 @@ class AgentSupervisor:
                     "Spawn or respawn the agent before calling revert."
                 )
 
-            # --- ancestry walk -----------------------------------------
-            # Walk parent_id from the agent's last-known head turn back
-            # through self._turns looking for target_turn_id.  The
-            # supervisor's ``_head_turn_id`` is the notebook head (all
-            # agents); the agent's own head is the most recent turn
-            # recorded for it.  We use the notebook head as the starting
-            # point since the turn chain is global and the agent's turns
-            # are embedded in it.
-            current_head = self._head_turn_id
+            # --- ancestry walk (PLAN-S4.1) -----------------------------
+            # Read the persisted turn graph from
+            # ``metadata.rts.zone.agents.<*>.turns[]`` and walk parent_id
+            # from the notebook head (most-recent turn) back through the
+            # union of all agents' chains looking for ``target_turn_id``.
+            turn_index, current_head = self._read_persisted_turns()
             found = False
             visited: set = set()
             cursor = current_head
@@ -967,7 +981,7 @@ class AgentSupervisor:
                 if cursor == target_turn_id:
                     found = True
                     break
-                turn_rec = self._turns.get(cursor)
+                turn_rec = turn_index.get(cursor)
                 if turn_rec is None:
                     break
                 cursor = turn_rec.get("parent_id")
@@ -981,7 +995,7 @@ class AgentSupervisor:
                     "turn outside this agent's lineage."
                 )
 
-            prior_head = self._head_turn_id
+            prior_head = current_head
 
             # --- SIGTERM live process -----------------------------------
             if handle.popen.poll() is None:
@@ -996,40 +1010,39 @@ class AgentSupervisor:
 
             # --- in-memory head update ---------------------------------
             handle.last_seen_turn_id = target_turn_id
-            self._head_turn_id = target_turn_id
+            # PLAN-S4.1: notebook head is computed from
+            # ``metadata.rts.zone.agents.<*>.turns[]`` on demand; the
+            # ``move_agent_head`` writer intent submitted below records
+            # the new head as the canonical post-revert position.
 
             # --- mint fresh claude_session_id for next continue --------
             handle.claude_session_id = str(uuid.uuid4())
 
-        # --- writer intents (outside lock; best-effort) ----------------
+        # --- writer intents (outside lock; PLAN-S4.1 active) -----------
         if self._metadata_writer is not None:
-            # move_agent_head is _PENDING_SLICE in the writer; it raises
-            # ValueError.  Log as no-op; in-memory state was already
-            # updated above.
-            try:
-                self._metadata_writer.submit_intent({
+            # ``move_agent_head`` is now active per PLAN-S4.1 §3.A.  The
+            # writer mutates ``zone.agents.<id>.session.{head_turn_id,
+            # last_seen_turn_id}`` and bumps snapshot_version.
+            self._metadata_writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
                     "intent_kind": "move_agent_head",
                     "parameters": {
                         "agent_id": agent_id,
                         "head_turn_id": target_turn_id,
                         "last_seen_turn_id": target_turn_id,
                     },
-                })
-            except Exception:
-                _diagnostics.mark(
-                    "revert_move_agent_head_pending_slice",
-                    agent_id=agent_id, target_turn_id=target_turn_id,
-                )
+                    "intent_id": f"revert-mah-{agent_id}-{target_turn_id}-{uuid.uuid4().hex[:8]}",
+                },
+            })
 
-            # agent_ref_move event log — BSP-002 §8.5.  The MetadataWriter
-            # does not yet have a first-class agent_ref_move handler (the
-            # BSP-002 turn-graph slice is _PENDING_SLICE).  We attempt the
-            # submit and log a diagnostic if the writer rejects it, so the
-            # intent is recorded in the writer's intent_log regardless of
-            # whether a handler fires.
-            try:
-                self._metadata_writer.submit_intent({
-                    "intent_kind": "agent_ref_move",
+            # agent_ref_move event log — PLAN-S4.1 §3.B.  Submitted as
+            # ``record_event`` with ``parameters.kind = 'agent_ref_move'``
+            # (NOT ``intent_kind: 'agent_ref_move'`` — that K40s).
+            self._metadata_writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
+                    "intent_kind": "record_event",
                     "parameters": {
                         "kind": "agent_ref_move",
                         "reason": "operator_revert",
@@ -1037,12 +1050,9 @@ class AgentSupervisor:
                         "from_turn_id": prior_head,
                         "to_turn_id": target_turn_id,
                     },
-                })
-            except Exception:
-                _diagnostics.mark(
-                    "revert_agent_ref_move_pending_slice",
-                    agent_id=agent_id,
-                )
+                    "intent_id": f"revert-arm-{agent_id}-{target_turn_id}-{uuid.uuid4().hex[:8]}",
+                },
+            })
 
         _diagnostics.mark(
             "revert_complete",
@@ -1218,8 +1228,8 @@ class AgentSupervisor:
                     "supervisor.  Choose a different new_agent_id."
                 )
 
-            # --- resolve effective branch point ------------------------
-            source_head = self._head_turn_id  # notebook-global head
+            # --- resolve effective branch point (PLAN-S4.1) ------------
+            turn_index, source_head = self._read_persisted_turns()
 
             # Determine Case A vs Case B.
             # Case A: at_turn_id is None OR equals the source's current head.
@@ -1239,7 +1249,7 @@ class AgentSupervisor:
                     if cursor == at_turn_id:
                         found = True
                         break
-                    turn_rec = self._turns.get(cursor)
+                    turn_rec = turn_index.get(cursor)
                     if turn_rec is None:
                         break
                     cursor = turn_rec.get("parent_id")
@@ -1290,12 +1300,13 @@ class AgentSupervisor:
 
             self._agents[new_agent_id] = new_handle
 
-        # --- writer intents (outside lock; best-effort) ----------------
+        # --- writer intents (outside lock; PLAN-S4.1 active) -----------
         if self._metadata_writer is not None:
-            # fork_agent intent: persists the new agent ref.
-            # The handler may be _PENDING_SLICE; log diagnostic if it fails.
-            try:
-                self._metadata_writer.submit_intent({
+            # fork_agent intent: persists the new agent ref into
+            # ``zone.agents.<new_id>`` per PLAN-S4.1 §3.A.
+            self._metadata_writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
                     "intent_kind": "fork_agent",
                     "parameters": {
                         "source_agent_id": source_agent_id,
@@ -1304,31 +1315,25 @@ class AgentSupervisor:
                         "case": case,
                         "claude_session_id": new_session_id,
                     },
-                })
-            except Exception:
-                _diagnostics.mark(
-                    "fork_agent_intent_pending_slice",
-                    source_agent_id=source_agent_id,
-                    new_agent_id=new_agent_id,
-                )
+                    "intent_id": f"fork-{source_agent_id}-{new_agent_id}-{uuid.uuid4().hex[:8]}",
+                },
+            })
 
-            # agent_ref_move event — BSP-002 §8.5.
-            try:
-                self._metadata_writer.submit_intent({
-                    "intent_kind": "agent_ref_move",
+            # agent_ref_move event — PLAN-S4.1 §3.B.
+            self._metadata_writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
+                    "intent_kind": "record_event",
                     "parameters": {
                         "kind": "agent_ref_move",
                         "reason": "operator_branch",
                         "agent_id": new_agent_id,
-                        "from_turn_id": self._head_turn_id,
+                        "from_turn_id": source_head,
                         "to_turn_id": branch_turn_id,
                     },
-                })
-            except Exception:
-                _diagnostics.mark(
-                    "fork_agent_ref_move_pending_slice",
-                    new_agent_id=new_agent_id,
-                )
+                    "intent_id": f"fork-arm-{new_agent_id}-{uuid.uuid4().hex[:8]}",
+                },
+            })
 
         _diagnostics.mark(
             "fork_complete",
