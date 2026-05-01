@@ -235,9 +235,16 @@ class AgentSupervisor:
         ``turn_index`` is keyed on turn-id and carries each persisted
         turn dict (with normalized ``content`` field aliasing ``body``
         for back-compat with the prior in-memory shape).
-        ``notebook_head_id`` is the most-recently-``created_at`` turn id
-        across all agents (deterministic tiebreak by id).  Returns
-        ``({}, None)`` when no writer is wired or no turns exist.
+
+        ``notebook_head_id`` resolution (PLAN-S4.1 §3.C.3):
+
+        1. If any agent has a ``session.head_turn_id`` set (e.g., by
+           ``move_agent_head`` after revert), pick the max across
+           agents by (created_at, id) of the corresponding turn.
+        2. Otherwise, fall back to the most-recently-``created_at`` turn
+           across all agents (lex tiebreak on id).
+
+        Returns ``({}, None)`` when no writer is wired or no turns exist.
         """
         if self._metadata_writer is None:
             return {}, None
@@ -248,9 +255,14 @@ class AgentSupervisor:
         zone = snap.get("zone") or {}
         agents = zone.get("agents") or {}
         index: Dict[str, Dict[str, Any]] = {}
+        session_heads: List[str] = []
         for agent_state in agents.values():
             if not isinstance(agent_state, dict):
                 continue
+            session = agent_state.get("session") or {}
+            sh = session.get("head_turn_id")
+            if isinstance(sh, str) and sh:
+                session_heads.append(sh)
             for t in agent_state.get("turns", []) or []:
                 if not isinstance(t, dict):
                     continue
@@ -265,15 +277,34 @@ class AgentSupervisor:
                 if "content" not in norm and "body" in norm:
                     norm["content"] = norm["body"]
                 index[tid] = norm
-        # Compute notebook head: most-recent created_at, lex tiebreak on id.
+
+        def _key_for(tid: str) -> Tuple[str, str]:
+            t = index.get(tid)
+            return (str(t.get("created_at") or "") if t else "", tid)
+
         head_id: Optional[str] = None
-        head_key: Optional[Tuple[str, str]] = None
-        for tid, t in index.items():
-            ca = t.get("created_at") or ""
-            key = (str(ca), tid)
-            if head_key is None or key > head_key:
-                head_key = key
-                head_id = tid
+        # Prefer agent session heads when present (post-revert / post-fork).
+        candidates = [h for h in session_heads if h in index]
+        if candidates:
+            head_id = max(candidates, key=_key_for)
+        else:
+            # Fall back to "leaf" turns (no other turn references them as
+            # parent) — these are the chain tips.  Among leaves, pick the
+            # most-recent created_at (lex tiebreak on id).  Falls through
+            # to the global most-recent if no leaves found (cycle).
+            referenced_parents: set = set()
+            for t in index.values():
+                pid = t.get("parent_id")
+                if isinstance(pid, str):
+                    referenced_parents.add(pid)
+            leaves = [tid for tid in index if tid not in referenced_parents]
+            pool = leaves if leaves else list(index.keys())
+            head_key: Optional[Tuple[str, str]] = None
+            for tid in pool:
+                key = _key_for(tid)
+                if head_key is None or key > head_key:
+                    head_key = key
+                    head_id = tid
         return index, head_id
 
     def _notebook_head_turn_id(self) -> Optional[str]:

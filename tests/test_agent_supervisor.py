@@ -270,8 +270,15 @@ def _patch_health(status_code: int = 200):
 
 
 def _make_supervisor() -> AgentSupervisor:
-    """Build a supervisor with stub run-tracker + dispatcher (no real kernel)."""
+    """Build a supervisor with stub run-tracker + dispatcher + real writer.
+
+    PLAN-S4.1: a real :class:`MetadataWriter` is wired so the
+    ``_missed_turns`` walker can read from
+    ``metadata.rts.zone.agents.<*>.turns[]``.  Tests seed turns via
+    :func:`_seed_turn` (which submits ``append_turn`` intents).
+    """
     from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.metadata_writer import MetadataWriter
 
     class _ListSink:
         def __init__(self) -> None: self.envelopes: List[Dict[str, Any]] = []
@@ -282,10 +289,57 @@ def _make_supervisor() -> AgentSupervisor:
         agent_id="alpha", zone_id="z1",
     )
     dispatcher = MagicMock()
-    return AgentSupervisor(
+    sup = AgentSupervisor(
         run_tracker=tracker, dispatcher=dispatcher,
         litellm_endpoint_url="http://127.0.0.1:9999/v1",
     )
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    sup.set_metadata_writer(writer)
+    return sup
+
+
+def _seed_turn(
+    sup: AgentSupervisor,
+    turn_id: str,
+    agent_id: str,
+    role: str,
+    content: str,
+    parent_id: Optional[str] = None,
+    *,
+    created_at: Optional[str] = None,
+) -> None:
+    """Submit one ``append_turn`` intent to the supervisor's writer.
+
+    Replacement for the deleted ``AgentSupervisor.record_turn`` test
+    seam (PLAN-S4.1 §3.C migration).
+    """
+    if sup._metadata_writer is None:  # pragma: no cover - defensive
+        raise RuntimeError(
+            "_seed_turn: supervisor has no writer wired"
+        )
+    # Map legacy ``role: "assistant"|"user"`` to the canonical roles.
+    norm_role = {"assistant": "agent", "user": "operator"}.get(role, role)
+    params: Dict[str, Any] = {
+        "id": turn_id,
+        "agent_id": agent_id,
+        "role": norm_role,
+        "body": content,
+        "parent_id": parent_id,
+    }
+    if created_at is not None:
+        params["created_at"] = created_at
+    result = sup._metadata_writer.submit_intent({
+        "payload": {
+            "action_type": "zone_mutate",
+            "intent_kind": "append_turn",
+            "parameters": params,
+            "intent_id": f"seed-{turn_id}-{uuid.uuid4().hex[:8]}",
+        },
+    })
+    if not result.get("applied"):
+        raise RuntimeError(
+            f"_seed_turn: append_turn rejected: {result}"
+        )
 
 
 def test_supervisor_spawn_creates_artifact_files(tmp_path: Path) -> None:
@@ -591,7 +645,7 @@ def test_send_user_turn_with_one_missed_sibling_turn(tmp_path: Path) -> None:
         sup.spawn(zone_id="z1", agent_id="beta", task="t", work_dir=tmp_path, api_key="sk-x")
 
     # Record a beta turn.
-    sup.record_turn("t1", "beta", "assistant", "beta reply one", parent_id=None)
+    _seed_turn(sup,"t1", "beta", "assistant", "beta reply one", parent_id=None)
 
     result = sup.send_user_turn("alpha", "operator to alpha")
     lines = fake_alpha.stdin.lines()
@@ -625,9 +679,9 @@ def test_send_user_turn_with_three_missed_sibling_turns(tmp_path: Path) -> None:
         sup.spawn(zone_id="z1", agent_id="beta", task="t", work_dir=tmp_path, api_key="sk-x")
 
     # Record 3 turns in a chain: t1 -> t2 -> t3.
-    sup.record_turn("t1", "beta", "assistant", "first", parent_id=None)
-    sup.record_turn("t2", "beta", "assistant", "second", parent_id="t1")
-    sup.record_turn("t3", "beta", "assistant", "third", parent_id="t2")
+    _seed_turn(sup,"t1", "beta", "assistant", "first", parent_id=None)
+    _seed_turn(sup,"t2", "beta", "assistant", "second", parent_id="t1")
+    _seed_turn(sup,"t3", "beta", "assistant", "third", parent_id="t2")
 
     result = sup.send_user_turn("alpha", "go")
     lines = fake_alpha.stdin.lines()
@@ -684,7 +738,7 @@ def test_send_user_turn_dead_agent_resumes_first(tmp_path: Path) -> None:
 def test_send_user_turn_advances_last_seen_turn_id(tmp_path: Path) -> None:
     """After success, handle.last_seen_turn_id == notebook head turn id."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t99", "alpha", "assistant", "alpha self turn", parent_id=None)
+    _seed_turn(sup,"t99", "alpha", "assistant", "alpha self turn", parent_id=None)
     # Self-authored turn is filtered — no prefix — but head advances.
     sup.send_user_turn("alpha", "msg")
     assert handle.last_seen_turn_id == "t99"
@@ -692,20 +746,31 @@ def test_send_user_turn_advances_last_seen_turn_id(tmp_path: Path) -> None:
 
 
 def test_send_user_turn_handoff_failure_raises_k26(tmp_path: Path) -> None:
-    """Cycle in turn DAG raises K26 RuntimeError with cycle_detected reason."""
+    """Cycle in turn DAG raises K26 RuntimeError with cycle_detected reason.
+
+    PLAN-S4.1: cycle injection bypasses ``append_turn`` validators
+    (which would reject the unknown parent_id) by writing directly into
+    the writer's ``_zone`` map.
+    """
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    # Create a turn cycle: t1 -> t2 -> t1 (via parent_id loop)
-    # Inject turns manually to bypass record_turn's linear ordering.
-    with sup._lock:
-        sup._turns["t1"] = {
-            "id": "t1", "agent_id": "beta", "role": "assistant",
-            "content": "beta msg", "parent_id": "t2",
+    # Inject the cycle directly into the writer's zone so the persisted
+    # graph carries it; ``append_turn`` rejects unknown parent_id so we
+    # cannot get there via the intent path.
+    writer = sup._metadata_writer
+    assert writer is not None
+    with writer._lock:
+        writer._zone.setdefault("agents", {})["beta"] = {
+            "turns": [
+                {"id": "t1", "agent_id": "beta", "role": "agent",
+                 "body": "beta msg", "parent_id": "t2",
+                 "created_at": "2026-04-30T17:00:00.000Z"},
+                {"id": "t2", "agent_id": "beta", "role": "agent",
+                 "body": "beta msg2", "parent_id": "t1",
+                 "created_at": "2026-04-30T17:00:01.000Z"},
+            ],
+            "session": {"head_turn_id": "t2"},
         }
-        sup._turns["t2"] = {
-            "id": "t2", "agent_id": "beta", "role": "assistant",
-            "content": "beta msg2", "parent_id": "t1",
-        }
-        sup._head_turn_id = "t2"
+        writer._dirty = True
 
     with pytest.raises(RuntimeError, match="K26"):
         sup.send_user_turn("alpha", "trigger cycle")
@@ -715,19 +780,33 @@ def test_send_user_turn_handoff_failure_raises_k26(tmp_path: Path) -> None:
 def test_send_user_turn_persists_last_seen_via_writer(tmp_path: Path) -> None:
     """update_agent_session intent submitted with last_seen_turn_id after success."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # PLAN-S4.1: seed BEFORE the mock swap so the persisted graph is
+    # populated; then swap to a mock to capture update_agent_session.
+    _seed_turn(sup, "t77", "alpha", "assistant", "self turn", parent_id=None)
     mock_writer = MagicMock()
     mock_writer.submit_intent = MagicMock(return_value={"ok": True})
+    # Pre-populate the mock's snapshot return so _missed_turns finds t77.
+    mock_writer.snapshot = MagicMock(return_value={
+        "zone": {"agents": {"alpha": {"turns": [
+            {"id": "t77", "agent_id": "alpha", "role": "agent",
+             "body": "self turn", "parent_id": None,
+             "created_at": "2026-04-30T17:00:00.000Z"},
+        ]}}},
+    })
     sup.set_metadata_writer(mock_writer)
 
-    sup.record_turn("t77", "alpha", "assistant", "self turn", parent_id=None)
     sup.send_user_turn("alpha", "persist test")
 
     # Writer must have received update_agent_session with last_seen_turn_id.
     mock_writer.submit_intent.assert_called_once()
     envelope = mock_writer.submit_intent.call_args[0][0]
-    assert envelope["intent_kind"] == "update_agent_session"
-    assert envelope["parameters"]["last_seen_turn_id"] == "t77"
-    assert envelope["parameters"]["agent_id"] == "alpha"
+    # Per BSP-003 §3 the wire shape wraps in ``payload`` (we accept the
+    # bare unwrapped form here for back-compat with the existing send
+    # call site).
+    inner = envelope.get("payload", envelope)
+    assert inner["intent_kind"] == "update_agent_session"
+    assert inner["parameters"]["last_seen_turn_id"] == "t77"
+    assert inner["parameters"]["agent_id"] == "alpha"
     handle.terminate()
 
 
@@ -751,7 +830,7 @@ def test_send_user_turn_strips_hashes_in_handoff_prefix(tmp_path: Path) -> None:
     # The strip helper removes the hash; the test asserts the prefix content
     # does NOT contain the hashed form.
     hashed_body = "@@deadbeef1234:agent hello"
-    sup.record_turn("t1", "beta", "assistant", hashed_body, parent_id=None)
+    _seed_turn(sup,"t1", "beta", "assistant", hashed_body, parent_id=None)
 
     sup.send_user_turn("alpha", "check strip")
     lines = fake_alpha.stdin.lines()
@@ -783,7 +862,7 @@ def test_revert_validates_target_in_ancestry_raises_k22(tmp_path: Path) -> None:
     """revert() raises K22 RuntimeError when target_turn_id is not in ancestry."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
     # Record a turn so there is a head, but target "t_orphan" is not in it.
-    sup.record_turn("t_1", "alpha", "assistant", "first turn", parent_id=None)
+    _seed_turn(sup,"t_1", "alpha", "assistant", "first turn", parent_id=None)
     with pytest.raises(RuntimeError, match="K22"):
         sup.revert("alpha", "t_orphan")
     handle.terminate()
@@ -792,7 +871,7 @@ def test_revert_validates_target_in_ancestry_raises_k22(tmp_path: Path) -> None:
 def test_revert_sigterms_live_process(tmp_path: Path) -> None:
     """revert() calls terminate() on a live process (popen.poll() is None)."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
     # Process is alive (returncode is None).
     assert fake.returncode is None
     sup.revert("alpha", "t_1")
@@ -805,43 +884,57 @@ def test_revert_sigterms_live_process(tmp_path: Path) -> None:
 def test_revert_resets_last_seen_to_target(tmp_path: Path) -> None:
     """revert() updates handle.last_seen_turn_id to target_turn_id."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
-    sup.record_turn("t_2", "alpha", "assistant", "turn two", parent_id="t_1")
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_2", "alpha", "assistant", "turn two", parent_id="t_1")
     # After two turns head is t_2; revert to t_1.
     sup.revert("alpha", "t_1")
     assert handle.last_seen_turn_id == "t_1"
-    assert sup._head_turn_id == "t_1"
+    assert sup._notebook_head_turn_id() == "t_1"
     handle.terminate()
 
 
 def test_revert_emits_agent_ref_move_event(tmp_path: Path) -> None:
-    """revert() submits move_agent_head + agent_ref_move intents to the writer."""
-    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    mock_writer = MagicMock()
-    # Both intents are best-effort; allow them to succeed or fail.
-    mock_writer.submit_intent = MagicMock(return_value={"ok": True})
-    sup.set_metadata_writer(mock_writer)
+    """revert() submits move_agent_head + record_event(agent_ref_move) intents.
 
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    PLAN-S4.1: ``agent_ref_move`` is an event sub-kind on
+    ``record_event``, NOT a top-level intent kind (which would K40).
+    """
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # Seed via the real writer (still wired by _make_supervisor) so the
+    # ancestry walk inside revert can find t_1.
+    _seed_turn(sup, "t_1", "alpha", "assistant", "turn one", parent_id=None)
+
+    # Now wrap the real writer so we can intercept submit_intent calls
+    # while the ancestry walk still reads from the persisted graph.
+    real_writer = sup._metadata_writer
+    intent_log: List[Dict[str, Any]] = []
+    orig_submit = real_writer.submit_intent  # type: ignore[union-attr]
+
+    def _capture(env: Dict[str, Any]) -> Dict[str, Any]:
+        intent_log.append(env)
+        return orig_submit(env)
+    real_writer.submit_intent = _capture  # type: ignore[union-attr]
+
     sup.revert("alpha", "t_1")
 
-    # submit_intent should have been called twice: move_agent_head + agent_ref_move.
-    assert mock_writer.submit_intent.call_count == 2
-    calls = [c[0][0] for c in mock_writer.submit_intent.call_args_list]
-    kinds = [c["intent_kind"] for c in calls]
+    # Two intents submitted: move_agent_head + record_event(agent_ref_move).
+    assert len(intent_log) == 2, intent_log
+    payloads = [env["payload"] for env in intent_log]
+    kinds = [p["intent_kind"] for p in payloads]
     assert "move_agent_head" in kinds
-    assert "agent_ref_move" in kinds
-    # Confirm agent_ref_move carries the right payload.
-    ref_move = next(c for c in calls if c["intent_kind"] == "agent_ref_move")
-    assert ref_move["parameters"]["reason"] == "operator_revert"
-    assert ref_move["parameters"]["to_turn_id"] == "t_1"
+    assert "record_event" in kinds
+    # Confirm record_event carries the right agent_ref_move payload.
+    rec = next(p for p in payloads if p["intent_kind"] == "record_event")
+    assert rec["parameters"]["kind"] == "agent_ref_move"
+    assert rec["parameters"]["reason"] == "operator_revert"
+    assert rec["parameters"]["to_turn_id"] == "t_1"
     handle.terminate()
 
 
 def test_revert_mints_new_claude_session_id_for_next_continue(tmp_path: Path) -> None:
     """revert() replaces claude_session_id on the handle so next continue uses a fresh session."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
     original_session_id = handle.claude_session_id
     sup.revert("alpha", "t_1")
     assert handle.claude_session_id != original_session_id
@@ -926,7 +1019,7 @@ def test_fork_validates_source_exists_raises_k20(tmp_path: Path) -> None:
 def test_fork_validates_new_id_unique_raises_k21(tmp_path: Path) -> None:
     """fork() raises K21 RuntimeError when new_agent_id already exists."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
     # Attempting to fork with new_agent_id="alpha" (already exists) raises K21.
     with pytest.raises(RuntimeError, match="K21"):
         sup.fork("alpha", None, "alpha")
@@ -936,9 +1029,9 @@ def test_fork_validates_new_id_unique_raises_k21(tmp_path: Path) -> None:
 def test_fork_case_a_at_head_succeeds_with_fresh_session_id(tmp_path: Path) -> None:
     """fork() Case A (at_turn_id == head): new agent gets fresh claude_session_id."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
     original_session = handle.claude_session_id
-    head = sup._head_turn_id  # "t_1"
+    head = sup._notebook_head_turn_id()  # "t_1"
 
     new_handle = sup.fork("alpha", head, "beta")
 
@@ -954,8 +1047,8 @@ def test_fork_case_a_at_head_succeeds_with_fresh_session_id(tmp_path: Path) -> N
 def test_fork_case_a_implicit_head_when_at_turn_id_none(tmp_path: Path) -> None:
     """fork() Case A (at_turn_id=None): branches at head implicitly."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
-    head = sup._head_turn_id  # "t_1"
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
+    head = sup._notebook_head_turn_id()  # "t_1"
 
     new_handle = sup.fork("alpha", None, "beta")
 
@@ -967,7 +1060,7 @@ def test_fork_case_a_implicit_head_when_at_turn_id_none(tmp_path: Path) -> None:
 def test_fork_case_b_validates_target_in_ancestry_raises_k22(tmp_path: Path) -> None:
     """fork() Case B raises K22 when at_turn_id is not in source ancestry."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
     # "t_orphan" is not in the turn chain → K22.
     with pytest.raises(RuntimeError, match="K22"):
         sup.fork("alpha", "t_orphan", "beta")
@@ -977,8 +1070,8 @@ def test_fork_case_b_validates_target_in_ancestry_raises_k22(tmp_path: Path) -> 
 def test_fork_case_b_succeeds_with_fresh_session_id_at_ancestor_turn(tmp_path: Path) -> None:
     """fork() Case B: branch at ancestor turn; new agent head=t_1, fresh session."""
     sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
-    sup.record_turn("t_2", "alpha", "assistant", "turn two", parent_id="t_1")
+    _seed_turn(sup,"t_1", "alpha", "assistant", "turn one", parent_id=None)
+    _seed_turn(sup,"t_2", "alpha", "assistant", "turn two", parent_id="t_1")
     # Head is now t_2; fork at ancestor t_1 (Case B).
     original_session = handle.claude_session_id
 
@@ -992,23 +1085,32 @@ def test_fork_case_b_succeeds_with_fresh_session_id_at_ancestor_turn(tmp_path: P
 
 
 def test_fork_emits_agent_ref_move_event(tmp_path: Path) -> None:
-    """fork() submits fork_agent + agent_ref_move intents to the writer."""
-    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
-    mock_writer = MagicMock()
-    mock_writer.submit_intent = MagicMock(return_value={"ok": True})
-    sup.set_metadata_writer(mock_writer)
+    """fork() submits fork_agent + record_event(agent_ref_move) intents.
 
-    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    PLAN-S4.1: ``agent_ref_move`` is an event sub-kind on
+    ``record_event``, NOT a top-level intent kind.
+    """
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    _seed_turn(sup, "t_1", "alpha", "assistant", "turn one", parent_id=None)
+
+    real_writer = sup._metadata_writer
+    intent_log: List[Dict[str, Any]] = []
+    orig_submit = real_writer.submit_intent  # type: ignore[union-attr]
+
+    def _capture(env: Dict[str, Any]) -> Dict[str, Any]:
+        intent_log.append(env)
+        return orig_submit(env)
+    real_writer.submit_intent = _capture  # type: ignore[union-attr]
+
     sup.fork("alpha", None, "beta")
 
-    # submit_intent should have been called twice: fork_agent + agent_ref_move.
-    assert mock_writer.submit_intent.call_count == 2
-    calls = [c[0][0] for c in mock_writer.submit_intent.call_args_list]
-    kinds = [c["intent_kind"] for c in calls]
+    assert len(intent_log) == 2, intent_log
+    payloads = [env["payload"] for env in intent_log]
+    kinds = [p["intent_kind"] for p in payloads]
     assert "fork_agent" in kinds
-    assert "agent_ref_move" in kinds
-    # Confirm agent_ref_move carries the right payload.
-    ref_move = next(c for c in calls if c["intent_kind"] == "agent_ref_move")
-    assert ref_move["parameters"]["reason"] == "operator_branch"
-    assert ref_move["parameters"]["agent_id"] == "beta"
+    assert "record_event" in kinds
+    rec = next(p for p in payloads if p["intent_kind"] == "record_event")
+    assert rec["parameters"]["kind"] == "agent_ref_move"
+    assert rec["parameters"]["reason"] == "operator_branch"
+    assert rec["parameters"]["agent_id"] == "beta"
     handle.terminate()

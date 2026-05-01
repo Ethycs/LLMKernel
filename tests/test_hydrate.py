@@ -217,6 +217,7 @@ class _FakePopenH:
 
 
 def _make_sup_h() -> AgentSupervisor:
+    """Build a hydrate-test supervisor with a real writer wired (PLAN-S4.1)."""
     from llm_kernel.run_tracker import RunTracker
 
     class _Sink:
@@ -227,11 +228,34 @@ def _make_sup_h() -> AgentSupervisor:
         trace_id=str(_uuid.uuid4()), sink=_Sink(),
         agent_id="alpha", zone_id="z1",
     )
-    return AgentSupervisor(
+    sup = AgentSupervisor(
         run_tracker=tracker,
         dispatcher=MagicMock(),
         litellm_endpoint_url="http://127.0.0.1:9999/v1",
     )
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    sup.set_metadata_writer(writer)
+    return sup
+
+
+def _seed_turn_h(
+    sup: AgentSupervisor, turn_id: str, agent_id: str, role: str,
+    content: str, parent_id: Any = None,
+) -> None:
+    """PLAN-S4.1 replacement for the deleted ``record_turn`` test seam."""
+    norm_role = {"assistant": "agent", "user": "operator"}.get(role, role)
+    sup._metadata_writer.submit_intent({  # type: ignore[union-attr]
+        "payload": {
+            "action_type": "zone_mutate",
+            "intent_kind": "append_turn",
+            "parameters": {
+                "id": turn_id, "agent_id": agent_id,
+                "role": norm_role, "body": content,
+                "parent_id": parent_id,
+            },
+            "intent_id": f"seed-{turn_id}-{_uuid.uuid4().hex[:8]}",
+        },
+    })
 
 
 def _patch_health_h(status_code: int = 200):
@@ -295,8 +319,8 @@ def test_handoff_after_hydrate_replays_correctly(tmp_path: Path) -> None:
         )
 
     # Record turns: t_old (already seen) and t_new (missed).
-    sup.record_turn("t_old", "beta", "assistant", "old beta msg", parent_id=None)
-    sup.record_turn("t_new", "beta", "assistant", "new beta msg", parent_id="t_old")
+    _seed_turn_h(sup,"t_old", "beta", "assistant", "old beta msg", parent_id=None)
+    _seed_turn_h(sup,"t_new", "beta", "assistant", "new beta msg", parent_id="t_old")
 
     # send_user_turn for alpha should inject only t_new (t_old was last_seen).
     result = sup.send_user_turn("alpha", "after hydrate")
