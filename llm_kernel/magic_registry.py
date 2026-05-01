@@ -325,9 +325,11 @@ LINE_MAGICS: Dict[str, LineMagicHandler] = {
     # routing layer ships an operator.action envelope {action_type:
     # "agent_stop", parameters: {agent_id, cell_id}}.
     "stop": LineMagicHandler(name="stop"),
-    "branch": LineMagicHandler(
-        name="branch", status="stub", pending_slice="S5",
-    ),
+    # S5a — @branch active: apply records to cell.line_magics; the kernel
+    # routing layer ships an operator.action envelope {action_type:
+    # "agent_branch", parameters: {source_agent, at_turn_id, new_agent_id,
+    # cell_id}}.
+    "branch": LineMagicHandler(name="branch"),
 }
 
 

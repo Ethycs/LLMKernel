@@ -428,6 +428,17 @@ def validate_tool_output(tool_name: str, result: Dict[str, Any]) -> Optional[str
 # meaning before it appears in a marker.
 
 K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
+    # S5a -- branch-agent: new_agent_id already exists in supervisor.
+    "K21": {
+        "name": "cell_directive_invalid_branch_target",
+        "fires_in": "agent_supervisor.fork",
+        "description": (
+            "The ``new_agent_id`` supplied to ``AgentSupervisor.fork`` "
+            "already exists in the supervisor's agent registry.  Agent "
+            "IDs must be unique within a zone.  The operator should "
+            "choose a different ``new_agent_id``."
+        ),
+    },
     # S5b -- revert-agent.
     "K22": {
         "name": "cell_directive_invalid_revert_target",
@@ -651,6 +662,7 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
 }
 
 # Convenience constants for K-class codes (avoids magic strings at call sites).
+K21_INVALID_BRANCH_TARGET: str = "K21"
 K22_INVALID_REVERT_TARGET: str = "K22"
 K26_CROSS_AGENT_HANDOFF_FAILED: str = "K26"
 K30_MULTIPLE_KINDS: str = "K30"
@@ -701,6 +713,7 @@ __all__ = [
     "K_CLASS_REGISTRY",
     "k_class_info",
     # K-code string constants
+    "K21_INVALID_BRANCH_TARGET",
     "K22_INVALID_REVERT_TARGET",
     "K26_CROSS_AGENT_HANDOFF_FAILED",
     "K30_MULTIPLE_KINDS",

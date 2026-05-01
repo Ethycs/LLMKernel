@@ -33,6 +33,7 @@ from llm_kernel.wire.tools import (  # noqa: F401
     K_CLASS_REGISTRY,
     k_class_info,
     # K-code string constants (new in S5.0.3a; harmless additions)
+    K21_INVALID_BRANCH_TARGET,
     K22_INVALID_REVERT_TARGET,
     K26_CROSS_AGENT_HANDOFF_FAILED,
     K30_MULTIPLE_KINDS,

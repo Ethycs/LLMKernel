@@ -158,3 +158,16 @@ def test_stop_line_magic_dispatches_agent_stop_envelope() -> None:
     # Confirm status is active (no _pending flag injected by the handler).
     assert MR.LINE_MAGICS["stop"].status == "active"
     assert not getattr(MR.LINE_MAGICS["stop"], "pending_slice", None)
+
+
+def test_branch_line_magic_dispatches_agent_branch_envelope() -> None:
+    """``@branch alpha at t_2 as beta`` is active: recorded to cell.line_magics."""
+    # @branch is now active (not stub); parse_cell on a cell containing
+    # @branch should record ("branch", "alpha at t_2 as beta") in
+    # cell.line_magics so the kernel routing layer can ship an
+    # agent_branch envelope {source_agent, at_turn_id, new_agent_id, cell_id}.
+    cell = parse_cell("@@agent alpha\n@branch alpha at t_2 as beta\nbody text")
+    assert ("branch", "alpha at t_2 as beta") in cell.line_magics, cell.line_magics
+    # Confirm status is active (no _pending flag injected by the handler).
+    assert MR.LINE_MAGICS["branch"].status == "active"
+    assert not getattr(MR.LINE_MAGICS["branch"], "pending_slice", None)

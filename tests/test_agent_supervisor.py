@@ -909,3 +909,106 @@ def test_stop_persists_runtime_status_via_writer(tmp_path: Path) -> None:
     assert envelope["parameters"]["pid"] is None
     assert envelope["parameters"]["agent_id"] == "alpha"
     handle.terminate()
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S5a: AgentSupervisor.fork tests
+# ---------------------------------------------------------------------------
+
+
+def test_fork_validates_source_exists_raises_k20(tmp_path: Path) -> None:
+    """fork() raises K20 RuntimeError when source_agent_id is unknown."""
+    sup = _make_supervisor()
+    with pytest.raises(RuntimeError, match="K20"):
+        sup.fork("nonexistent", None, "beta")
+
+
+def test_fork_validates_new_id_unique_raises_k21(tmp_path: Path) -> None:
+    """fork() raises K21 RuntimeError when new_agent_id already exists."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    # Attempting to fork with new_agent_id="alpha" (already exists) raises K21.
+    with pytest.raises(RuntimeError, match="K21"):
+        sup.fork("alpha", None, "alpha")
+    handle.terminate()
+
+
+def test_fork_case_a_at_head_succeeds_with_fresh_session_id(tmp_path: Path) -> None:
+    """fork() Case A (at_turn_id == head): new agent gets fresh claude_session_id."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    original_session = handle.claude_session_id
+    head = sup._head_turn_id  # "t_1"
+
+    new_handle = sup.fork("alpha", head, "beta")
+
+    assert new_handle.agent_id == "beta"
+    assert new_handle.last_seen_turn_id == head
+    assert new_handle.claude_session_id != original_session
+    assert new_handle.claude_session_id  # non-empty UUID
+    # New agent is in the registry.
+    assert "beta" in sup._agents
+    handle.terminate()
+
+
+def test_fork_case_a_implicit_head_when_at_turn_id_none(tmp_path: Path) -> None:
+    """fork() Case A (at_turn_id=None): branches at head implicitly."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    head = sup._head_turn_id  # "t_1"
+
+    new_handle = sup.fork("alpha", None, "beta")
+
+    assert new_handle.last_seen_turn_id == head
+    assert "beta" in sup._agents
+    handle.terminate()
+
+
+def test_fork_case_b_validates_target_in_ancestry_raises_k22(tmp_path: Path) -> None:
+    """fork() Case B raises K22 when at_turn_id is not in source ancestry."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    # "t_orphan" is not in the turn chain → K22.
+    with pytest.raises(RuntimeError, match="K22"):
+        sup.fork("alpha", "t_orphan", "beta")
+    handle.terminate()
+
+
+def test_fork_case_b_succeeds_with_fresh_session_id_at_ancestor_turn(tmp_path: Path) -> None:
+    """fork() Case B: branch at ancestor turn; new agent head=t_1, fresh session."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    sup.record_turn("t_2", "alpha", "assistant", "turn two", parent_id="t_1")
+    # Head is now t_2; fork at ancestor t_1 (Case B).
+    original_session = handle.claude_session_id
+
+    new_handle = sup.fork("alpha", "t_1", "beta")
+
+    assert new_handle.agent_id == "beta"
+    assert new_handle.last_seen_turn_id == "t_1"
+    assert new_handle.claude_session_id != original_session
+    assert "beta" in sup._agents
+    handle.terminate()
+
+
+def test_fork_emits_agent_ref_move_event(tmp_path: Path) -> None:
+    """fork() submits fork_agent + agent_ref_move intents to the writer."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    mock_writer = MagicMock()
+    mock_writer.submit_intent = MagicMock(return_value={"ok": True})
+    sup.set_metadata_writer(mock_writer)
+
+    sup.record_turn("t_1", "alpha", "assistant", "turn one", parent_id=None)
+    sup.fork("alpha", None, "beta")
+
+    # submit_intent should have been called twice: fork_agent + agent_ref_move.
+    assert mock_writer.submit_intent.call_count == 2
+    calls = [c[0][0] for c in mock_writer.submit_intent.call_args_list]
+    kinds = [c["intent_kind"] for c in calls]
+    assert "fork_agent" in kinds
+    assert "agent_ref_move" in kinds
+    # Confirm agent_ref_move carries the right payload.
+    ref_move = next(c for c in calls if c["intent_kind"] == "agent_ref_move")
+    assert ref_move["parameters"]["reason"] == "operator_branch"
+    assert ref_move["parameters"]["agent_id"] == "beta"
+    handle.terminate()

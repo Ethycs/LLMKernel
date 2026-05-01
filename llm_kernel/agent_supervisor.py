@@ -1141,6 +1141,204 @@ class AgentSupervisor:
             agent_id=agent_id,
         )
 
+    # ------------------------------------------------------------------
+    # PLAN-S5a: branch / fork operation
+    # ------------------------------------------------------------------
+
+    #: K-class for invalid branch target (new_agent_id already exists).
+    K21_INVALID_BRANCH_TARGET: str = "K21"
+
+    def fork(
+        self,
+        source_agent_id: str,
+        at_turn_id: Optional[str],
+        new_agent_id: str,
+    ) -> "AgentHandle":
+        """Create a new agent ref branching from ``source_agent_id``.
+
+        PLAN-S5a / `branch-agent.md`:
+
+        1. Validate ``source_agent_id`` exists (K20 if not).
+        2. Validate ``new_agent_id`` does NOT already exist (K21 if it does).
+        3. **Case A** (``at_turn_id`` is ``None`` OR equals
+           ``source.head_turn_id``):
+           - New agent's ``head_turn_id = source.head_turn_id``.
+           - New agent's ``last_seen_turn_id = source.head_turn_id``.
+           - Fresh ``claude_session_id`` minted (source session NOT shared).
+           - ``runtime_status = "idle"`` — no live process; spawn on first
+             continue-turn via existing resume + replay mechanics.
+        4. **Case B** (``at_turn_id`` is an ancestor):
+           - Validate ``at_turn_id`` is in ``source.head_turn_id``'s ancestry
+             by walking ``parent_id`` (K22 if not found).
+           - New agent's ``head_turn_id = at_turn_id``.
+           - New agent's ``last_seen_turn_id = at_turn_id``.
+           - Fresh ``claude_session_id``; ``runtime_status = "idle"``.
+           - Transcript replay (synthesizing a claude session at ``at_turn_id``)
+             is NOT this slice's job — it happens lazily on first continue-turn
+             via existing resume + replay mechanics.
+        5. Insert the new AgentHandle into ``self._agents``.
+        6. Submit ``fork_agent`` intent to writer (best-effort; logs diagnostic
+           if the handler is ``_PENDING_SLICE``).
+        7. Submit ``record_event`` intent with ``kind: "agent_ref_move"``,
+           ``reason: "operator_branch"``.
+        8. Return the new AgentHandle.
+
+        Args:
+            source_agent_id: The agent to branch from.
+            at_turn_id: The turn to branch at.  ``None`` or equal to
+                ``source.head_turn_id`` triggers Case A (branch at head).
+                Any ancestor turn triggers Case B.
+            new_agent_id: The ID for the new agent.  MUST be unique.
+
+        Returns:
+            The newly-created :class:`AgentHandle` (``runtime_status``
+            is ``"idle"``; no live process yet).
+
+        Raises:
+            RuntimeError: K20 if ``source_agent_id`` is unknown; K21 if
+                ``new_agent_id`` already exists; K22 if ``at_turn_id``
+                is not in the source agent's ancestry.
+        """
+        from . import _diagnostics
+
+        with self._lock:
+            # --- validate source exists --------------------------------
+            source_handle = self._agents.get(source_agent_id)
+            if source_handle is None:
+                raise RuntimeError(
+                    f"K20: source agent {source_agent_id!r} not found in "
+                    "supervisor.  Spawn the source agent before branching."
+                )
+
+            # --- validate new_agent_id is unique -----------------------
+            if new_agent_id in self._agents:
+                raise RuntimeError(
+                    f"{self.K21_INVALID_BRANCH_TARGET}: "
+                    f"new_agent_id {new_agent_id!r} already exists in "
+                    "supervisor.  Choose a different new_agent_id."
+                )
+
+            # --- resolve effective branch point ------------------------
+            source_head = self._head_turn_id  # notebook-global head
+
+            # Determine Case A vs Case B.
+            # Case A: at_turn_id is None OR equals the source's current head.
+            if at_turn_id is None or at_turn_id == source_head:
+                branch_turn_id = source_head
+                case = "A"
+            else:
+                # Case B: at_turn_id must be reachable via parent_id walk.
+                found = False
+                visited: set = set()
+                cursor = source_head
+                depth = 0
+                while cursor is not None and depth < self._HANDOFF_MAX_DEPTH:
+                    if cursor in visited:
+                        break  # cycle guard
+                    visited.add(cursor)
+                    if cursor == at_turn_id:
+                        found = True
+                        break
+                    turn_rec = self._turns.get(cursor)
+                    if turn_rec is None:
+                        break
+                    cursor = turn_rec.get("parent_id")
+                    depth += 1
+
+                if not found:
+                    raise RuntimeError(
+                        f"{self.K22_INVALID_REVERT_TARGET}: "
+                        f"turn {at_turn_id!r} is not in agent "
+                        f"{source_agent_id!r}'s ancestry.  Use a turn "
+                        "reachable via parent_id walk from the source head."
+                    )
+                branch_turn_id = at_turn_id
+                case = "B"
+
+            # --- mint fresh claude_session_id for the new agent --------
+            new_session_id = str(uuid.uuid4())
+
+            # --- build the new AgentHandle (metadata-only; no process) -
+            # We construct a minimal handle using a sentinel Popen-like
+            # object: the handle's popen.poll() returns non-None (already
+            # "exited") so runtime_status is treated as idle by callers.
+            import types
+            idle_popen: Any = types.SimpleNamespace(
+                poll=lambda: 0,
+                returncode=0,
+                pid=None,
+                terminate=lambda: None,
+                kill=lambda: None,
+                wait=lambda **_: 0,
+                stdin=None,
+                stdout=iter([]),
+                stderr=iter([]),
+            )
+            now = time.monotonic()
+            new_handle = AgentHandle(
+                agent_id=new_agent_id,
+                zone_id=source_handle.zone_id,
+                popen=idle_popen,
+                started_at=now,
+                work_dir=source_handle.work_dir,
+                stdout_thread=threading.Thread(),
+                stderr_thread=threading.Thread(),
+                claude_session_id=new_session_id,
+                last_seen_turn_id=branch_turn_id,
+            )
+            new_handle.state = "terminated"  # idle; no live process
+
+            self._agents[new_agent_id] = new_handle
+
+        # --- writer intents (outside lock; best-effort) ----------------
+        if self._metadata_writer is not None:
+            # fork_agent intent: persists the new agent ref.
+            # The handler may be _PENDING_SLICE; log diagnostic if it fails.
+            try:
+                self._metadata_writer.submit_intent({
+                    "intent_kind": "fork_agent",
+                    "parameters": {
+                        "source_agent_id": source_agent_id,
+                        "new_agent_id": new_agent_id,
+                        "at_turn_id": branch_turn_id,
+                        "case": case,
+                        "claude_session_id": new_session_id,
+                    },
+                })
+            except Exception:
+                _diagnostics.mark(
+                    "fork_agent_intent_pending_slice",
+                    source_agent_id=source_agent_id,
+                    new_agent_id=new_agent_id,
+                )
+
+            # agent_ref_move event — BSP-002 §8.5.
+            try:
+                self._metadata_writer.submit_intent({
+                    "intent_kind": "agent_ref_move",
+                    "parameters": {
+                        "kind": "agent_ref_move",
+                        "reason": "operator_branch",
+                        "agent_id": new_agent_id,
+                        "from_turn_id": self._head_turn_id,
+                        "to_turn_id": branch_turn_id,
+                    },
+                })
+            except Exception:
+                _diagnostics.mark(
+                    "fork_agent_ref_move_pending_slice",
+                    new_agent_id=new_agent_id,
+                )
+
+        _diagnostics.mark(
+            "fork_complete",
+            source_agent_id=source_agent_id,
+            new_agent_id=new_agent_id,
+            at_turn_id=branch_turn_id,
+            case=case,
+        )
+        return new_handle
+
     def terminate_all(self, grace_seconds: float = 10.0) -> None:
         """Graceful shutdown of every active agent (RFC-002 §6)."""
         with self._lock:
