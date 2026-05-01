@@ -1092,7 +1092,14 @@ class MetadataWriter:
             # Bump iff the version is unchanged from before the apply.
             # We approximate by bumping only when the handler did NOT
             # already increment (intent_kind in the explicit set).
-            if intent_kind in {"record_event", "acknowledge_drift"}:
+            if intent_kind in {
+                "record_event", "acknowledge_drift",
+                # PLAN-S4.1 turn-graph handlers: in-memory mutators
+                # that flip ``_dirty`` but do not bump the snapshot
+                # version themselves.  We bump here so each successful
+                # apply produces a fresh snapshot id.
+                "append_turn", "fork_agent", "move_agent_head",
+            }:
                 self._snapshot_version += 1
             new_version = self._snapshot_version
             self._intent_applied[intent_id] = new_version
@@ -1164,21 +1171,13 @@ class MetadataWriter:
                 return self.acknowledge_drift(field_path=fp, detected_at=da)
             return _h
         if intent_kind == "record_event":
-            def _h(params: Dict[str, Any]) -> bool:
-                # Append a structured event-log entry; we fold these
-                # into the intent_log so the snapshot carries them.
-                fp = params.get("field_path")
-                if not isinstance(fp, str) or not fp:
-                    raise ValueError("record_event: field_path is required")
-                self.append_drift_event(
-                    field_path=fp,
-                    previous_value=params.get("previous_value"),
-                    current_value=params.get("current_value"),
-                    severity=str(params.get("severity", "info")),
-                    detected_at=params.get("detected_at"),
-                )
-                return True
-            return _h
+            return self._handle_record_event
+        if intent_kind == "append_turn":
+            return self._handle_append_turn
+        if intent_kind == "fork_agent":
+            return self._handle_fork_agent
+        if intent_kind == "move_agent_head":
+            return self._handle_move_agent_head
         if intent_kind == "add_blob":
             def _h(params: Dict[str, Any]) -> bool:
                 key = params.get("key")
@@ -1205,10 +1204,9 @@ class MetadataWriter:
         _PENDING_SLICE = {
             # BSP-002 turn graph kinds (writer carries the agent graph
             # but not the turn-level conversation graph yet).
-            "append_turn":              "BSP-002 turn graph slice",
+            # PLAN-S4.1: ``append_turn``, ``fork_agent``, ``move_agent_head``
+            # active above; ``record_event`` reshaped above.
             "create_agent":             "BSP-002 turn graph slice",
-            "move_agent_head":          "BSP-002 turn graph slice",
-            "fork_agent":               "BSP-002 turn graph slice",
             "update_agent_session":     "BSP-002 turn graph slice",
             "add_overlay":              "BSP-002 turn graph slice",
             "move_overlay_ref":         "BSP-002 turn graph slice",
@@ -1265,6 +1263,356 @@ class MetadataWriter:
         """Return a snapshot of the in-memory intent_applied log entries."""
         with self._lock:
             return [dict(entry) for entry in self._intent_log]
+
+    # -- PLAN-S4.1 turn-graph persistence ---------------------------
+
+    # Recognized roles per [concepts/turn](docs/atoms/concepts/turn.md)
+    # §Schema.  Used as a soft validator on ``append_turn``; unknown
+    # roles raise K42.
+    _TURN_ROLES: FrozenSet[str] = frozenset({"operator", "agent", "system", "user", "assistant"})  # type: ignore[name-defined]
+    _AGENT_REF_MOVE_REASONS: FrozenSet[str] = frozenset({"operator_revert", "operator_branch"})  # type: ignore[name-defined]
+
+    def _zone_agents(self) -> Dict[str, Any]:
+        """Return ``metadata.rts.zone.agents`` map, creating it if absent.
+
+        Caller MUST hold ``self._lock``.  The map is keyed by
+        ``agent_id`` per [concepts/agent](docs/atoms/concepts/agent.md);
+        each value carries ``turns[]`` plus a ``session`` substructure
+        with ``head_turn_id`` / ``last_seen_turn_id`` per PLAN-S4.1
+        §3.B'.
+        """
+        return self._zone.setdefault("agents", {})
+
+    def _all_persisted_turn_ids(self) -> set:
+        """Return the set of all turn ids across all agents in the zone.
+
+        Caller MUST hold ``self._lock``.  Used by ``append_turn`` to
+        enforce zone-wide turn_id uniqueness per PLAN-S4.1 §3.A.
+        """
+        agents = self._zone.get("agents", {})
+        out: set = set()
+        for agent_state in agents.values():
+            if not isinstance(agent_state, dict):
+                continue
+            for t in agent_state.get("turns", []) or []:
+                tid = t.get("id") if isinstance(t, dict) else None
+                if isinstance(tid, str):
+                    out.add(tid)
+        return out
+
+    def _turn_in_agent_ancestry(
+        self, agent_id: str, target_turn_id: str,
+    ) -> bool:
+        """Return True iff ``target_turn_id`` is reachable from the agent's head.
+
+        Caller MUST hold ``self._lock``.  Walks ``parent_id`` from the
+        agent's current ``head_turn_id`` (or last persisted turn) back
+        through the union of all agents' ``turns[]`` arrays.  Used by
+        ``move_agent_head`` and ``fork_agent`` per PLAN-S4.1 §3.A.
+        """
+        agents = self._zone.get("agents", {})
+        agent_state = agents.get(agent_id)
+        if not isinstance(agent_state, dict):
+            return False
+        # Build a global turn-by-id index across all agents (the chain
+        # may cross agent boundaries by parent_id).
+        all_turns: Dict[str, Dict[str, Any]] = {}
+        for st in agents.values():
+            if not isinstance(st, dict):
+                continue
+            for t in st.get("turns", []) or []:
+                if isinstance(t, dict) and isinstance(t.get("id"), str):
+                    all_turns[t["id"]] = t
+        # Resolve starting cursor: prefer session.head_turn_id, else the
+        # last appended turn for this agent.
+        session = agent_state.get("session", {}) or {}
+        cursor = session.get("head_turn_id")
+        if not isinstance(cursor, str):
+            agent_turns = agent_state.get("turns", []) or []
+            cursor = agent_turns[-1].get("id") if agent_turns else None
+        # Special case: target equals current cursor.
+        visited: set = set()
+        depth = 0
+        max_depth = 10_000  # generous guard
+        while isinstance(cursor, str) and depth < max_depth:
+            if cursor in visited:
+                return False  # cycle guard
+            visited.add(cursor)
+            if cursor == target_turn_id:
+                return True
+            t = all_turns.get(cursor)
+            if t is None:
+                return False
+            cursor = t.get("parent_id")
+            depth += 1
+        return False
+
+    def _handle_append_turn(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply one ``append_turn`` intent (PLAN-S4.1 §3.A).
+
+        Appends an immutable turn record to
+        ``metadata.rts.zone.agents.<agent_id>.turns[]``.  Validators
+        (raise ``ValueError`` -> K42):
+
+        * ``id`` (str, non-empty) — the turn id.
+        * ``agent_id`` (str, non-empty) — the author.
+        * ``role`` (str) — must be in :attr:`_TURN_ROLES`.
+        * ``parent_id`` (str|None) — if non-null, MUST resolve to an
+          existing turn in any agent's ``turns[]`` chain.
+        * ``id`` MUST be unique zone-wide (no other agent's chain
+          carries it).
+
+        Returns ``{"ok": True, "turn_id": ..., "agent_id": ...}``.
+        """
+        # ``turn_id`` accepted as alias for ``id`` (the wire shape uses
+        # ``id`` per concepts/turn.md but PLAN-S4.1 examples in the
+        # supervisor migration use both).
+        turn_id = params.get("id")
+        if not isinstance(turn_id, str) or not turn_id:
+            turn_id = params.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("append_turn: id (or turn_id) is required")
+        agent_id = params.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("append_turn: agent_id is required")
+        role = params.get("role")
+        if not isinstance(role, str) or role not in self._TURN_ROLES:
+            raise ValueError(
+                f"append_turn: role must be one of {sorted(self._TURN_ROLES)} "
+                f"(got {role!r})"
+            )
+        parent_id = params.get("parent_id")
+        if parent_id is not None and not isinstance(parent_id, str):
+            raise ValueError(
+                "append_turn: parent_id must be a string or null"
+            )
+        body = params.get("body")
+        if body is None:
+            body = params.get("content", "")
+        if not isinstance(body, str):
+            raise ValueError("append_turn: body must be a string")
+
+        with self._lock:
+            existing_ids = self._all_persisted_turn_ids()
+            if turn_id in existing_ids:
+                raise ValueError(
+                    f"append_turn: duplicate turn id {turn_id!r} "
+                    "already in zone"
+                )
+            if parent_id is not None and parent_id not in existing_ids:
+                raise ValueError(
+                    f"append_turn: unknown parent_id {parent_id!r} "
+                    "(not in any agent's persisted turns[])"
+                )
+            agents = self._zone_agents()
+            agent_state = agents.setdefault(agent_id, {
+                "turns": [],
+                "session": {},
+            })
+            turns_list = agent_state.setdefault("turns", [])
+            record: Dict[str, Any] = {
+                "id": turn_id,
+                "parent_id": parent_id,
+                "agent_id": agent_id,
+                "claude_session_id": params.get("claude_session_id"),
+                "role": role,
+                "body": body,
+                "spans": list(params.get("spans") or []),
+                "cell_id": params.get("cell_id"),
+                "created_at": params.get("created_at") or _utc_now_iso(),
+            }
+            if "provider" in params:
+                record["provider"] = params["provider"]
+            else:
+                record["provider"] = "claude-code"
+            turns_list.append(record)
+            self._dirty = True
+        return {"ok": True, "turn_id": turn_id, "agent_id": agent_id}
+
+    def _handle_fork_agent(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply one ``fork_agent`` intent (PLAN-S4.1 §3.A).
+
+        Creates ``metadata.rts.zone.agents.<new_agent_id>`` with
+        ``head_turn_id = at_turn_id`` and a fresh session.  Validators
+        (raise ``ValueError`` -> K42):
+
+        * ``source_agent_id`` (str, non-empty) — MUST already exist in
+          ``zone.agents`` (or the source has zero persisted turns yet —
+          in that case ``at_turn_id`` MUST also be null).
+        * ``new_agent_id`` (str, non-empty) — MUST NOT already exist.
+        * ``at_turn_id`` (str|None) — if non-null, MUST be in the source
+          agent's ancestry.
+        * ``case`` (``"A"`` or ``"B"``) — informational; not validated.
+        * ``claude_session_id`` (str) — recorded on the new agent.
+        """
+        source_agent_id = params.get("source_agent_id")
+        if not isinstance(source_agent_id, str) or not source_agent_id:
+            raise ValueError("fork_agent: source_agent_id is required")
+        new_agent_id = params.get("new_agent_id")
+        if not isinstance(new_agent_id, str) or not new_agent_id:
+            raise ValueError("fork_agent: new_agent_id is required")
+        at_turn_id = params.get("at_turn_id")
+        if at_turn_id is not None and not isinstance(at_turn_id, str):
+            raise ValueError(
+                "fork_agent: at_turn_id must be a string or null"
+            )
+        new_session_id = params.get("claude_session_id")
+        # case is informational; we accept it without strict checking
+        # (the supervisor sets it; the writer trusts).
+        case = params.get("case")
+
+        with self._lock:
+            agents = self._zone_agents()
+            if new_agent_id in agents:
+                raise ValueError(
+                    f"fork_agent: new_agent_id {new_agent_id!r} already "
+                    "exists in zone.agents"
+                )
+            # Source-existence check is permissive: if the source agent
+            # has not yet been persisted (e.g., the very first fork in a
+            # zone with no prior append_turn calls) AND at_turn_id is
+            # null, we accept the fork as bootstrapping the agent map.
+            source_present = source_agent_id in agents
+            if not source_present and at_turn_id is not None:
+                raise ValueError(
+                    f"fork_agent: source_agent_id {source_agent_id!r} not "
+                    "found in zone.agents (cannot fork at a non-null turn "
+                    "from an absent source)"
+                )
+            if at_turn_id is not None and source_present:
+                if not self._turn_in_agent_ancestry(
+                    source_agent_id, at_turn_id,
+                ):
+                    raise ValueError(
+                        f"fork_agent: at_turn_id {at_turn_id!r} is not in "
+                        f"agent {source_agent_id!r}'s ancestry"
+                    )
+            agents[new_agent_id] = {
+                "turns": [],
+                "session": {
+                    "head_turn_id": at_turn_id,
+                    "last_seen_turn_id": at_turn_id,
+                    "claude_session_id": new_session_id,
+                    "runtime_status": "idle",
+                },
+            }
+            if case is not None:
+                agents[new_agent_id]["session"]["fork_case"] = case
+            self._dirty = True
+        return {
+            "ok": True,
+            "new_agent_id": new_agent_id,
+            "source_agent_id": source_agent_id,
+            "at_turn_id": at_turn_id,
+        }
+
+    def _handle_move_agent_head(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply one ``move_agent_head`` intent (PLAN-S4.1 §3.A).
+
+        Sets ``agents.<agent_id>.session.head_turn_id`` and
+        ``last_seen_turn_id`` to the new value.  Validators (raise
+        ``ValueError`` -> K42):
+
+        * ``agent_id`` (str, non-empty) — MUST exist in zone.agents.
+        * ``head_turn_id`` (str) — MUST be in the agent's ancestry.
+        * ``last_seen_turn_id`` (str, optional) — defaults to
+          ``head_turn_id``.
+        """
+        agent_id = params.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("move_agent_head: agent_id is required")
+        head_turn_id = params.get("head_turn_id")
+        if not isinstance(head_turn_id, str) or not head_turn_id:
+            raise ValueError("move_agent_head: head_turn_id is required")
+        last_seen = params.get("last_seen_turn_id", head_turn_id)
+        if not isinstance(last_seen, str) or not last_seen:
+            raise ValueError(
+                "move_agent_head: last_seen_turn_id must be a non-empty "
+                "string when provided"
+            )
+
+        with self._lock:
+            agents = self._zone_agents()
+            agent_state = agents.get(agent_id)
+            if not isinstance(agent_state, dict):
+                raise ValueError(
+                    f"move_agent_head: agent {agent_id!r} not found in "
+                    "zone.agents"
+                )
+            if not self._turn_in_agent_ancestry(agent_id, head_turn_id):
+                raise ValueError(
+                    f"move_agent_head: head_turn_id {head_turn_id!r} is "
+                    f"not in agent {agent_id!r}'s ancestry"
+                )
+            session = agent_state.setdefault("session", {})
+            session["head_turn_id"] = head_turn_id
+            session["last_seen_turn_id"] = last_seen
+            self._dirty = True
+        return {
+            "ok": True,
+            "agent_id": agent_id,
+            "head_turn_id": head_turn_id,
+            "last_seen_turn_id": last_seen,
+        }
+
+    def _handle_record_event(self, params: Dict[str, Any]) -> bool:
+        """Apply one ``record_event`` intent (PLAN-S4.1 §3.B).
+
+        Dispatches on ``parameters.kind``:
+
+        * ``kind == "agent_ref_move"``: append a structured entry to
+          ``metadata.rts.event_log[]`` per
+          [protocols/family-d-event-log](docs/atoms/protocols/family-d-event-log.md).
+          Required parameters: ``reason``, ``agent_id``, ``from_turn_id``,
+          ``to_turn_id``.  ``reason`` MUST be in
+          :attr:`_AGENT_REF_MOVE_REASONS`.
+        * Otherwise: legacy drift-event path.  ``field_path`` required;
+          routes through :meth:`append_drift_event` for backward
+          compatibility (the original V1 shape).
+        """
+        kind = params.get("kind")
+        if kind == "agent_ref_move":
+            reason = params.get("reason")
+            if not isinstance(reason, str) or reason not in self._AGENT_REF_MOVE_REASONS:
+                raise ValueError(
+                    f"record_event[agent_ref_move]: reason must be one of "
+                    f"{sorted(self._AGENT_REF_MOVE_REASONS)} (got {reason!r})"
+                )
+            agent_id = params.get("agent_id")
+            if not isinstance(agent_id, str) or not agent_id:
+                raise ValueError(
+                    "record_event[agent_ref_move]: agent_id is required"
+                )
+            entry = {
+                "kind": "agent_ref_move",
+                "reason": reason,
+                "agent_id": agent_id,
+                "from_turn_id": params.get("from_turn_id"),
+                "to_turn_id": params.get("to_turn_id"),
+                "recorded_at": params.get("recorded_at") or _utc_now_iso(),
+            }
+            with self._lock:
+                rts_event_log = self._zone.setdefault("event_log", [])
+                rts_event_log.append(entry)
+                self._dirty = True
+            return True
+        # Legacy drift-event path (backward compat).
+        fp = params.get("field_path")
+        if not isinstance(fp, str) or not fp:
+            raise ValueError(
+                "record_event: either kind='agent_ref_move' or "
+                "field_path (legacy drift) is required"
+            )
+        self.append_drift_event(
+            field_path=fp,
+            previous_value=params.get("previous_value"),
+            current_value=params.get("current_value"),
+            severity=str(params.get("severity", "info")),
+            detected_at=params.get("detected_at"),
+        )
+        return True
 
     # -- BSP-005 §6.1 / S0.5 cell-kinds -----------------------------
 
