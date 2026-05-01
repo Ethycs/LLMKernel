@@ -100,6 +100,15 @@ class SocketWriter:
         # the writer's config field), the sanitizer no-ops — fully
         # backwards-compatible with pre-S5.0.1 callers.
         self._hash_mode_provider: Optional[Callable[[], bool]] = None
+        # PLAN-S5.0.1 §3.3 / S5.0.1b — K36 event hook. When the
+        # sanitizer escapes at least one hashed-magic line in an
+        # outbound frame it invokes this callable (if wired) so the
+        # caller (kernel, agent_supervisor) can emit K36 and set
+        # contaminated on the receiving cell. Signature:
+        #   _k36_handler(original_record, sanitized_record) -> None
+        # Both records are passed so the caller can extract cell_id
+        # or agent_id from envelope fields.
+        self._k36_handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None
 
     # -- Connection lifecycle ---------------------------------------
 
@@ -180,6 +189,24 @@ class SocketWriter:
         """
         self._hash_mode_provider = provider
 
+    def set_k36_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]],
+    ) -> None:
+        """Wire the K36 event callback for hashed-magic escape events.
+
+        PLAN-S5.0.1 §3.3 / S5.0.1b — when the sanitizer escapes a
+        hashed-magic line in an outbound frame, it invokes this
+        callable with ``(original_record, sanitized_record)`` so the
+        kernel can emit K36 and flag contamination on the receiving
+        cell. Set to ``None`` to disable (test isolation / pre-wiring
+        startup window).
+
+        The handler is invoked OUTSIDE the write lock to avoid
+        deadlock in cases where the handler itself emits a frame.
+        """
+        self._k36_handler = handler
+
     def _hash_mode_enabled(self) -> bool:
         """Best-effort hash-mode lookup. Defaults False on any error."""
         provider = self._hash_mode_provider
@@ -207,7 +234,19 @@ class SocketWriter:
         path.
         """
         if self._hash_mode_enabled():
+            original = record
             record = sanitize_outbound_record(record)
+            # S5.0.1b — emit K36 when the sanitizer actually rewrote
+            # the record (i.e. a hashed-magic line was escaped).
+            if record is not original:
+                handler = self._k36_handler
+                if handler is not None:
+                    try:
+                        handler(original, record)
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception(
+                            "SocketWriter.write_frame: K36 handler raised"
+                        )
         # Encode first so a producer-side ``TypeError`` doesn't leave
         # the socket holding a partial frame. The encode itself is
         # CPU-bound and lock-free.
