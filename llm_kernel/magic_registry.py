@@ -321,9 +321,10 @@ LINE_MAGICS: Dict[str, LineMagicHandler] = {
     # routing layer ships an operator.action envelope {action_type:
     # "agent_revert", parameters: {agent_id, target_turn_id, cell_id}}.
     "revert": LineMagicHandler(name="revert"),
-    "stop": LineMagicHandler(
-        name="stop", status="stub", pending_slice="S5",
-    ),
+    # S5c — @stop active: apply records to cell.line_magics; the kernel
+    # routing layer ships an operator.action envelope {action_type:
+    # "agent_stop", parameters: {agent_id, cell_id}}.
+    "stop": LineMagicHandler(name="stop"),
     "branch": LineMagicHandler(
         name="branch", status="stub", pending_slice="S5",
     ),

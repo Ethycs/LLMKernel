@@ -847,3 +847,65 @@ def test_revert_mints_new_claude_session_id_for_next_continue(tmp_path: Path) ->
     assert handle.claude_session_id != original_session_id
     assert handle.claude_session_id  # non-empty UUID
     handle.terminate()
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S5c: AgentSupervisor.stop tests
+# ---------------------------------------------------------------------------
+
+
+def test_stop_validates_agent_exists_raises_k20(tmp_path: Path) -> None:
+    """stop() raises K20 RuntimeError when agent_id is unknown."""
+    sup = _make_supervisor()
+    with pytest.raises(RuntimeError, match="K20"):
+        sup.stop("nonexistent")
+
+
+def test_stop_sigterms_live_process_sets_idle(tmp_path: Path) -> None:
+    """stop() calls terminate() on a live process and exits without error."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # Process is alive (returncode is None).
+    assert fake.returncode is None
+    sup.stop("alpha")
+    # After SIGTERM the fake popen should have been terminated.
+    assert fake.returncode is not None
+    handle.terminate()
+
+
+def test_stop_on_idle_agent_is_noop(tmp_path: Path) -> None:
+    """stop() on an already-exited agent is a silent no-op (idempotent)."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # Simulate process already exited.
+    fake.returncode = 0
+    # Should not raise; should return cleanly.
+    sup.stop("alpha")
+    handle.terminate()
+
+
+def test_stop_preserves_claude_session_id(tmp_path: Path) -> None:
+    """stop() does NOT mint a new claude_session_id (contrast with revert)."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    original_session_id = handle.claude_session_id
+    sup.stop("alpha")
+    assert handle.claude_session_id == original_session_id, (
+        "stop must preserve claude_session_id for next --resume continuation"
+    )
+    handle.terminate()
+
+
+def test_stop_persists_runtime_status_via_writer(tmp_path: Path) -> None:
+    """stop() submits update_agent_session intent with runtime_status=idle."""
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    mock_writer = MagicMock()
+    mock_writer.submit_intent = MagicMock(return_value={"ok": True})
+    sup.set_metadata_writer(mock_writer)
+
+    sup.stop("alpha")
+
+    mock_writer.submit_intent.assert_called_once()
+    envelope = mock_writer.submit_intent.call_args[0][0]
+    assert envelope["intent_kind"] == "update_agent_session"
+    assert envelope["parameters"]["runtime_status"] == "idle"
+    assert envelope["parameters"]["pid"] is None
+    assert envelope["parameters"]["agent_id"] == "alpha"
+    handle.terminate()

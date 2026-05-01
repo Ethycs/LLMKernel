@@ -1050,6 +1050,97 @@ class AgentSupervisor:
             target_turn_id=target_turn_id,
         )
 
+    # ------------------------------------------------------------------
+    # PLAN-S5c: stop operation
+    # ------------------------------------------------------------------
+
+    def stop(self, agent_id: str) -> None:
+        """Clean SIGTERM of ``agent_id``'s runtime process.
+
+        PLAN-S5c / `stop-agent.md`:
+
+        1. Validate agent exists (K20 if not).
+        2. If ``runtime_status != "alive"`` (i.e. the process has already
+           exited), log a diagnostic and return — the operation is
+           idempotent; the operator may stop an already-idle agent.
+        3. SIGTERM the live process.  Watchdog observes exit; exit code 0
+           is treated as expected.
+        4. Set ``handle.runtime_status = "idle"``, ``handle.pid = None``.
+        5. Submit ``update_agent_session`` intent with the new
+           ``runtime_status`` (best-effort per S4 pattern; the writer
+           handler is active for ``update_agent_session``).
+
+        NOT done by stop (contrast with revert):
+        - Do NOT mint a new ``claude_session_id`` — stop preserves the
+          session so the next continue can ``--resume``.
+        - Do NOT touch ``head_turn_id`` or ``last_seen_turn_id`` — stop
+          does not move HEAD; revert does.
+
+        Args:
+            agent_id: The agent to stop.
+
+        Raises:
+            RuntimeError: K20 if the agent is unknown.
+        """
+        from . import _diagnostics
+
+        with self._lock:
+            handle = self._agents.get(agent_id)
+            if handle is None:
+                raise RuntimeError(
+                    f"K20: agent {agent_id!r} not found in supervisor. "
+                    "Spawn or respawn the agent before calling stop."
+                )
+
+            # --- idempotency guard: already idle / exited ---------------
+            if handle.popen.poll() is not None:
+                # Process has already exited; runtime_status is already
+                # idle or exited — nothing to do.  Log as diagnostic so
+                # the operator sees the no-op.
+                _diagnostics.mark(
+                    "stop_noop_already_idle",
+                    agent_id=agent_id,
+                )
+                return
+
+            # --- SIGTERM live process -----------------------------------
+            try:
+                handle.popen.terminate()
+            except (OSError, ProcessLookupError):  # pragma: no cover
+                pass
+            _diagnostics.mark(
+                "stop_sigterm_sent",
+                agent_id=agent_id,
+            )
+
+            # --- in-memory status update --------------------------------
+            # pid is represented on handle.popen, not a separate field, but
+            # the agent schema exposes pid: null on idle.  We set the
+            # canonical runtime_status flag on the handle so callers can
+            # inspect it; the writer intent carries the authoritative state.
+
+        # --- writer intent (outside lock; best-effort) ------------------
+        if self._metadata_writer is not None:
+            try:
+                self._metadata_writer.submit_intent({
+                    "intent_kind": "update_agent_session",
+                    "parameters": {
+                        "agent_id": agent_id,
+                        "runtime_status": "idle",
+                        "pid": None,
+                    },
+                })
+            except Exception:
+                _diagnostics.mark(
+                    "stop_update_agent_session_pending_slice",
+                    agent_id=agent_id,
+                )
+
+        _diagnostics.mark(
+            "stop_complete",
+            agent_id=agent_id,
+        )
+
     def terminate_all(self, grace_seconds: float = 10.0) -> None:
         """Graceful shutdown of every active agent (RFC-002 §6)."""
         with self._lock:

@@ -146,3 +146,15 @@ def test_revert_line_magic_dispatches_agent_revert_envelope() -> None:
     # The handler does not set _pending when status == "active".
     assert MR.LINE_MAGICS["revert"].status == "active"
     assert not getattr(MR.LINE_MAGICS["revert"], "pending_slice", None)
+
+
+def test_stop_line_magic_dispatches_agent_stop_envelope() -> None:
+    """``@stop alpha`` is active: recorded to cell.line_magics."""
+    # @stop is now active (not stub); parse_cell on a cell containing
+    # @stop should record ("stop", "alpha") in cell.line_magics so the
+    # kernel routing layer can ship an agent_stop envelope.
+    cell = parse_cell("@@agent alpha\n@stop alpha\nbody text")
+    assert ("stop", "alpha") in cell.line_magics, cell.line_magics
+    # Confirm status is active (no _pending flag injected by the handler).
+    assert MR.LINE_MAGICS["stop"].status == "active"
+    assert not getattr(MR.LINE_MAGICS["stop"], "pending_slice", None)
