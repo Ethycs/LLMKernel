@@ -739,10 +739,14 @@ class AgentSupervisor:
         if self._metadata_writer is not None and head_turn_id is not None:
             try:
                 self._metadata_writer.submit_intent({
-                    "intent_kind": "update_agent_session",
-                    "parameters": {
-                        "agent_id": agent_id,
-                        "last_seen_turn_id": head_turn_id,
+                    "payload": {
+                        "action_type": "zone_mutate",
+                        "intent_kind": "update_agent_session",
+                        "parameters": {
+                            "agent_id": agent_id,
+                            "last_seen_turn_id": head_turn_id,
+                        },
+                        "intent_id": f"sut-uas-{agent_id}-{uuid.uuid4().hex[:8]}",
                     },
                 })
             except Exception:  # pragma: no cover — writer errors are best-effort
@@ -1164,16 +1168,20 @@ class AgentSupervisor:
         if self._metadata_writer is not None:
             try:
                 self._metadata_writer.submit_intent({
-                    "intent_kind": "update_agent_session",
-                    "parameters": {
-                        "agent_id": agent_id,
-                        "runtime_status": "idle",
-                        "pid": None,
+                    "payload": {
+                        "action_type": "zone_mutate",
+                        "intent_kind": "update_agent_session",
+                        "parameters": {
+                            "agent_id": agent_id,
+                            "runtime_status": "idle",
+                            "pid": None,
+                        },
+                        "intent_id": f"stop-uas-{agent_id}-{uuid.uuid4().hex[:8]}",
                     },
                 })
-            except Exception:
+            except Exception:  # pragma: no cover — best-effort; writer errors are non-fatal
                 _diagnostics.mark(
-                    "stop_update_agent_session_pending_slice",
+                    "stop_update_agent_session_failed",
                     agent_id=agent_id,
                 )
 

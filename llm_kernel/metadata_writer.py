@@ -1099,6 +1099,9 @@ class MetadataWriter:
                 # version themselves.  We bump here so each successful
                 # apply produces a fresh snapshot id.
                 "append_turn", "fork_agent", "move_agent_head",
+                # PLAN-S4.2: update_agent_session bumps version so
+                # runtime_status / pid changes produce a fresh snapshot.
+                "update_agent_session",
             }:
                 self._snapshot_version += 1
             new_version = self._snapshot_version
@@ -1178,6 +1181,8 @@ class MetadataWriter:
             return self._handle_fork_agent
         if intent_kind == "move_agent_head":
             return self._handle_move_agent_head
+        if intent_kind == "update_agent_session":
+            return self._handle_update_agent_session
         if intent_kind == "add_blob":
             def _h(params: Dict[str, Any]) -> bool:
                 key = params.get("key")
@@ -1207,7 +1212,7 @@ class MetadataWriter:
             # PLAN-S4.1: ``append_turn``, ``fork_agent``, ``move_agent_head``
             # active above; ``record_event`` reshaped above.
             "create_agent":             "BSP-002 turn graph slice",
-            "update_agent_session":     "BSP-002 turn graph slice",
+            # PLAN-S4.2: ``update_agent_session`` active above.
             "add_overlay":              "BSP-002 turn graph slice",
             "move_overlay_ref":         "BSP-002 turn graph slice",
             "update_ordering":          "BSP-002 turn graph slice",
@@ -1555,6 +1560,90 @@ class MetadataWriter:
             "agent_id": agent_id,
             "head_turn_id": head_turn_id,
             "last_seen_turn_id": last_seen,
+        }
+
+    # -- PLAN-S4.2 update_agent_session handler ----------------------
+
+    #: Fields that ``update_agent_session`` is permitted to patch.
+    #: All are optional; the handler applies only those that are non-None
+    #: in ``params`` (partial-update semantics).
+    _SESSION_MUTABLE_FIELDS: FrozenSet[str] = frozenset({  # type: ignore[name-defined]
+        "head_turn_id",
+        "last_seen_turn_id",
+        "runtime_status",
+        "pid",
+        "claude_session_id",
+    })
+
+    def _handle_update_agent_session(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply one ``update_agent_session`` intent (PLAN-S4.2).
+
+        Updates one or more session fields on
+        ``metadata.rts.zone.agents.<agent_id>.session``.  Uses partial-
+        update semantics: only fields present and non-``None`` in
+        ``params`` are written (except ``pid`` which accepts ``None``
+        explicitly to clear it).
+
+        Validators (raise ``ValueError`` -> K42):
+
+        * ``agent_id`` (str, non-empty) — MUST exist in ``zone.agents``;
+          raises K20 if absent.
+        * ``runtime_status`` (str, optional) — when present, MUST be one
+          of ``{"idle", "alive", "exited", "terminated"}``.
+
+        Returns ``{"ok": True, "agent_id": ..., "updated": [...]}``.
+        """
+        agent_id = params.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("update_agent_session: agent_id is required")
+
+        runtime_status = params.get("runtime_status")
+        if runtime_status is not None:
+            _VALID_RUNTIME_STATUSES = frozenset(
+                {"idle", "alive", "exited", "terminated"}
+            )
+            if runtime_status not in _VALID_RUNTIME_STATUSES:
+                raise ValueError(
+                    f"update_agent_session: runtime_status must be one of "
+                    f"{sorted(_VALID_RUNTIME_STATUSES)} (got {runtime_status!r})"
+                )
+
+        with self._lock:
+            agents = self._zone_agents()
+            agent_state = agents.get(agent_id)
+            if not isinstance(agent_state, dict):
+                raise ValueError(
+                    f"K20: update_agent_session: agent {agent_id!r} not "
+                    "found in zone.agents"
+                )
+            session = agent_state.setdefault("session", {})
+            updated: List[str] = []
+
+            # Apply each non-None field (pid is special: None is a valid
+            # value meaning "clear the pid").
+            for field in (
+                "head_turn_id",
+                "last_seen_turn_id",
+                "runtime_status",
+                "claude_session_id",
+            ):
+                if field in params and params[field] is not None:
+                    session[field] = params[field]
+                    updated.append(field)
+
+            # pid explicitly accepts None (idle agent has pid=None).
+            if "pid" in params:
+                session["pid"] = params["pid"]
+                updated.append("pid")
+
+            self._dirty = True
+
+        return {
+            "ok": True,
+            "agent_id": agent_id,
+            "updated": updated,
         }
 
     def _handle_record_event(self, params: Dict[str, Any]) -> bool:

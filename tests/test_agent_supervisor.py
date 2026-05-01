@@ -997,10 +997,32 @@ def test_stop_persists_runtime_status_via_writer(tmp_path: Path) -> None:
 
     mock_writer.submit_intent.assert_called_once()
     envelope = mock_writer.submit_intent.call_args[0][0]
-    assert envelope["intent_kind"] == "update_agent_session"
-    assert envelope["parameters"]["runtime_status"] == "idle"
-    assert envelope["parameters"]["pid"] is None
-    assert envelope["parameters"]["agent_id"] == "alpha"
+    inner = envelope.get("payload", envelope)
+    assert inner["intent_kind"] == "update_agent_session"
+    assert inner["parameters"]["runtime_status"] == "idle"
+    assert inner["parameters"]["pid"] is None
+    assert inner["parameters"]["agent_id"] == "alpha"
+    handle.terminate()
+
+
+def test_stop_runtime_status_persists_in_metadata_rts(tmp_path: Path) -> None:
+    """End-to-end: after @stop alpha, metadata.rts.zone.agents.alpha.session.runtime_status == 'idle'.
+
+    PLAN-S4.2: the update_agent_session writer handler is now active, so
+    stop() no longer produces a no-op pending-slice; the status change
+    persists into the snapshot.
+    """
+    sup, handle, fake = _make_supervisor_with_alpha(tmp_path)
+    # Seed a turn so zone.agents.alpha exists in the writer's in-memory graph.
+    _seed_turn(sup, "t_s1", "alpha", "assistant", "seed", parent_id=None)
+
+    sup.stop("alpha")
+
+    snap = sup._metadata_writer.snapshot()
+    session = snap["zone"]["agents"]["alpha"]["session"]
+    assert session.get("runtime_status") == "idle", (
+        f"Expected runtime_status='idle' after @stop, got: {session}"
+    )
     handle.terminate()
 
 

@@ -544,3 +544,93 @@ def test_record_event_legacy_drift_path_preserved() -> None:
     drift = snap["drift_log"]
     assert len(drift) == 1
     assert drift[0]["field_path"] == "config.kernel.example"
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S4.2: update_agent_session handler tests
+# ---------------------------------------------------------------------------
+
+
+def _make_writer_with_agent(agent_id: str = "alpha") -> MetadataWriter:
+    """Return a MetadataWriter with one agent already seeded via append_turn."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    writer.submit_intent(_envelope("append_turn", {
+        "id": "t_seed", "agent_id": agent_id, "role": "agent",
+        "body": "seed turn", "parent_id": None,
+    }))
+    return writer
+
+
+def test_update_agent_session_sets_runtime_status() -> None:
+    """Partial update with just runtime_status persists on the session."""
+    writer = _make_writer_with_agent("alpha")
+    result = writer.submit_intent(_envelope("update_agent_session", {
+        "agent_id": "alpha",
+        "runtime_status": "idle",
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    sess = snap["zone"]["agents"]["alpha"]["session"]
+    assert sess["runtime_status"] == "idle"
+    assert "runtime_status" in result["response"]["updated"]
+
+
+def test_update_agent_session_validates_agent_id_k20() -> None:
+    """update_agent_session rejects unknown agent_id with K42 (embeds K20 msg)."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    result = writer.submit_intent(_envelope("update_agent_session", {
+        "agent_id": "nonexistent",
+        "runtime_status": "idle",
+    }))
+    assert result["applied"] is False
+    assert result["error_code"] == "K42"
+    assert "K20" in (result["error_reason"] or "")
+
+
+def test_update_agent_session_sets_multiple_fields_atomically() -> None:
+    """All five session fields are applied in one intent."""
+    writer = _make_writer_with_agent("alpha")
+    result = writer.submit_intent(_envelope("update_agent_session", {
+        "agent_id": "alpha",
+        "head_turn_id": "t_seed",
+        "last_seen_turn_id": "t_seed",
+        "runtime_status": "idle",
+        "pid": None,
+        "claude_session_id": "sess-new-1",
+    }))
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    sess = snap["zone"]["agents"]["alpha"]["session"]
+    assert sess["head_turn_id"] == "t_seed"
+    assert sess["last_seen_turn_id"] == "t_seed"
+    assert sess["runtime_status"] == "idle"
+    assert sess["pid"] is None
+    assert sess["claude_session_id"] == "sess-new-1"
+    updated = result["response"]["updated"]
+    assert set(updated) == {"head_turn_id", "last_seen_turn_id",
+                            "runtime_status", "pid", "claude_session_id"}
+
+
+def test_update_agent_session_round_trips_via_writer() -> None:
+    """Writer accepts the exact payload-wrapped shape supervisor sends for @stop."""
+    writer = _make_writer_with_agent("alpha")
+    # Exact envelope shape emitted by agent_supervisor.stop() after S4.2 fix.
+    import uuid as _uuid
+    envelope = {
+        "payload": {
+            "action_type": "zone_mutate",
+            "intent_kind": "update_agent_session",
+            "parameters": {
+                "agent_id": "alpha",
+                "runtime_status": "idle",
+                "pid": None,
+            },
+            "intent_id": f"stop-uas-alpha-{_uuid.uuid4().hex[:8]}",
+        },
+    }
+    result = writer.submit_intent(envelope)
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    sess = snap["zone"]["agents"]["alpha"]["session"]
+    assert sess["runtime_status"] == "idle"
+    assert sess.get("pid") is None
