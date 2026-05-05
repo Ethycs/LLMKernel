@@ -104,7 +104,7 @@ extend-exclude = '''
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["win-64"]
+platforms = ["win-64", "linux-64", "osx-arm64"]
 
 [tool.pixi.pypi-dependencies]
 llm-kernel = { path = ".", editable = true }
@@ -192,16 +192,19 @@ lab = "jupyter lab"
 test = "pytest tests/ -v"
 test-simple = "pytest test_kernel.py -v"
 test-markers = "pytest --markers"
-setup-test-env = "cp tests/.env.test .env.test && echo 'Test environment configured!'"
-clean-test = "rm -rf .pytest_cache htmlcov .coverage* report.html && echo 'Test artifacts cleaned!'"
+setup-test-env = "python -c \"import shutil; shutil.copy('tests/.env.test', '.env.test'); print('Test environment configured!')\""
+clean-test = "python -c \"import shutil, glob, os; [shutil.rmtree(p, ignore_errors=True) for p in ['.pytest_cache', 'htmlcov']]; [os.remove(f) for f in glob.glob('.coverage*') + glob.glob('report.html') if os.path.exists(f)]; print('Test artifacts cleaned!')\""
 
-# Extension development tasks
-ext-install = { cmd = "npm install", cwd = "vscode-llm-kernel-extension" }
-ext-compile = { cmd = "npm run compile", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-install"] }
-ext-watch = { cmd = "npm run watch", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-install"] }
-ext-lint = { cmd = "npm run lint", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-install"] }
-ext-test = { cmd = "npm test", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-compile"] }
-ext-package = { cmd = "npm run package", cwd = "vscode-llm-kernel-extension", depends-on = ["ext-compile"] }
+# Extension development tasks — point at the V1.5 driver extension at the outer
+# repo root (../../extension), per PLAN-S5.0.3 driver-extraction. The legacy
+# vendor/LLMKernel/vscode-llm-kernel-extension/ directory predates that slice
+# and is no longer the active surface.
+ext-install = { cmd = "npm install", cwd = "../../extension" }
+ext-compile = { cmd = "npm run compile", cwd = "../../extension", depends-on = ["ext-install"] }
+ext-watch = { cmd = "npm run watch", cwd = "../../extension", depends-on = ["ext-install"] }
+ext-lint = { cmd = "npm run lint", cwd = "../../extension", depends-on = ["ext-install"] }
+ext-test = { cmd = "npm test", cwd = "../../extension", depends-on = ["ext-compile"] }
+ext-package = { cmd = "npm run package", cwd = "../../extension", depends-on = ["ext-compile"] }
 dev-setup = { cmd = "echo 'Development environment ready!'", depends-on = ["install-editable", "ext-install"] }
 
 [tool.pixi.feature.notebook.tasks]
