@@ -264,7 +264,8 @@ import pytest
         ("create_overlay_ref",       "BSP-007 overlay_applier"),
         # ``record_context_manifest`` shipped in K-AS-A (S3.5) -- now has
         # a real handler; covered by ``test_context_packer.py``.
-        ("record_run_frame",         "BSP-008 context_packer"),
+        # ``record_run_frame`` shipped in K-CTXR (S6) -- now has a real
+        # handler; covered by ``test_run_frame_handler.py``.
     ],
 )
 def test_submit_intent_amendment_kinds_registered_but_unimplemented(

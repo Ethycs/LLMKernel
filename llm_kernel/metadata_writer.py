@@ -1307,6 +1307,8 @@ class MetadataWriter:
             return self._handle_set_cell_metadata
         if intent_kind == "record_context_manifest":
             return self._handle_record_context_manifest
+        if intent_kind == "record_run_frame":
+            return self._handle_record_run_frame
 
         # Registered-but-not-yet-implemented kinds: the registry
         # accepts the envelope so callers see K42 ("not yet implemented")
@@ -1326,10 +1328,9 @@ class MetadataWriter:
             "apply_overlay_commit":     "BSP-007 overlay_applier (K-OVERLAY slice)",
             "revert_overlay_to_commit": "BSP-007 overlay_applier (K-OVERLAY slice)",
             "create_overlay_ref":       "BSP-007 overlay_applier (K-OVERLAY slice)",
-            # BSP-008 ContextPacker / RunFrame kinds. ``record_context_manifest``
-            # ships in K-AS-A (S3.5) -- handler routed above. ``record_run_frame``
-            # remains pending until the S6 RunFrame slice lands.
-            "record_run_frame":         "BSP-008 context_packer (K-CTXR slice)",
+            # BSP-008 ContextPacker / RunFrame kinds. Both ``record_context_manifest``
+            # (K-AS-A / S3.5) and ``record_run_frame`` (K-CTXR / S6) ship with
+            # active handlers above; this map is now empty for BSP-008 entries.
         }
         slice_label = _PENDING_SLICE.get(intent_kind, "future slice")
         def _stub(params: Dict[str, Any]) -> bool:
@@ -2608,6 +2609,156 @@ class MetadataWriter:
             "ok": True,
             "manifest_id": manifest_id,
             "cell_id": cell_id,
+        }
+
+    # -- BSP-008 §7 / S6 record_run_frame ---------------------------
+
+    #: BSP-008 §7 RunFrame status enum. ``running`` is permitted as an
+    #: intermediate state per the §8 lifecycle ("a single run produces
+    #: 2+ intents over its lifetime — start with status=running, terminal
+    #: with same run_id and final status"). The §7 schema documents only
+    #: the three terminal values; the AgentSupervisor needs ``running``
+    #: to record the start frame before the run completes.
+    #: FLAGGED: the spec atom (concepts/run-frame.md) lists only the
+    #: three terminals; we accept ``running`` as a permitted intermediate
+    #: state because the §8 lifecycle paragraph requires it.
+    _RUN_FRAME_STATUSES: FrozenSet[str] = frozenset({  # type: ignore[name-defined]
+        "running", "complete", "failed", "interrupted",
+    })
+
+    def _handle_record_run_frame(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist one RunFrame under ``metadata.rts.zone.run_frames``.
+
+        Per BSP-008 §7 / [concepts/run-frame](docs/atoms/concepts/run-frame.md):
+        the ``record_run_frame`` intent carries a fully-formed RunFrame
+        dict. The AgentSupervisor submits TWO intents per run:
+
+        1. A start frame at run dispatch (``status: "running"``,
+           ``ended_at: null``).
+        2. A terminal frame at run completion (``status: "complete" |
+           "failed" | "interrupted"``, ``turn_head_after`` set,
+           ``ended_at`` set). Both frames carry the same ``run_id``;
+           idempotency-on-``run_id`` allows update-in-place per §8.
+
+        Validation surface (raises ``ValueError`` -> K42 / K102):
+
+        * ``params['run_frame']`` MUST be a dict (or ``params`` itself
+          MAY carry the run-frame fields directly per the
+          ``record_context_manifest`` precedent — we accept both).
+        * ``run_id``, ``cell_id``, ``executor_id``,
+          ``context_manifest_id``, ``status``, and ``started_at`` are
+          required non-empty strings.
+        * ``status`` MUST be one of ``running | complete | failed |
+          interrupted`` per BSP-008 §7 + the §8 lifecycle ``running``
+          intermediate.
+        * **K102**: a ``run_id`` that already exists with a DIFFERENT
+          ``cell_id`` is rejected. Same-``cell_id`` resubmission is the
+          terminal-status update path described in the atom invariants.
+
+        Storage key: ``metadata.rts.zone.run_frames[<run_id>]``.
+        RunFrames are append-only across distinct ``run_id`` values per
+        the atom's invariants; the only mutation a RunFrame undergoes is
+        the start->terminal status update (idempotent on ``run_id``).
+        """
+        # Accept both shapes: params={"run_frame": {...}} OR params={...}
+        # (matches the ``record_context_manifest`` handler's accept-both
+        # discipline so the AgentSupervisor builder is symmetric).
+        frame = params.get("run_frame")
+        if not isinstance(frame, dict):
+            frame = params
+        if not isinstance(frame, dict):
+            raise ValueError(
+                "record_run_frame: run_frame must be a dict"
+            )
+        run_id = frame.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError(
+                "record_run_frame: run_id is required"
+            )
+        cell_id = frame.get("cell_id")
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError(
+                "record_run_frame: cell_id is required"
+            )
+        executor_id = frame.get("executor_id")
+        if not isinstance(executor_id, str) or not executor_id:
+            raise ValueError(
+                "record_run_frame: executor_id is required"
+            )
+        context_manifest_id = frame.get("context_manifest_id")
+        if not isinstance(context_manifest_id, str) or not context_manifest_id:
+            raise ValueError(
+                "record_run_frame: context_manifest_id is required"
+            )
+        status = frame.get("status")
+        if not isinstance(status, str) or status not in self._RUN_FRAME_STATUSES:
+            raise ValueError(
+                f"record_run_frame: status must be one of "
+                f"{sorted(self._RUN_FRAME_STATUSES)!r} (got {status!r})"
+            )
+        started_at = frame.get("started_at")
+        if not isinstance(started_at, str) or not started_at:
+            raise ValueError(
+                "record_run_frame: started_at is required"
+            )
+        # ``ended_at`` MAY be present on terminal frames; per §7 it is
+        # null while running. Terminal frames without ``ended_at`` are
+        # accepted (the supervisor may not have populated it server-side
+        # if the wall clock was unavailable) — the writer logs but does
+        # not reject. Per the brief: "treat missing ended_at on terminal
+        # frames as accept + log".
+        ended_at = frame.get("ended_at")
+        if status != "running" and (
+            not isinstance(ended_at, str) or not ended_at
+        ):
+            logger.info(
+                "record_run_frame: terminal status %s without ended_at "
+                "(run_id=%s); accepting without ended_at",
+                status, run_id,
+                extra={
+                    "event.name": "runframe_terminal_missing_ended_at",
+                    "llmnb.run_id": run_id,
+                    "llmnb.runframe_status": status,
+                },
+            )
+
+        record = _deepcopy_json(frame)
+        with self._lock:
+            zone = self._zone.setdefault("run_frames", {})
+            existing = zone.get(run_id)
+            if existing is not None:
+                existing_cell_id = existing.get("cell_id")
+                if existing_cell_id != cell_id:
+                    # K102: idempotency-on-run_id permits same-cell
+                    # update-in-place (terminal status), but a different
+                    # cell_id under the same run_id is a corruption /
+                    # collision. Surface as K42 (intent_validation_failed)
+                    # with the K102 marker per BSP-008 §10.
+                    logger.warning(
+                        "runframe_write_rejected run_id=%s reason=cell_id_mismatch "
+                        "existing_cell=%s submitted_cell=%s",
+                        run_id, existing_cell_id, cell_id,
+                        extra={
+                            "event.name": "runframe_write_rejected",
+                            "llmnb.run_id": run_id,
+                            "llmnb.k_class": "K102",
+                            "llmnb.runframe_reason": "cell_id_mismatch",
+                        },
+                    )
+                    raise ValueError(
+                        f"K102: record_run_frame: run_id {run_id!r} already "
+                        f"exists with cell_id {existing_cell_id!r}; refusing "
+                        f"to rebind to {cell_id!r}"
+                    )
+            zone[run_id] = record
+            self._dirty = True
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "cell_id": cell_id,
+            "status": status,
         }
 
     # -- V1 Kernel Gap Closure G13 -- intent-queue overflow ----------

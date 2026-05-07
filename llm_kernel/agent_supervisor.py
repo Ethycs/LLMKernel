@@ -25,9 +25,11 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
+from . import context_packer
 from ._provisioning import (
     EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION,
     PreSpawnValidationError, build_argv, build_env,
@@ -698,6 +700,38 @@ class AgentSupervisor:
                 f"{exc}"
             ) from exc
 
+        # BSP-008 §9 — ContextPacker + RunFrame wiring (K-CTXR slice).
+        # When the operator passes a ``cell_id``, pack the manifest, submit
+        # ``record_context_manifest``, and submit a start ``record_run_frame``
+        # (status=running). On synchronous send failure we submit a terminal
+        # frame with status=failed; on successful stdin write we submit
+        # a terminal frame with status=complete. A missing ``cell_id`` is
+        # the BSP-008 §12 graceful-degradation path: the run still works,
+        # just produces no Inspect-mode trail.
+        #
+        # FLAGGED: the spec describes the "after completion" terminal frame
+        # as triggered when the agent finishes its reply. send_user_turn
+        # returns immediately after stdin write — the agent's response
+        # streams asynchronously through the stdout reader. For V1 we treat
+        # a successful stdin dispatch as run-complete from the supervisor's
+        # vantage and emit the terminal frame inline. A future slice with a
+        # per-turn completion detector (e.g. observing the agent's
+        # ``stop_reason`` envelope) can resubmit the terminal frame; the
+        # writer is idempotent-on-run_id for same-cell updates.
+        run_id: Optional[str] = None
+        manifest_id: Optional[str] = None
+        if (
+            cell_id is not None
+            and isinstance(cell_id, str)
+            and cell_id
+            and self._metadata_writer is not None
+        ):
+            run_id, manifest_id = self._submit_context_pack_and_start_run_frame(
+                agent_id=agent_id,
+                cell_id=cell_id,
+                turn_head_before=head_turn_id,
+            )
+
         # Write the stream-json user turn. BSP-002 §4.1: claude reads
         # ``{"type":"user","message":{"role":"user","content":<text>}}``
         # from stdin when the process was launched with
@@ -731,6 +765,18 @@ class AgentSupervisor:
                 k_class=K26_CROSS_AGENT_HANDOFF_FAILED if prefix_lines else None,
                 reason="stdin_write_failed" if prefix_lines else None,
             )
+            # BSP-008 §9 — emit terminal RunFrame with status=failed so
+            # Inspect mode records the synchronous failure.
+            if run_id is not None and cell_id is not None and manifest_id is not None:
+                self._submit_terminal_run_frame(
+                    run_id=run_id,
+                    cell_id=cell_id,
+                    executor_id=agent_id,
+                    context_manifest_id=manifest_id,
+                    turn_head_before=head_turn_id,
+                    turn_head_after=head_turn_id,
+                    status="failed",
+                )
             raise
         # PLAN-S4: advance last_seen_turn_id to the notebook head so the
         # next call computes the correct missed-turn delta.
@@ -754,6 +800,27 @@ class AgentSupervisor:
                     "send_user_turn_update_session_intent_failed",
                     agent_id=agent_id,
                 )
+        # BSP-008 §9 — emit terminal RunFrame with status=complete on
+        # successful stdin dispatch. See FLAGGED note above the start
+        # frame for the V1 semantics: "complete" here reflects the
+        # supervisor's vantage (user-turn delivered to the agent), not
+        # the agent's reply lifecycle. The writer is idempotent on
+        # run_id for same-cell updates so a future per-turn completion
+        # detector can re-emit without K102.
+        if run_id is not None and cell_id is not None and manifest_id is not None:
+            # Re-read the head turn id post-write — for V1 ContextPacker
+            # there's no atomic turn-commit yet, so head_turn_after may
+            # equal head_turn_before; the field is still recorded.
+            head_after = self._notebook_head_turn_id()
+            self._submit_terminal_run_frame(
+                run_id=run_id,
+                cell_id=cell_id,
+                executor_id=agent_id,
+                context_manifest_id=manifest_id,
+                turn_head_before=head_turn_id,
+                turn_head_after=head_after,
+                status="complete",
+            )
         _diagnostics.mark(
             "send_user_turn_stdin_written",
             agent_id=agent_id, status=status, cell_id=cell_id,
@@ -765,7 +832,223 @@ class AgentSupervisor:
             "status": status,
             "cell_id": cell_id,
             "handoff_prefix_count": len(prefix_lines),
+            "run_id": run_id,
+            "context_manifest_id": manifest_id,
         }
+
+    # ------------------------------------------------------------------
+    # BSP-008 §9 — ContextPacker + RunFrame integration helpers
+    # ------------------------------------------------------------------
+
+    def _runframe_now_iso(self) -> str:
+        """Return the current UTC timestamp in ISO 8601 with millisecond precision.
+
+        Mirrors ``context_packer._utc_now_iso`` so the start/terminal
+        RunFrame timestamps are byte-aligned with the manifest's
+        ``generated_at`` stamp.
+        """
+        return (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def _build_pack_snapshot(self) -> Dict[str, Any]:
+        """Build the minimal overlay snapshot ContextPacker.pack() needs.
+
+        Per BSP-008 §3 the V1 walker reads ``cells`` (with per-cell
+        ``pinned`` / ``section_id`` / ``sub_turns`` / ``scratch`` /
+        ``excluded`` / ``obsolete`` flags) and ``ordering`` (document
+        order). The K-MW writer carries the cells map at
+        ``self._metadata_writer._cells`` and the layout-derived ordering
+        is not yet wired through; for V1 we read what the writer's full
+        snapshot exposes (``cells`` field) and let ContextPacker fall
+        back to insertion order when ``ordering`` is absent.
+
+        Returns an empty dict when the writer has no cells map (the
+        V1 graceful-degradation path — pack() will raise K100 if
+        cell_id is genuinely orphan; the caller catches and skips).
+        """
+        writer = self._metadata_writer
+        if writer is None:
+            return {}
+        try:
+            snap = writer.snapshot(trigger="save")
+        except Exception:  # pragma: no cover — defensive
+            return {}
+        out: Dict[str, Any] = {}
+        cells = snap.get("cells")
+        if isinstance(cells, dict):
+            out["cells"] = cells
+        ordering = snap.get("ordering")
+        if isinstance(ordering, list):
+            out["ordering"] = ordering
+        return out
+
+    def _submit_context_pack_and_start_run_frame(
+        self,
+        *,
+        agent_id: str,
+        cell_id: str,
+        turn_head_before: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Pack the manifest, persist it, and submit the start RunFrame.
+
+        Per BSP-008 §9 the AgentSupervisor wraps the ContextPacker call
+        in a ``record_context_manifest`` intent and emits a start
+        ``record_run_frame`` (status=running, ended_at=null) before
+        dispatching the user turn.
+
+        All failure modes are caught and logged so a packer / writer
+        error never blocks the operator's run; the operator just sees a
+        degraded Inspect-mode trail. Returns ``(run_id, manifest_id)``
+        on success, ``(None, None)`` on degradation.
+        """
+        from . import _diagnostics
+        writer = self._metadata_writer
+        if writer is None:
+            return None, None
+        snapshot = self._build_pack_snapshot()
+        try:
+            manifest = context_packer.pack(cell_id, snapshot)
+        except context_packer.K100OrphanCellError as exc:
+            _diagnostics.mark(
+                "contextpacker_orphan_cell",
+                agent_id=agent_id, cell_id=cell_id,
+                k_class="K100", reason=str(exc),
+            )
+            return None, None
+        except context_packer.ContextPackerError as exc:
+            _diagnostics.mark(
+                "contextpacker_pack_failed",
+                agent_id=agent_id, cell_id=cell_id, reason=str(exc),
+            )
+            return None, None
+
+        manifest_id = manifest.get("manifest_id")
+        if not isinstance(manifest_id, str) or not manifest_id:
+            _diagnostics.mark(
+                "contextpacker_missing_manifest_id",
+                agent_id=agent_id, cell_id=cell_id,
+            )
+            return None, None
+
+        try:
+            writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
+                    "intent_kind": "record_context_manifest",
+                    "parameters": {"manifest": manifest},
+                    "intent_id": f"sut-rcm-{manifest_id[:12]}",
+                },
+            })
+        except Exception:  # pragma: no cover — writer errors are best-effort
+            _diagnostics.mark(
+                "send_user_turn_record_manifest_failed",
+                agent_id=agent_id, cell_id=cell_id,
+                manifest_id=manifest_id,
+            )
+            return None, None
+
+        run_id = uuid.uuid4().hex
+        started_at = self._runframe_now_iso()
+        try:
+            writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
+                    "intent_kind": "record_run_frame",
+                    "parameters": {
+                        "run_frame": {
+                            "run_id": run_id,
+                            "cell_id": cell_id,
+                            "executor_id": agent_id,
+                            "turn_head_before": turn_head_before,
+                            "turn_head_after": None,
+                            "context_manifest_id": manifest_id,
+                            "status": "running",
+                            "started_at": started_at,
+                            "ended_at": None,
+                        },
+                    },
+                    "intent_id": f"sut-rrf-start-{run_id[:12]}",
+                },
+            })
+        except Exception:  # pragma: no cover — writer errors are best-effort
+            _diagnostics.mark(
+                "send_user_turn_start_run_frame_failed",
+                agent_id=agent_id, cell_id=cell_id, run_id=run_id,
+            )
+            return None, None
+
+        _diagnostics.mark(
+            "send_user_turn_run_frame_started",
+            agent_id=agent_id, cell_id=cell_id, run_id=run_id,
+            manifest_id=manifest_id,
+        )
+        return run_id, manifest_id
+
+    def _submit_terminal_run_frame(
+        self,
+        *,
+        run_id: str,
+        cell_id: str,
+        executor_id: str,
+        context_manifest_id: str,
+        turn_head_before: Optional[str],
+        turn_head_after: Optional[str],
+        status: str,
+    ) -> None:
+        """Submit the terminal RunFrame intent (status=complete|failed|interrupted).
+
+        Per BSP-008 §8 the writer is idempotent on ``run_id`` for
+        same-``cell_id`` resubmissions, so this method may be called
+        more than once across the lifetime of a single run (e.g.,
+        synchronous failure path + future stdout-based completion
+        detector). All failure modes are best-effort: a writer outage
+        produces a ``_diagnostics.mark`` but never blocks the caller.
+        """
+        from . import _diagnostics
+        writer = self._metadata_writer
+        if writer is None:
+            return
+        ended_at = self._runframe_now_iso()
+        try:
+            writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
+                    "intent_kind": "record_run_frame",
+                    "parameters": {
+                        "run_frame": {
+                            "run_id": run_id,
+                            "cell_id": cell_id,
+                            "executor_id": executor_id,
+                            "turn_head_before": turn_head_before,
+                            "turn_head_after": turn_head_after,
+                            "context_manifest_id": context_manifest_id,
+                            "status": status,
+                            # ``started_at`` is required; we don't carry
+                            # it across the call so we re-stamp with the
+                            # terminal time. The persisted record's
+                            # ``started_at`` will reflect the terminal
+                            # submission's stamp — V2 may carry the start
+                            # time forward if precise duration matters.
+                            "started_at": ended_at,
+                            "ended_at": ended_at,
+                        },
+                    },
+                    "intent_id": f"sut-rrf-end-{run_id[:12]}-{status}",
+                },
+            })
+        except Exception:  # pragma: no cover — writer errors are best-effort
+            _diagnostics.mark(
+                "send_user_turn_terminal_run_frame_failed",
+                run_id=run_id, cell_id=cell_id, status=status,
+            )
+            return
+        _diagnostics.mark(
+            "send_user_turn_run_frame_terminal",
+            run_id=run_id, cell_id=cell_id, status=status,
+        )
 
     # ------------------------------------------------------------------
     # PLAN-S4: cross-agent context handoff helpers
