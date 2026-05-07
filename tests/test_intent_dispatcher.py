@@ -253,41 +253,36 @@ def test_submit_intent_unknown_kind_returns_k40() -> None:
 # ---------------------------------------------------------------------------
 
 
-import pytest
+# No remaining amendment kinds are in the "registered but unimplemented"
+# state.  ``record_context_manifest`` shipped in K-AS-A (S3.5);
+# ``record_run_frame`` shipped in K-CTXR (S6); ``apply_overlay_commit`` /
+# ``revert_overlay_to_commit`` / ``create_overlay_ref`` shipped in
+# K-OVERLAY (BSP-007).  See ``test_context_packer.py``,
+# ``test_run_frame_handler.py``, and ``test_overlay_applier.py`` for
+# their per-handler coverage.
 
 
-@pytest.mark.parametrize(
-    "intent_kind, slice_label",
-    [
-        ("apply_overlay_commit",     "BSP-007 overlay_applier"),
-        ("revert_overlay_to_commit", "BSP-007 overlay_applier"),
-        ("create_overlay_ref",       "BSP-007 overlay_applier"),
-        # ``record_context_manifest`` shipped in K-AS-A (S3.5) -- now has
-        # a real handler; covered by ``test_context_packer.py``.
-        # ``record_run_frame`` shipped in K-CTXR (S6) -- now has a real
-        # handler; covered by ``test_run_frame_handler.py``.
-    ],
-)
-def test_submit_intent_amendment_kinds_registered_but_unimplemented(
-    intent_kind: str, slice_label: str,
-) -> None:
-    """The remaining amendment kinds are in the registry (no K40) but their
-    handlers ship with later slices — submitting today returns K42 with
-    a slice-label reason so the operator knows where the work is queued."""
+def test_apply_overlay_commit_no_longer_pending() -> None:
+    """K-OVERLAY shipped: apply_overlay_commit now has a real handler.
+
+    Previously this kind returned K42 with the "pending slice" reason;
+    now it dispatches to ``MetadataWriter._handle_apply_overlay_commit``
+    via the overlay applier.  The basic happy path is exercised in
+    ``test_overlay_applier.py``; this test only confirms the registry
+    no longer routes to the ``_PENDING_SLICE`` stub.
+    """
     writer = _new_writer()
+    # Empty operations[] -> K90 (the new handler's validator), NOT K42
+    # (which is what the old stub returned).
     result = writer.submit_intent(_envelope(
-        intent_kind=intent_kind,
-        parameters={},
-        intent_id=f"intent-pending-{intent_kind}",
+        intent_kind="apply_overlay_commit",
+        parameters={"operations": []},
+        intent_id="intent-overlay-shipped",
     ))
     assert result["applied"] is False
-    assert result["error_code"] == "K42", (
-        f"{intent_kind} should return K42 (registered-but-unimplemented), "
-        f"not {result['error_code']}"
-    )
-    assert intent_kind in result["error_reason"]
-    assert slice_label in result["error_reason"], (
-        f"{intent_kind}'s K42 reason should cite the {slice_label} slice"
+    assert result["error_code"] == "K90", (
+        "apply_overlay_commit should now surface BSP-007 §7 K-codes, "
+        f"not the old K42 stub (got {result['error_code']})"
     )
 
 

@@ -54,6 +54,9 @@ from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
+from . import overlay_applier as _overlay_applier
+from .overlay_applier import OverlayRejected as _OverlayRejected
+
 if TYPE_CHECKING:  # pragma: no cover
     from .custom_messages import CustomMessageDispatcher
     from .run_tracker import RunTracker
@@ -941,12 +944,12 @@ class MetadataWriter:
         "apply_layout_edit",
         "apply_agent_graph_command",
         "acknowledge_drift",
-        # 2026-04-28 amendment kinds: registered for envelope acceptance
-        # but their handlers live in modules that ship with later slices.
-        # Submitting today returns K42 ("not yet implemented") rather than
-        # K40 ("unknown kind") so callers know the protocol contract is
-        # honored even though execution is queued.
-        "apply_overlay_commit",        # BSP-007 §8 — overlay_applier.py
+        # 2026-04-28 amendment kinds: BSP-007 K-OVERLAY + BSP-008
+        # ContextPacker handlers ship with their respective slices.
+        # The overlay-commit kinds dispatch to overlay_applier.py
+        # (BSP-007 K-OVERLAY); the context-manifest / run-frame kinds
+        # dispatch to context_packer.py (BSP-008 K-AS-A / K-CTXR).
+        "apply_overlay_commit",        # BSP-007 §4.1 / §8 — overlay_applier.py
         "revert_overlay_to_commit",    # BSP-007 §4.2 — overlay_applier.py
         "create_overlay_ref",          # BSP-007 §4.4 — overlay_applier.py
         "record_context_manifest",     # BSP-008 §3 — context_packer.py
@@ -1127,6 +1130,34 @@ class MetadataWriter:
             pre_version = self._snapshot_version
         try:
             outcome = handler(parameters)
+        except _OverlayRejected as overlay_exc:  # BSP-007 §7 K90+ codes.
+            # The overlay applier raises a structured rejection that
+            # carries the K-code (K90/K91/K92/K93/K94/K95) plus the
+            # per-K marker and detail dict the operator UI surfaces.
+            logger.warning(
+                "%s intent_kind=%s intent_id=%s reason=%s",
+                overlay_exc.marker, intent_kind, intent_id, overlay_exc.reason,
+                extra={
+                    "event.name": overlay_exc.marker,
+                    "llmnb.intent_id": intent_id,
+                    "llmnb.intent_kind": intent_kind,
+                    "llmnb.overlay_rejection": dict(overlay_exc.details),
+                },
+            )
+            with self._lock:
+                version_at_reject = self._snapshot_version
+            return {
+                "applied": False,
+                "already_applied": False,
+                "intent_id": intent_id,
+                "snapshot_version": version_at_reject,
+                "error_code": overlay_exc.code,
+                "error_reason": overlay_exc.reason,
+                "response": {
+                    "marker": overlay_exc.marker,
+                    "details": dict(overlay_exc.details),
+                },
+            }
         except Exception as exc:  # K42 -- validation / apply error.
             logger.warning(
                 "intent_validation_failed intent_kind=%s intent_id=%s reason=%s",
@@ -1208,6 +1239,11 @@ class MetadataWriter:
                 # PLAN-S4.2: update_agent_session bumps version so
                 # runtime_status / pid changes produce a fresh snapshot.
                 "update_agent_session",
+                # BSP-007 K-OVERLAY: overlay primitives flip _dirty
+                # but rely on the dispatcher to bump version, so each
+                # apply / revert / create-ref produces a fresh snapshot.
+                "apply_overlay_commit", "revert_overlay_to_commit",
+                "create_overlay_ref",
             }:
                 self._snapshot_version += 1
             new_version = self._snapshot_version
@@ -1309,6 +1345,13 @@ class MetadataWriter:
             return self._handle_record_context_manifest
         if intent_kind == "record_run_frame":
             return self._handle_record_run_frame
+        # BSP-007 K-OVERLAY slice: overlay-commit primitives.
+        if intent_kind == "apply_overlay_commit":
+            return self._handle_apply_overlay_commit
+        if intent_kind == "revert_overlay_to_commit":
+            return self._handle_revert_overlay_to_commit
+        if intent_kind == "create_overlay_ref":
+            return self._handle_create_overlay_ref
 
         # Registered-but-not-yet-implemented kinds: the registry
         # accepts the envelope so callers see K42 ("not yet implemented")
@@ -1321,13 +1364,16 @@ class MetadataWriter:
             # active above; ``record_event`` reshaped above.
             "create_agent":             "BSP-002 turn graph slice",
             # PLAN-S4.2: ``update_agent_session`` active above.
+            # Note: ``add_overlay`` / ``move_overlay_ref`` / ``update_ordering``
+            # are reachable INSIDE ``apply_overlay_commit`` (BSP-007) via the
+            # overlay applier dispatch; the standalone (BSP-002 turn-graph)
+            # entrypoints below remain pending until that slice lands.
             "add_overlay":              "BSP-002 turn graph slice",
             "move_overlay_ref":         "BSP-002 turn graph slice",
             "update_ordering":          "BSP-002 turn graph slice",
-            # BSP-007 overlay-commit kinds.
-            "apply_overlay_commit":     "BSP-007 overlay_applier (K-OVERLAY slice)",
-            "revert_overlay_to_commit": "BSP-007 overlay_applier (K-OVERLAY slice)",
-            "create_overlay_ref":       "BSP-007 overlay_applier (K-OVERLAY slice)",
+            # BSP-007 overlay-commit kinds: handlers wired above
+            # (apply_overlay_commit / revert_overlay_to_commit /
+            # create_overlay_ref). K-OVERLAY slice landed.
             # BSP-008 ContextPacker / RunFrame kinds. Both ``record_context_manifest``
             # (K-AS-A / S3.5) and ``record_run_frame`` (K-CTXR / S6) ship with
             # active handlers above; this map is now empty for BSP-008 entries.
@@ -2610,6 +2656,264 @@ class MetadataWriter:
             "manifest_id": manifest_id,
             "cell_id": cell_id,
         }
+
+    # -- BSP-007 K-OVERLAY overlay-commit handlers ------------------
+
+    def _set_cell_flag(
+        self, cell_id: str, flag: str, value: bool,
+    ) -> bool:
+        """Mutate one of the canonical cell flags on ``self._cells``.
+
+        The four flags pin / exclude / scratch / checkpoint are V1's
+        single-cell-property toggles per the
+        [pin-exclude-scratch-checkpoint atom]
+        (docs/atoms/operations/pin-exclude-scratch-checkpoint.md).
+
+        Used by:
+          * ``_handle_set_cell_metadata`` (the BSP-003 §5 entrypoint),
+            which writes flags through the ``params`` dict directly;
+          * the BSP-007 overlay applier, which wraps the same mutation
+            in an overlay commit so the operator timeline records it.
+
+        Returns True iff the flag's stored value changed. Callers
+        should also flip ``self._dirty`` (this helper does NOT bump
+        ``_snapshot_version``; the dispatcher does that on success).
+        """
+        if flag not in self._SET_CELL_METADATA_FLAG_KEYS:
+            raise ValueError(
+                f"_set_cell_flag: unknown flag {flag!r} "
+                f"(allowed: {self._SET_CELL_METADATA_FLAG_KEYS})"
+            )
+        coerced = bool(value)
+        with self._lock:
+            record = dict(self._cells.get(cell_id, {}))
+            previous = record.get(flag)
+            record[flag] = coerced
+            self._cells[cell_id] = record
+            if hasattr(self, "_cell_view_cache"):
+                self._cell_view_cache.pop(cell_id, None)
+            self._dirty = True
+        return previous != coerced
+
+    def _zone_overlay_state(self) -> Dict[str, Any]:
+        """Return ``metadata.rts.zone.overlay`` substructure (init if absent).
+
+        The locked-interface contract per the BSP-007 K-OVERLAY brief:
+        the dict ALWAYS has ``commits`` (list) and ``refs`` (dict).
+        Caller MUST hold ``self._lock``.
+        """
+        return _overlay_applier.ensure_overlay_state(self._zone)
+
+    def _build_overlay_state_view(self) -> Dict[str, Any]:
+        """Build the per-call state view the applier mutates.
+
+        Caller MUST hold ``self._lock``. The returned dict references
+        the writer's live in-memory dicts directly (no copy). The
+        applier deep-copies into a work_state, applies ops, and on
+        success swaps the work copies back IN PLACE so the writer's
+        references stay valid.
+
+        We inject only the read-only ``is_cell_executing`` predicate
+        as a closure so the applier never imports the writer module.
+        Mutating closures (``set_cell_flag``, ``set_cell_metadata``)
+        are NOT passed through -- the applier mutates the work_state's
+        dicts directly so atomic rollback covers them.
+
+        The zone substructures (``sections``, ``overlay``,
+        ``per_turn_overlays``) are NOT initialised here -- the applier
+        does that lazily inside :func:`overlay_applier.apply_commit`
+        only when an apply actually succeeds, so a rejected commit
+        leaves the writer's ``self._zone`` byte-identical to its
+        pre-call state.
+        """
+        return {
+            "cells":             self._cells,
+            "sections":          self._zone.get("sections") or {},
+            "overlay":           self._zone.get("overlay") or {},
+            "per_turn_overlays": self._zone.get("per_turn_overlays") or {},
+            # Markers the applier reads to know whether the sub-dicts
+            # are aliases of live state vs fresh defaults. We pass a
+            # callable the applier invokes on success to actually
+            # install the live sub-dicts.
+            "_install_zone_subdict": self._install_zone_subdict,
+            "is_cell_executing": self._is_cell_executing_for_overlay,
+        }
+
+    def _install_zone_subdict(self, key: str) -> Dict[str, Any]:
+        """Install a writer-owned sub-dict at ``self._zone[key]`` if absent.
+
+        Caller MUST hold ``self._lock``. Returns the live dict.
+        Used by the overlay applier only on the success path so a
+        rejected commit doesn't dirty ``self._zone``.
+        """
+        existing = self._zone.get(key)
+        if not isinstance(existing, dict):
+            existing = {}
+            self._zone[key] = existing
+        return existing
+
+    def _is_cell_executing_for_overlay(self, cell_id: str) -> bool:
+        """Predicate: is a run currently in flight on ``cell_id``?
+
+        BSP-007 §7 K95 fires when an overlay commit would touch a cell
+        the kernel is actively executing. The writer doesn't own the
+        run state directly; the AgentSupervisor / RunTracker does. We
+        consult those if attached, else fall back to a per-cell
+        "_executing" flag the test harness can set via
+        :meth:`set_cell_execution_state`.
+        """
+        # Check the per-cell test seam first.
+        with self._lock:
+            record = self._cells.get(cell_id)
+            if isinstance(record, dict) and bool(record.get("_executing")):
+                return True
+        # Run tracker: if any open span is bound to this cell, we
+        # treat the cell as executing. The tracker's open spans live
+        # in ``iter_runs()`` with ``endTimeUnixNano: None``.
+        tracker = self._run_tracker
+        if tracker is not None:
+            try:
+                for span in tracker.iter_runs():
+                    span_dict = (
+                        span.model_dump() if hasattr(span, "model_dump")
+                        else span
+                    )
+                    if not isinstance(span_dict, dict):
+                        continue
+                    if span_dict.get("endTimeUnixNano") is not None:
+                        continue
+                    attrs = span_dict.get("attributes") or {}
+                    if isinstance(attrs, dict):
+                        if attrs.get("llmnb.cell_id") == cell_id:
+                            return True
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return False
+
+    def set_cell_execution_state(
+        self, cell_id: str, executing: bool,
+    ) -> None:
+        """Test-only seam: mark a cell as currently executing.
+
+        Used by BSP-007 §9 K95 tests
+        (``test_overlay_blocked_during_execution``) when the kernel's
+        actual run-tracker isn't attached. Production code drives this
+        via :meth:`_is_cell_executing_for_overlay`.
+        """
+        with self._lock:
+            record = dict(self._cells.get(cell_id, {}))
+            if executing:
+                record["_executing"] = True
+            else:
+                record.pop("_executing", None)
+            self._cells[cell_id] = record
+            self._dirty = True
+
+    def _handle_apply_overlay_commit(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply one ``apply_overlay_commit`` intent (BSP-007 §4.1).
+
+        Atomic: the applier deep-copies the writer's live cell /
+        section / overlay sub-dicts, validates every operation in
+        ``params['operations']`` against the work copy, and on success
+        swaps the work copy back IN PLACE. On failure (any K-code) the
+        work copy is dropped and the writer's live state is unchanged
+        -- partial application is impossible.
+
+        Returns ``{"ok": True, "commit_id": ..., "head_commit_id": ...}``.
+        """
+        operations = params.get("operations")
+        if not isinstance(operations, list) or not operations:
+            raise _OverlayRejected(
+                "K90",
+                "apply_overlay_commit: operations[] must be a non-empty list",
+                details={"reason": "operations_required"},
+            )
+        message = params.get("message", "")
+        author = params.get("author", "operator")
+
+        with self._lock:
+            state_view = self._build_overlay_state_view()
+            commit_id, _record = _overlay_applier.apply_commit(
+                state_view,
+                operations,
+                message=str(message) if message is not None else "",
+                author=str(author) if author else "operator",
+            )
+            # On failure the applier raises; this code only runs on
+            # success. Live cells / sections / overlay were mutated in
+            # place by the applier's swap-back step.
+            self._dirty = True
+            # Invalidate any cached cell views the per-op flag mutations
+            # may have invalidated.
+            if hasattr(self, "_cell_view_cache"):
+                self._cell_view_cache.clear()
+            head_id = _overlay_applier.head_commit_id(
+                self._zone_overlay_state(),
+            )
+        return {
+            "ok": True,
+            "commit_id": commit_id,
+            "head_commit_id": head_id,
+        }
+
+    def _handle_revert_overlay_to_commit(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply one ``revert_overlay_to_commit`` intent (BSP-007 §4.2).
+
+        K91 when ``commit_id`` is unknown.
+        """
+        commit_id = params.get("commit_id")
+        if not isinstance(commit_id, str) or not commit_id:
+            raise _OverlayRejected(
+                "K91",
+                "revert_overlay_to_commit: commit_id is required",
+                details={"reason": "commit_id_required"},
+            )
+        with self._lock:
+            state_view = self._build_overlay_state_view()
+            head = _overlay_applier.revert_to_commit(state_view, commit_id)
+            self._dirty = True
+        return {
+            "ok": True,
+            "commit_id": commit_id,
+            "head_commit_id": head,
+        }
+
+    def _handle_create_overlay_ref(
+        self, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply one ``create_overlay_ref`` intent (BSP-007 §4.4 / V1 tag)."""
+        name = params.get("name")
+        commit_id = params.get("commit_id")
+        with self._lock:
+            state_view = self._build_overlay_state_view()
+            outcome = _overlay_applier.create_ref(
+                state_view, name=name, commit_id=commit_id,
+            )
+            self._dirty = True
+        return {
+            "ok": True,
+            "name": outcome["name"],
+            "commit_id": outcome["commit_id"],
+            "created": outcome["created"],
+        }
+
+    def diff_overlay_commits(
+        self, commit_a: str, commit_b: str,
+    ) -> List[Dict[str, Any]]:
+        """Read-only diff primitive (BSP-007 §4.3).
+
+        Not exposed via ``submit_intent`` because it is read-only;
+        consumers (History mode UI, audit trails) call this directly.
+        Raises :class:`OverlayRejected` (K91) when either commit is
+        unknown.
+        """
+        with self._lock:
+            state_view = self._build_overlay_state_view()
+            return _overlay_applier.diff(state_view, commit_a, commit_b)
 
     # -- BSP-008 §7 / S6 record_run_frame ---------------------------
 
@@ -3897,12 +4201,16 @@ class MetadataWriter:
                 # marker cleared on emission so the *persisted* snapshot
                 # carries only the canonical kind field.  We mutate
                 # in place: the marker is an in-memory hint, not part
-                # of the on-the-wire schema.
+                # of the on-the-wire schema. Same treatment for the
+                # BSP-007 ``_executing`` test seam (set via
+                # :meth:`set_cell_execution_state`) -- it lives in
+                # memory only and never lands on the wire.
                 cells_out: Dict[str, Dict[str, Any]] = {}
+                _IN_MEMORY_ONLY_KEYS = ("_kind_back_filled", "_executing")
                 for cell_id, record in self._cells.items():
                     persisted = {
                         k: v for k, v in record.items()
-                        if k != "_kind_back_filled"
+                        if k not in _IN_MEMORY_ONLY_KEYS
                     }
                     cells_out[cell_id] = persisted
                     # Clear the back-fill marker now that we've written
