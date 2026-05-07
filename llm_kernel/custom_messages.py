@@ -159,6 +159,8 @@ class CustomMessageDispatcher:
         comm_target: str = DEFAULT_COMM_TARGET,
         buffer_size: int = DEFAULT_BUFFER_SIZE,
         heartbeat_interval_sec: float = DEFAULT_HEARTBEAT_INTERVAL_SEC,
+        *,
+        read_only: bool = False,
     ) -> None:
         """Bind to ``kernel``; ``comm_target`` defaults to ``llmnb.rts.v2``.
 
@@ -206,6 +208,13 @@ class CustomMessageDispatcher:
         # actual environment supplies this in production (see
         # :meth:`_collect_current_volatile`); tests inject directly.
         self._current_volatile_provider: Optional[Callable[[], Dict[str, Any]]] = None
+        # PLAN-S6.0 §3.D replay-safety flag.  ``EventLogReplayer.project_state``
+        # asserts ``is_writable() == False`` at the boundary; passing a writable
+        # dispatcher into replay would re-emit captured envelopes and double-
+        # log them on every reopen.  Production replay sites (e.g. the X-EXT
+        # hydrate handler) MUST construct with ``read_only=True`` or call
+        # :meth:`set_read_only`.
+        self._read_only: bool = read_only
 
     # -- Collaborator wiring ----------------------------------------------
     #
@@ -244,6 +253,25 @@ class CustomMessageDispatcher:
     def set_drift_detector(self, detector: Any) -> None:
         """Bind a drift detector collaborator (overrides kernel-attr lookup)."""
         self._drift_detector_override = detector
+
+    def set_read_only(self, value: bool) -> None:
+        """Toggle the PLAN-S6.0 §3.D replay-safety flag.
+
+        Late-binding companion to the ``read_only=True`` constructor kwarg
+        so a dispatcher built before its replay role is known can be
+        flipped before being handed to ``EventLogReplayer.project_state``.
+        """
+        self._read_only = bool(value)
+
+    def is_writable(self) -> bool:
+        """Return True if this dispatcher would emit on the wire.
+
+        ``EventLogReplayer.project_state`` calls this at the boundary and
+        refuses replay when it returns True (PLAN-S6.0 §3.D).  The flag
+        is self-reported; callers that wrap, proxy, or otherwise replace
+        the emit path are responsible for keeping the report honest.
+        """
+        return not self._read_only
 
     def set_current_volatile_provider(
         self, provider: Callable[[], Dict[str, Any]],

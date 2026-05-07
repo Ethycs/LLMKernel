@@ -69,6 +69,18 @@ class EventLogVersionMismatchError(RuntimeError):
     """
 
 
+class EventLogReplayUnsafeError(RuntimeError):
+    """Raised when ``project_state`` is called with a writable dispatcher.
+
+    Per PLAN-S6.0 §3.D the replay path MUST drive a dispatcher whose
+    ``is_writable()`` returns ``False``; a writable dispatcher would
+    re-emit captured envelopes on the wire and double-log them in the
+    in-tree event log.  The check is a contract assertion at the boundary,
+    not an emission gate -- callers are still responsible for honoring
+    the read-only contract internally.
+    """
+
+
 def _parse_semver_major_minor(version: str) -> Optional[tuple[int, int]]:
     """Return ``(major, minor)`` for a semver triple, or ``None`` on parse error."""
     if not isinstance(version, str):
@@ -187,17 +199,44 @@ class EventLogReplayer:
         """Project ``metadata.rts`` from the latest snapshot + tail.
 
         Algorithm (PLAN-S6.0 §3.C):
-          1. Find the latest snapshot envelope.
-          2. ``working_rts := snapshot.payload.snapshot``.
-          3. Replay each subsequent envelope through ``dispatcher``
+          1. Assert ``dispatcher.is_writable()`` returns ``False`` --
+             writable dispatchers would re-emit captured envelopes on
+             every reopen, exponentially duplicating the event log
+             (PLAN-S6.0 §3.D).  Default-deny: a dispatcher missing the
+             ``is_writable`` method is treated as writable.
+          2. Find the latest snapshot envelope.
+          3. ``working_rts := snapshot.payload.snapshot``.
+          4. Replay each subsequent envelope through ``dispatcher``
              (which the caller MUST have configured in *read-only*
              mode -- see ``llm_client.boot.boot_minimal_kernel``'s
              ``read_only=True`` kwarg, which gates AgentSupervisor
-             instantiation).
-          4. Return ``working_rts``.
+             instantiation, and ``CustomMessageDispatcher(read_only=True)``
+             which makes ``is_writable()`` return ``False``).
+          5. Return ``working_rts``.
 
-        Raises :class:`EventLogReplayError` if no snapshot is present.
+        Raises:
+            :class:`EventLogReplayUnsafeError` if the dispatcher is
+                writable or lacks ``is_writable``.
+            :class:`EventLogReplayError` if no snapshot is present.
         """
+        is_writable = getattr(dispatcher, "is_writable", None)
+        if not callable(is_writable):
+            raise EventLogReplayUnsafeError(
+                f"dispatcher of type {type(dispatcher).__name__!r} lacks a "
+                "callable is_writable() method; refusing replay (PLAN-S6.0 "
+                "§3.D default-deny).  Construct with read_only=True or wrap "
+                "in a stub that reports is_writable() == False."
+            )
+        if is_writable():
+            raise EventLogReplayUnsafeError(
+                f"dispatcher of type {type(dispatcher).__name__!r} reports "
+                "is_writable() == True; refusing replay (PLAN-S6.0 §3.D).  "
+                "Pass read_only=True at construction or call "
+                "set_read_only(True) before driving project_state -- "
+                "otherwise captured envelopes re-emit on the wire and "
+                "double-log on every reopen."
+            )
+
         snapshot_envelope = self.latest_snapshot()
         if snapshot_envelope is None:
             raise EventLogReplayError(
@@ -275,5 +314,6 @@ def _deepcopy_json(obj: Any) -> Any:
 __all__ = [
     "EventLogReplayer",
     "EventLogReplayError",
+    "EventLogReplayUnsafeError",
     "EventLogVersionMismatchError",
 ]

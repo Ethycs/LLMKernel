@@ -9,7 +9,8 @@ import pytest
 
 from llm_kernel.custom_messages import CustomMessageDispatcher
 from llm_kernel.event_log import (
-    EventLogReplayError, EventLogReplayer, EventLogVersionMismatchError,
+    EventLogReplayError, EventLogReplayer, EventLogReplayUnsafeError,
+    EventLogVersionMismatchError,
 )
 from llm_kernel.metadata_writer import MetadataWriter
 from llm_kernel.run_envelope import (
@@ -72,6 +73,10 @@ class _NullDispatcher:
         # tested separately by the snapshot_equivalence test below.
         return None
 
+    def is_writable(self) -> bool:
+        # PLAN-S6.0 §3.D: replay-safety report.  This stub never emits.
+        return False
+
 
 def test_replay_determinism() -> None:
     """Same event_log replayed twice produces byte-identical projection."""
@@ -127,7 +132,11 @@ def test_no_agent_spawn_on_replay() -> None:
 
     from unittest.mock import MagicMock
     kernel = MagicMock()
-    dispatcher = CustomMessageDispatcher(kernel)
+    # PLAN-S6.0 §3.D: replay sites MUST construct the dispatcher in
+    # read-only mode so ``project_state``'s boundary assertion permits
+    # the call.  This is the contract a future X-EXT hydrate handler
+    # follows.
+    dispatcher = CustomMessageDispatcher(kernel, read_only=True)
     writer = MetadataWriter(autosave_interval_sec=999.0)
     dispatcher.set_metadata_writer(writer)
     dispatcher.set_agent_supervisor(_SpawnTrackingSupervisor())
@@ -184,6 +193,55 @@ def test_no_checkpoint_raises() -> None:
     replayer = EventLogReplayer(log)
     with pytest.raises(EventLogReplayError):
         replayer.project_state(dispatcher=_NullDispatcher())
+
+
+# ---------------------------------------------------------------------------
+# test_writable_dispatcher_refused (PLAN-S6.0 §3.D boundary assertion)
+# ---------------------------------------------------------------------------
+
+def test_writable_dispatcher_refused() -> None:
+    """A dispatcher whose ``is_writable()`` returns True is refused.
+
+    Without this guard a future caller (e.g. the X-EXT hydrate handler)
+    could pass a live dispatcher and the replay path would re-emit
+    every captured envelope, exponentially duplicating ``event_log[]``
+    on each reopen.  The boundary check stops that at the door.
+    """
+    from unittest.mock import MagicMock
+    kernel = MagicMock()
+    dispatcher = CustomMessageDispatcher(kernel)  # default read_only=False
+    log = _build_log(snapshot_seq=1, tail_count=1)
+    with pytest.raises(EventLogReplayUnsafeError, match="is_writable"):
+        EventLogReplayer(log).project_state(dispatcher=dispatcher)
+
+
+def test_dispatcher_missing_is_writable_refused() -> None:
+    """A dispatcher object lacking ``is_writable`` is refused (default-deny).
+
+    Mirrors a programmer mistake: passing a stub that forgot the
+    safety method.  Default-deny prevents silent leaks.
+    """
+
+    class _StubMissingMethod:
+        def _on_comm_msg(self, msg: Dict[str, Any]) -> None:
+            return None
+
+    log = _build_log(snapshot_seq=1, tail_count=1)
+    with pytest.raises(EventLogReplayUnsafeError, match="lacks a callable"):
+        EventLogReplayer(log).project_state(dispatcher=_StubMissingMethod())
+
+
+def test_set_read_only_flips_writability() -> None:
+    """``set_read_only(True)`` makes a writable dispatcher replay-safe."""
+    from unittest.mock import MagicMock
+    kernel = MagicMock()
+    dispatcher = CustomMessageDispatcher(kernel)
+    assert dispatcher.is_writable() is True
+    dispatcher.set_read_only(True)
+    assert dispatcher.is_writable() is False
+    # Replay now permitted.
+    log = _build_log(snapshot_seq=1, tail_count=1)
+    EventLogReplayer(log).project_state(dispatcher=dispatcher)
 
 
 # ---------------------------------------------------------------------------

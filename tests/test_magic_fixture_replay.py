@@ -91,6 +91,10 @@ class _NullDispatcher:
     def _on_comm_msg(self, msg: Dict[str, Any]) -> None:
         return None
 
+    def is_writable(self) -> bool:
+        # PLAN-S6.0 §3.D: replay-safety report.
+        return False
+
 
 def test_magic_to_events_to_tree() -> None:
     """Parse the .magic fixture, capture envelopes, replay to projection.
