@@ -246,9 +246,12 @@ def _run_agent_supervisor_smoke() -> int:
         # When the passthrough is selected, force set_base_url=True so
         # Claude Code routes ALL /v1/* through our proxy (which handles
         # model-resolution preflights cleanly, unlike LiteLLM).
+        smoke_task = (
+            "Use the notify tool to greet the operator. Then call report_completion."
+        )
         handle = supervisor.spawn(
             zone_id="smoke", agent_id="alpha",
-            task="Use the notify tool to greet the operator. Then call report_completion.",
+            task=smoke_task,
             work_dir=work_dir,
             model=os.environ.get(
                 "LLMKERNEL_SMOKE_MODEL", "claude-haiku-4-5-20251001",
@@ -256,12 +259,37 @@ def _run_agent_supervisor_smoke() -> int:
             use_bare=os.environ.get("LLMKERNEL_USE_BARE") == "1",
             set_base_url=True if use_passthrough else None,
         )
-        deadline = time.monotonic() + 60.0
+        # Claude CLI 2.1+ with ``--input-format=stream-json`` (per
+        # _provisioning.build_argv) reads turns from stdin and IGNORES
+        # the trailing positional argv. The supervisor.spawn() above
+        # only sets up Popen + reader threads -- it does not seed the
+        # initial turn. Tier-3 smoke needs the agent to actually do
+        # work, so feed the task through send_user_turn (cell_id=None
+        # graceful-degrades the BSP-008 ContextPacker / RunFrame trail
+        # since the smoke has no notebook tree).
+        supervisor.send_user_turn(
+            agent_id="alpha", text=smoke_task, cell_id=None,
+        )
+        # Close stdin so claude treats the stream as terminated and
+        # exits after its single response. With --input-format=stream-json
+        # claude waits indefinitely for more turns until stdin EOF;
+        # without this close, the smoke hangs at the wait deadline
+        # even though the agent finished its work in seconds.
+        try:
+            handle.popen.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        # 120s deadline: a passthrough-routed claude session needs more
+        # headroom than the bare API path (proxy round-trip on every
+        # /v1/* call). Direct claude+MCP flow takes ~6s; passthrough
+        # adds proxy hops; the supervisor's reader threads add stdout
+        # parsing overhead. 60s was historically tight.
+        deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline and handle.poll() is None:
             time.sleep(0.5)
         if handle.poll() is None:
             handle.terminate()
-            print("FAIL: agent did not exit within 60s", flush=True)
+            print("FAIL: agent did not exit within 120s", flush=True)
             _dump_debug_artifacts(debug_root, "alpha")
             return 1
         # If passthrough is on, flush the mitm log into the tracker so

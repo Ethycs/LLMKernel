@@ -419,12 +419,18 @@ class OperatorBridgeServer:
         # OTLP semconv shape: ``llmnb.run_type`` lives in attributes,
         # not as a top-level field.  This log-only fallback mirrors
         # the production envelope's keys for grep parity.
+        # ``name`` would collide with ``LogRecord.name`` (the logger
+        # name) and Python raises ``KeyError: "Attempt to overwrite
+        # 'name' in LogRecord"`` -- a tool call that hit this path
+        # disabled the entire MCP bridge during the Tier-3 smoke
+        # campaign.  Namespaced as ``span.name`` per
+        # discipline/magic-injection-defense.
         extra: Dict[str, Any] = {
             "rfc": "RFC-003",
             "message_type": message_type,
             "spanId": run_id,
             "traceId": self.trace_id,
-            "name": tool_name,
+            "span.name": tool_name,
             "kind": "SPAN_KIND_INTERNAL",
             "timestamp": _utc_now_iso(),
             "attributes": {
