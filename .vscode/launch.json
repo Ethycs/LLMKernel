@@ -28,33 +28,6 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": false
-        },
-        {
-            "name": "Run Extension",
-            "type": "extensionHost",
-            "request": "launch",
-            "runtimeExecutable": "${execPath}",
-            "args": [
-                "--extensionDevelopmentPath=${workspaceFolder}/vscode-llm-kernel-extension"
-            ],
-            "outFiles": [
-                "${workspaceFolder}/vscode-llm-kernel-extension/out/**/*.js"
-            ],
-            "preLaunchTask": "npm: compile - vscode-llm-kernel-extension"
-        },
-        {
-            "name": "Extension Tests",
-            "type": "extensionHost",
-            "request": "launch",
-            "runtimeExecutable": "${execPath}",
-            "args": [
-                "--extensionDevelopmentPath=${workspaceFolder}/vscode-llm-kernel-extension",
-                "--extensionTestsPath=${workspaceFolder}/vscode-llm-kernel-extension/out/test/suite/index"
-            ],
-            "outFiles": [
-                "${workspaceFolder}/vscode-llm-kernel-extension/out/test/**/*.js"
-            ],
-            "preLaunchTask": "npm: compile - vscode-llm-kernel-extension"
         }
     ]
 }
