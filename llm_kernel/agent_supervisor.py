@@ -709,15 +709,16 @@ class AgentSupervisor:
         # the BSP-008 §12 graceful-degradation path: the run still works,
         # just produces no Inspect-mode trail.
         #
-        # FLAGGED: the spec describes the "after completion" terminal frame
-        # as triggered when the agent finishes its reply. send_user_turn
-        # returns immediately after stdin write — the agent's response
-        # streams asynchronously through the stdout reader. For V1 we treat
-        # a successful stdin dispatch as run-complete from the supervisor's
-        # vantage and emit the terminal frame inline. A future slice with a
-        # per-turn completion detector (e.g. observing the agent's
-        # ``stop_reason`` envelope) can resubmit the terminal frame; the
-        # writer is idempotent-on-run_id for same-cell updates.
+        # V1 timing limitation (BSP-008 §8 — documented; no longer FLAGGED):
+        # The terminal frame is emitted at stdin-write success — i.e., when
+        # the user turn is delivered to the agent process, NOT when the agent
+        # finishes its reply. The agent's response streams asynchronously
+        # through the stdout reader. As a result, V1 RunFrame durations
+        # (started_at → ended_at) read as ~0 ms. This is acceptable for V1;
+        # a future slice (BSP-008 §13 FLAGGED) with a per-turn completion
+        # detector (e.g. observing the agent's ``stop_reason`` envelope) can
+        # resubmit the terminal frame with accurate timing; the writer is
+        # idempotent-on-run_id for same-cell updates.
         run_id: Optional[str] = None
         manifest_id: Optional[str] = None
         if (

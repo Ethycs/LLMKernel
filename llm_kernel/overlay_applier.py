@@ -736,6 +736,9 @@ def _validate_promote_span(state: Dict[str, Any], params: Dict[str, Any]) -> Non
         state["cells"] = cells
     new_cell_id = params.get("new_cell_id")
     if not isinstance(new_cell_id, str) or not new_cell_id:
+        # Non-deterministic by default (Option A per promote-span atom
+        # §"Cell-id determinism"). Callers who need replay-stable ids
+        # MUST supply an explicit ``new_cell_id`` from a stable source.
         new_cell_id = f"prom_{span_id}_{uuid.uuid4().hex[:8]}"
     cells[new_cell_id] = {
         "kind": cell_kind,

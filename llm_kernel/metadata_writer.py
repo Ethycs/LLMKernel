@@ -2770,8 +2770,17 @@ class MetadataWriter:
         # Run tracker: if any open span is bound to this cell, we
         # treat the cell as executing. The tracker's open spans live
         # in ``iter_runs()`` with ``endTimeUnixNano: None``.
+        #
+        # Attribute-key audit (K95 / BSP-007 §7): the production tagging
+        # path in RunTracker.start_run() (llm_kernel/run_tracker.py:249-251)
+        # hoists ``metadata["cell_id"]`` to ``attrs["llmnb.cell_id"]`` for
+        # every span opened with a cell_id in its metadata dict.  The key
+        # ``"llmnb.cell_id"`` is therefore the authoritative production key.
+        # Spans carry attributes as an OTLP/JSON list (List[{key, value}]);
+        # we must decode via decode_attrs before dict-style access.
         tracker = self._run_tracker
         if tracker is not None:
+            from ._attrs import decode_attrs
             try:
                 for span in tracker.iter_runs():
                     span_dict = (
@@ -2782,7 +2791,9 @@ class MetadataWriter:
                         continue
                     if span_dict.get("endTimeUnixNano") is not None:
                         continue
-                    attrs = span_dict.get("attributes") or {}
+                    raw_attrs = span_dict.get("attributes") or []
+                    # OTLP attributes are a list; decode to a plain dict.
+                    attrs = decode_attrs(raw_attrs) if isinstance(raw_attrs, list) else raw_attrs
                     if isinstance(attrs, dict):
                         if attrs.get("llmnb.cell_id") == cell_id:
                             return True
@@ -2917,15 +2928,13 @@ class MetadataWriter:
 
     # -- BSP-008 §7 / S6 record_run_frame ---------------------------
 
-    #: BSP-008 §7 RunFrame status enum. ``running`` is permitted as an
-    #: intermediate state per the §8 lifecycle ("a single run produces
-    #: 2+ intents over its lifetime — start with status=running, terminal
-    #: with same run_id and final status"). The §7 schema documents only
-    #: the three terminal values; the AgentSupervisor needs ``running``
-    #: to record the start frame before the run completes.
-    #: FLAGGED: the spec atom (concepts/run-frame.md) lists only the
-    #: three terminals; we accept ``running`` as a permitted intermediate
-    #: state because the §8 lifecycle paragraph requires it.
+    #: BSP-008 §7 RunFrame status enum. ``running`` is the intermediate
+    #: status emitted at run start per the §8 lifecycle (BSP-008 §8 —
+    #: "a single run produces 2+ intents over its lifetime — start with
+    #: status=running, ended_at=null; terminal frame with same run_id and
+    #: final status"). The run-frame atom (concepts/run-frame.md) now
+    #: includes ``running`` in the enum (amended in BSP-007/008 spec
+    #: hygiene sweep — item 5).
     _RUN_FRAME_STATUSES: FrozenSet[str] = frozenset({  # type: ignore[name-defined]
         "running", "complete", "failed", "interrupted",
     })
