@@ -14,3 +14,9 @@ llm_kernel.log
 
 # Extension files
 node_modules/
+
+# ipython REPL history (auto-created when the kernel boots in-process)
+profile_default/
+
+# RFC-008 diagnostics (per-process; ignored by root .gitignore too)
+.llmnb-kernel-markers.jsonl
