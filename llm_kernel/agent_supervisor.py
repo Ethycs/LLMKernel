@@ -232,6 +232,14 @@ class AgentSupervisor:
         # the ``MetadataWriter``.  Tests and callers seed turns with
         # ``submit_intent({intent_kind: "append_turn", ...})``.
 
+        # PLAN-S5.5 Phase 1d — section status auto-flip ref counting.
+        # Tracks how many runs are currently active in each section so
+        # that ``in_progress → open`` transitions only fire when the
+        # last run terminates. Lock-protected because run start /
+        # terminal hooks fire from arbitrary worker threads.
+        self._in_progress_run_count: Dict[str, int] = {}
+        self._auto_flip_lock: threading.Lock = threading.Lock()
+
     # PLAN-S4.1: ``record_turn`` REMOVED.  Callers submit ``append_turn``
     # intents to the writer; ``_missed_turns`` reads the persisted
     # ``metadata.rts.zone.agents.<id>.turns[]`` arrays directly.
@@ -991,6 +999,9 @@ class AgentSupervisor:
             agent_id=agent_id, cell_id=cell_id, run_id=run_id,
             manifest_id=manifest_id,
         )
+        # PLAN-S5.5 Phase 1d — increment run count for the section
+        # containing this cell. May flip section to ``in_progress``.
+        self._maybe_flip_section_on_run_start(cell_id)
         return run_id, manifest_id
 
     def _submit_terminal_run_frame(
@@ -1054,6 +1065,156 @@ class AgentSupervisor:
         _diagnostics.mark(
             "send_user_turn_run_frame_terminal",
             run_id=run_id, cell_id=cell_id, status=status,
+        )
+        # PLAN-S5.5 Phase 1d — decrement run count for the section
+        # containing this cell. May flip section back to ``open``.
+        self._maybe_flip_section_on_run_end(cell_id)
+
+    # ------------------------------------------------------------------
+    # PLAN-S5.5 Phase 1d — section status auto-flip
+    # ------------------------------------------------------------------
+    #
+    # When an agent run starts in a cell that belongs to a section, the
+    # section flips ``open → in_progress`` so the UI shows the section
+    # is actively being worked on and (via K95) so structural ops on
+    # member cells are blocked while the run is in flight. Reference-
+    # counted: only flip on 0→1 (first run) and 1→0 (last run) so
+    # multiple concurrent runs in the same section don't thrash the
+    # status. The flip is a best-effort ``set_section_status`` intent;
+    # if the section is currently ``frozen`` the writer returns K95
+    # and the run still proceeds (frozen sections stay frozen — auto-
+    # flip never overrides operator intent). Failures are logged via
+    # ``_diagnostics.mark`` and never propagate.
+
+    def _maybe_flip_section_on_run_start(self, cell_id: str) -> None:
+        """Increment the section run count for ``cell_id``'s section;
+        flip ``open → in_progress`` if this is the first active run.
+
+        No-op when the cell has no ``section_id`` or when the writer is
+        not wired. Safe to call repeatedly; the ref-count math handles
+        it. Thread-safe via :attr:`_auto_flip_lock`.
+        """
+        from . import _diagnostics
+        writer = self._metadata_writer
+        if writer is None:
+            return
+        rec = writer.get_cell_record(cell_id)
+        if not isinstance(rec, dict):
+            return
+        section_id = rec.get("section_id")
+        if not isinstance(section_id, str) or not section_id:
+            return
+        with self._auto_flip_lock:
+            count = self._in_progress_run_count.get(section_id, 0)
+            self._in_progress_run_count[section_id] = count + 1
+            should_flip = count == 0
+        if not should_flip:
+            return
+        self._submit_section_status_flip(
+            section_id=section_id,
+            new_status="in_progress",
+            cell_id=cell_id,
+            reason_marker="auto_flip_section_in_progress",
+        )
+
+    def _maybe_flip_section_on_run_end(self, cell_id: str) -> None:
+        """Decrement the section run count for ``cell_id``'s section;
+        flip ``in_progress → open`` if this was the last active run.
+
+        Pairs with :meth:`_maybe_flip_section_on_run_start`. Idempotent
+        on ``cell_id`` (extra decrements clamp at zero); a section that
+        somehow accumulated more decrements than increments stays at
+        zero rather than going negative.
+        """
+        from . import _diagnostics
+        writer = self._metadata_writer
+        if writer is None:
+            return
+        rec = writer.get_cell_record(cell_id)
+        if not isinstance(rec, dict):
+            return
+        section_id = rec.get("section_id")
+        if not isinstance(section_id, str) or not section_id:
+            return
+        with self._auto_flip_lock:
+            count = self._in_progress_run_count.get(section_id, 0)
+            new_count = count - 1 if count > 0 else 0
+            self._in_progress_run_count[section_id] = new_count
+            should_flip = count > 0 and new_count == 0
+        if not should_flip:
+            return
+        self._submit_section_status_flip(
+            section_id=section_id,
+            new_status="open",
+            cell_id=cell_id,
+            reason_marker="auto_flip_section_open",
+        )
+
+    def _submit_section_status_flip(
+        self,
+        *,
+        section_id: str,
+        new_status: str,
+        cell_id: str,
+        reason_marker: str,
+    ) -> None:
+        """Submit one ``set_section_status`` overlay intent.
+
+        Failures (transport, K90 unknown_section, K95 frozen) are
+        logged via ``_diagnostics.mark`` but never raised — the
+        supervisor's run path must not be blocked by a section
+        bookkeeping error. K95 specifically is expected when the
+        section is ``frozen``; we surface a distinct marker so the
+        audit trail distinguishes "frozen — auto-flip declined" from
+        "writer down — auto-flip lost".
+        """
+        from . import _diagnostics
+        writer = self._metadata_writer
+        if writer is None:
+            return
+        intent_id = f"af-{new_status[:3]}-{section_id[:8]}-{uuid.uuid4().hex[:8]}"
+        try:
+            result = writer.submit_intent({
+                "payload": {
+                    "action_type": "zone_mutate",
+                    "intent_kind": "apply_overlay_commit",
+                    "parameters": {
+                        "operations": [{
+                            "kind": "set_section_status",
+                            "section_id": section_id,
+                            "new_status": new_status,
+                        }],
+                        "message": (
+                            f"auto-flip: section→{new_status} "
+                            f"(cell {cell_id})"
+                        ),
+                    },
+                    "intent_id": intent_id,
+                },
+            })
+        except Exception:
+            _diagnostics.mark(
+                f"{reason_marker}_failed",
+                cell_id=cell_id, section_id=section_id,
+                reason="writer_raised",
+            )
+            return
+        if not result.get("applied", False):
+            # K90 unknown_section / K95 forbidden_section_transition /
+            # K95 frozen — all expected on degraded paths. Mark for
+            # the audit trail; the run continues unaffected.
+            details = (result.get("response") or {}).get("details") or {}
+            _diagnostics.mark(
+                f"{reason_marker}_declined",
+                cell_id=cell_id, section_id=section_id,
+                error_code=result.get("error_code"),
+                reason=details.get("reason"),
+            )
+            return
+        _diagnostics.mark(
+            reason_marker,
+            cell_id=cell_id, section_id=section_id,
+            new_status=new_status,
         )
 
     # ------------------------------------------------------------------

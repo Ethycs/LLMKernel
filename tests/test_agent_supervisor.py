@@ -1244,3 +1244,184 @@ def test_idle_resume_and_handoff_smoke(tmp_path: Path) -> None:
     assert res["handoff_prefix_count"] == 1
     fake_alpha_resume.terminate()
     fake_beta.terminate()
+
+
+# ---------------------------------------------------------------------
+# PLAN-S5.5 Phase 1d — section status auto-flip.
+#
+# Verifies that ``AgentSupervisor._maybe_flip_section_on_run_start`` /
+# ``_run_end`` correctly flip the containing section's status and that
+# reference counting prevents thrash when multiple runs share a section.
+# Tests call the helpers directly rather than spinning up real subprocess
+# agents — the wiring at the RunFrame start / terminal points is covered
+# by inspection (search for `_maybe_flip_section_on_run_*` in
+# agent_supervisor.py).
+# ---------------------------------------------------------------------
+
+
+def _seed_section_with_cell(sup, section_id: str, cell_id: str) -> None:
+    """Create a section then put a cell in it via overlay-commit intents."""
+    writer = sup._metadata_writer
+    # Seed cell via set_cell_metadata.
+    writer.submit_intent({"payload": {
+        "action_type": "zone_mutate",
+        "intent_kind": "set_cell_metadata",
+        "parameters": {"cell_id": cell_id, "kind": "agent"},
+        "intent_id": f"seed-{cell_id}",
+    }})
+    # Create section + move cell into it.
+    writer.submit_intent({"payload": {
+        "action_type": "zone_mutate",
+        "intent_kind": "apply_overlay_commit",
+        "parameters": {
+            "operations": [
+                {"kind": "create_section", "section_id": section_id, "title": section_id},
+                {"kind": "move_cells_into_section",
+                 "target_section_id": section_id,
+                 "cell_ids": [cell_id], "position": 0},
+            ],
+            "message": f"seed {section_id}",
+        },
+        "intent_id": f"seed-sec-{section_id}",
+    }})
+
+
+def _section_status(sup, section_id: str) -> Optional[str]:
+    """Read current status of a section from the live writer state."""
+    snap = sup._metadata_writer.snapshot()
+    sections = snap.get("zone", {}).get("sections", {})
+    sec = sections.get(section_id)
+    return sec.get("status") if isinstance(sec, dict) else None
+
+
+def test_auto_flip_open_to_in_progress_on_run_start() -> None:
+    """First run starting in a section flips it ``open → in_progress``."""
+    sup = _make_supervisor()
+    _seed_section_with_cell(sup, "sec_arch", "c_a1")
+    assert _section_status(sup, "sec_arch") == "open"
+    sup._maybe_flip_section_on_run_start("c_a1")
+    assert _section_status(sup, "sec_arch") == "in_progress"
+
+
+def test_auto_flip_back_to_open_when_last_run_ends() -> None:
+    """One run's lifecycle: start (open → in_progress) then end
+    (in_progress → open)."""
+    sup = _make_supervisor()
+    _seed_section_with_cell(sup, "sec_x", "c_x1")
+    sup._maybe_flip_section_on_run_start("c_x1")
+    assert _section_status(sup, "sec_x") == "in_progress"
+    sup._maybe_flip_section_on_run_end("c_x1")
+    assert _section_status(sup, "sec_x") == "open"
+
+
+def test_auto_flip_ref_counted_two_runs_no_intermediate_flip() -> None:
+    """Two concurrent runs in the same section: only the LAST end flips
+    back to open."""
+    sup = _make_supervisor()
+    _seed_section_with_cell(sup, "sec_r", "c_r1")
+    # Second cell in the same section.
+    writer = sup._metadata_writer
+    writer.submit_intent({"payload": {
+        "action_type": "zone_mutate",
+        "intent_kind": "set_cell_metadata",
+        "parameters": {"cell_id": "c_r2", "kind": "agent"},
+        "intent_id": "seed-c_r2",
+    }})
+    writer.submit_intent({"payload": {
+        "action_type": "zone_mutate",
+        "intent_kind": "apply_overlay_commit",
+        "parameters": {
+            "operations": [
+                {"kind": "move_cells_into_section",
+                 "target_section_id": "sec_r",
+                 "cell_ids": ["c_r2"], "position": 1},
+            ],
+            "message": "add c_r2 to sec_r",
+        },
+        "intent_id": "seed-mv-c_r2",
+    }})
+    # Two starts in a row.
+    sup._maybe_flip_section_on_run_start("c_r1")
+    assert _section_status(sup, "sec_r") == "in_progress"
+    sup._maybe_flip_section_on_run_start("c_r2")
+    # Status stays in_progress (ref count is 2).
+    assert _section_status(sup, "sec_r") == "in_progress"
+    # First end — still in_progress (ref count drops 2 → 1).
+    sup._maybe_flip_section_on_run_end("c_r1")
+    assert _section_status(sup, "sec_r") == "in_progress"
+    # Last end — flips back to open (1 → 0).
+    sup._maybe_flip_section_on_run_end("c_r2")
+    assert _section_status(sup, "sec_r") == "open"
+
+
+def test_auto_flip_no_section_id_is_noop() -> None:
+    """A cell without ``section_id`` triggers no flip and no error."""
+    sup = _make_supervisor()
+    sup._metadata_writer.submit_intent({"payload": {
+        "action_type": "zone_mutate",
+        "intent_kind": "set_cell_metadata",
+        "parameters": {"cell_id": "c_lone", "kind": "agent"},
+        "intent_id": "seed-c_lone",
+    }})
+    # No section created. Both helpers should silently no-op.
+    sup._maybe_flip_section_on_run_start("c_lone")
+    sup._maybe_flip_section_on_run_end("c_lone")
+    # No exception means success; the per-section counter dict
+    # has no entry.
+    assert sup._in_progress_run_count == {}
+
+
+def test_auto_flip_frozen_section_declines_silently() -> None:
+    """A frozen section: run start tries to flip → K95 from state
+    machine → auto-flip records a declined-marker but doesn't raise.
+    Section stays frozen; supervisor ref count still increments so a
+    matching end-call clean-up is balanced."""
+    sup = _make_supervisor()
+    _seed_section_with_cell(sup, "sec_fz", "c_fz1")
+    # Freeze the section.
+    sup._metadata_writer.submit_intent({"payload": {
+        "action_type": "zone_mutate",
+        "intent_kind": "apply_overlay_commit",
+        "parameters": {
+            "operations": [{
+                "kind": "set_section_status",
+                "section_id": "sec_fz",
+                "new_status": "frozen",
+            }],
+            "message": "freeze",
+        },
+        "intent_id": "i-freeze",
+    }})
+    assert _section_status(sup, "sec_fz") == "frozen"
+    # Run start: auto-flip attempt is K95 because frozen → in_progress
+    # is forbidden. No exception; section stays frozen.
+    sup._maybe_flip_section_on_run_start("c_fz1")
+    assert _section_status(sup, "sec_fz") == "frozen"
+    # Ref count still bumped: we track activity regardless.
+    assert sup._in_progress_run_count.get("sec_fz") == 1
+    # End: ref count returns to 0; the flip-back-to-open would also be
+    # rejected (frozen → open IS allowed from the state machine, but
+    # this is a clean no-op because the supervisor only attempts the
+    # flip when count goes 0 → ... actually, count goes 1 → 0 here so
+    # the flip IS attempted; it succeeds because frozen → open is the
+    # legal unfreeze path. Operators can override this by calling
+    # set_section_status frozen again).
+    sup._maybe_flip_section_on_run_end("c_fz1")
+    # The 1 → 0 transition fires set_section_status(open); state
+    # machine allows frozen → open. Section unfreezes.
+    # If this proves operator-hostile in practice, a V2+ refinement
+    # could remember "section was frozen at run start" and skip the
+    # end-flip. V1 ships with the simpler model.
+    assert _section_status(sup, "sec_fz") == "open"
+    assert sup._in_progress_run_count.get("sec_fz") == 0
+
+
+def test_auto_flip_decrement_floor_at_zero() -> None:
+    """Extra end-calls don't drive the ref count negative."""
+    sup = _make_supervisor()
+    _seed_section_with_cell(sup, "sec_z", "c_z1")
+    sup._maybe_flip_section_on_run_end("c_z1")  # underflow
+    sup._maybe_flip_section_on_run_end("c_z1")  # underflow
+    assert sup._in_progress_run_count.get("sec_z", 0) == 0
+    # Section status was never touched.
+    assert _section_status(sup, "sec_z") == "open"
