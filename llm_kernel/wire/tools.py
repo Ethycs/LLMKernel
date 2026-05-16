@@ -724,6 +724,47 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
             "remains banned regardless of operator action."
         ),
     },
+    # PLAN-S5.0.5 §7 -- magic-driven notebook encode/decode codes.
+    "K3M": {
+        "name": "notebook_export_path_outside_workspace",
+        "fires_in": "file_actions.apply_export",
+        "description": (
+            "The ``path:`` argument to ``@@export`` resolved outside "
+            "``workspace_root`` after ``..`` normalization and "
+            "symlink resolution.  Kernel rejects the export before "
+            "any file write.  Per PLAN-S5.0.5 §9 risk #1, symlinks "
+            "are followed during resolution; ``is_relative_to`` is "
+            "checked against the resolved target.  Recovery: operator "
+            "passes a relative path that lands at or beneath the "
+            "workspace.  V2+ may add an explicit ``--unsafe`` flag."
+        ),
+    },
+    "K3N": {
+        "name": "notebook_export_refused_overwrite",
+        "fires_in": "file_actions.apply_export",
+        "description": (
+            "The ``@@export`` target file exists and the cell did not "
+            "carry ``overwrite:true``.  Default is fail-safe -- the "
+            "operator must opt in to replacement.  No file is "
+            "modified.  Recovery: re-run with ``overwrite:true`` or "
+            "choose a different path."
+        ),
+    },
+    "K3O": {
+        "name": "notebook_io_failed",
+        "fires_in": "file_actions.apply_export / magic_generators._handle_import",
+        "description": (
+            "Bundled I/O / format failure for the cell-magic file "
+            "encode/decode vocabulary.  The ``cause`` sub-code on the "
+            "outcome envelope disambiguates: ``permission_denied``, "
+            "``disk_full``, ``unsupported_format``, ``parse_failed``, "
+            "``encoding_error``, ``invalid_input``, ``io_failed``.  "
+            "Atomic write via ``<path>.tmp`` + ``os.replace`` ensures "
+            "no partial files land at the target.  PLAN-S5.0.5 §9 "
+            "risk #7 documents the bundling rationale; V1.5 may split "
+            "into K3O/K3P/K3Q/K3R if per-cause recovery diverges."
+        ),
+    },
 }
 
 # Convenience constants for K-class codes (avoids magic strings at call sites).
@@ -747,6 +788,9 @@ K3I_GENERATOR_HANDLER_PRODUCED_INVALID_HASH: str = "K3I"
 K3J_GENERATOR_PROVENANCE_MISSING: str = "K3J"
 K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT: str = "K3K"
 K3L_PRIVILEGED_AGENT_STREAM_MAGIC: str = "K3L"
+K3M_NOTEBOOK_EXPORT_PATH_OUTSIDE_WORKSPACE: str = "K3M"
+K3N_NOTEBOOK_EXPORT_REFUSED_OVERWRITE: str = "K3N"
+K3O_NOTEBOOK_IO_FAILED: str = "K3O"
 
 
 def k_class_info(code: str) -> Optional[Dict[str, str]]:
@@ -800,6 +844,9 @@ __all__ = [
     "K3J_GENERATOR_PROVENANCE_MISSING",
     "K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT",
     "K3L_PRIVILEGED_AGENT_STREAM_MAGIC",
+    "K3M_NOTEBOOK_EXPORT_PATH_OUTSIDE_WORKSPACE",
+    "K3N_NOTEBOOK_EXPORT_REFUSED_OVERWRITE",
+    "K3O_NOTEBOOK_IO_FAILED",
     # PLAN-S5.0.4 emit_magic_cell schemas
     "EMIT_MAGIC_CELL_INPUT",
     "EMIT_MAGIC_CELL_OUTPUT",

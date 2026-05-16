@@ -217,6 +217,28 @@ class _SectionCellMagic(CellMagicHandler):
             cell.args["section_name"] = positional[0]
 
 
+class _ExportCellMagic(CellMagicHandler):
+    """``@@export path:"…" [format:"…"] [overwrite:bool]`` handler.
+
+    PLAN-S5.0.5 §5.1. Parses args and stows the typed fields on
+    ``cell.args`` so the dispatcher (``file_actions.apply_export``)
+    can consume them without re-parsing. ``path`` and ``format`` are
+    name-only; ``overwrite`` is interpreted as a boolean (case-
+    insensitive ``true`` / ``false``; absent → default False).
+    """
+
+    def _refine_args(self, cell, positional, named):
+        if "path" in named:
+            cell.args["path"] = named["path"]
+        if "format" in named:
+            cell.args["format"] = named["format"]
+        if "overwrite" in named:
+            value = (named["overwrite"] or "").strip().lower()
+            cell.args["overwrite"] = value == "true"
+        else:
+            cell.args["overwrite"] = False
+
+
 class _CheckpointCellMagic(CellMagicHandler):
     def _refine_args(self, cell, positional, named):
         if "covers" in named:
@@ -294,6 +316,13 @@ CELL_MAGICS: Dict[str, CellMagicHandler] = {
     "template": CellMagicHandler(name="template", kind="template"),
     "expand": CellMagicHandler(name="expand", kind="expand"),
     "import": CellMagicHandler(name="import", kind="import"),
+    # PLAN-S5.0.5 — magic-driven notebook encode. ``@@export`` is a
+    # side-effect emitter (it writes a file on disk); not a generator
+    # (it does not insert cells). The parser classifies the cell as
+    # ``kind=export``; the run-time dispatch calls
+    # ``file_actions.apply_export`` with the typed args refined
+    # below.
+    "export": _ExportCellMagic(name="export", kind="export"),
 }
 
 
