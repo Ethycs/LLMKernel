@@ -225,6 +225,27 @@ RUN_COMMAND_OUTPUT: JSONSchema = _obj(["exit_code", "stdout", "stderr", "run_id"
     "duration_ms": {"type": "integer", "minimum": 0}})
 
 
+# PLAN-S5.0.4 §3.1 / §3.4 — `emit_magic_cell` MCP tool schemas.
+#
+# Per certified-magic-emitter atom clause 1, this is the structural
+# channel a privileged agent uses to produce a new cell with
+# operator-rooted intent (the operator's grant authorizes the channel).
+# The handler in `magic_emit_tool.py` validates the privilege grant
+# under `metadata.rts.config.magic_emit_privileges[]` and dispatches
+# through `CellManager.insert_cells_with_provenance`.
+EMIT_MAGIC_CELL_INPUT: JSONSchema = _obj(["name", "position"], {
+    "_rfc_version": _VER,
+    "name": {"type": "string", "minLength": 1,
+             "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"},
+    "args": {"type": "object", "additionalProperties": _VS},
+    "body": {"type": ["string", "null"]},
+    "position": _obj(["after_cell_id"], {
+        "after_cell_id": {"type": "string", "minLength": 1}})})
+EMIT_MAGIC_CELL_OUTPUT: JSONSchema = _obj(["cell_id"], {
+    "_rfc_version": _VS,
+    "cell_id": {"type": "string", "minLength": 1}})
+
+
 # Public catalog: tool name -> (input_schema, output_schema, description).
 # Order matches RFC-002's mcpServers.allowedTools array exactly.
 TOOL_CATALOG: Dict[str, Tuple[JSONSchema, JSONSchema, str]] = {
@@ -241,13 +262,24 @@ TOOL_CATALOG: Dict[str, Tuple[JSONSchema, JSONSchema, str]] = {
     "read_file": (READ_FILE_INPUT, READ_FILE_OUTPUT, "Proxied: returns file contents from the workspace."),
     "write_file": (WRITE_FILE_INPUT, WRITE_FILE_OUTPUT, "Proxied: writes file contents inside the workspace."),
     "run_command": (RUN_COMMAND_INPUT, RUN_COMMAND_OUTPUT, "Proxied: executes a shell command in the zone workspace."),
+    "emit_magic_cell": (
+        EMIT_MAGIC_CELL_INPUT, EMIT_MAGIC_CELL_OUTPUT,
+        "Privileged: produces a new cell with @@<name> magic on the "
+        "operator's behalf (PLAN-S5.0.4 / certified-magic-emitter "
+        "atom clause 1).",
+    ),
 }
 
 # Tools whose handlers are real (B1-stub) implementations.
+# PLAN-S5.0.4: ``emit_magic_cell`` joins the native-tools list -- the
+# handler in ``magic_emit_tool.py`` is kernel-side and routes through
+# ``CellManager.insert_cells_with_provenance`` (clause 2 of
+# certified-magic-emitter atom).
 NATIVE_TOOLS: Tuple[str, ...] = (
     "ask", "clarify", "propose", "request_approval",
     "report_progress", "report_completion", "report_problem",
-    "present", "notify", "escalate")
+    "present", "notify", "escalate",
+    "emit_magic_cell")
 
 # Tools that are proxied; B1 leaves them unimplemented and raises NotImplementedError.
 PROXIED_TOOLS: Tuple[str, ...] = ("read_file", "write_file", "run_command")
@@ -659,6 +691,39 @@ K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
             "K3J instead of silently inserting orphan cells."
         ),
     },
+    # PLAN-S5.0.4 §3.4 -- privileged magic emission codes.
+    "K3K": {
+        "name": "unprivileged_agent_magic_emit",
+        "fires_in": "magic_emit_tool.emit_magic_cell",
+        "description": (
+            "An agent invoked the ``emit_magic_cell`` MCP tool without "
+            "a covering privilege grant under "
+            "``metadata.rts.config.magic_emit_privileges[]`` for its "
+            "(agent_id, zone_id, magic_name) tuple.  The tool call "
+            "rejects; no cell is inserted.  Per certified-magic-emitter "
+            "clause 1, the operator's grant -- not the agent's "
+            "identity -- is what authorizes emission via the structural "
+            "channel.  Operator may grant via the "
+            "``grant_magic_emit_privilege`` operator-action intent."
+        ),
+    },
+    "K3L": {
+        "name": "privileged_agent_stream_magic",
+        "fires_in": "agent_supervisor._scan_for_magic_contamination",
+        "description": (
+            "Informational marker: a privileged agent (one that holds "
+            "an active ``magic_emit_privileges`` grant) emitted a "
+            "magic-shaped line via its stdout/stderr stream rather "
+            "than invoking the ``emit_magic_cell`` MCP tool.  The "
+            "line is still sanitized per Layer-2 emission ban; the "
+            "K3L marker triggers the operator-facing promotion chip "
+            "on the contaminated cell so the operator may one-click "
+            "promote the stream emission to a tool call via the "
+            "``promote_stream_magic`` operator-action intent.  K3L is "
+            "NOT a refusal -- it is a recovery affordance; the stream "
+            "remains banned regardless of operator action."
+        ),
+    },
 }
 
 # Convenience constants for K-class codes (avoids magic strings at call sites).
@@ -680,6 +745,8 @@ K3G_OPERATOR_ACCEPTED_INJECTION_PERSISTED: str = "K3G"
 K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED: str = "K3H"
 K3I_GENERATOR_HANDLER_PRODUCED_INVALID_HASH: str = "K3I"
 K3J_GENERATOR_PROVENANCE_MISSING: str = "K3J"
+K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT: str = "K3K"
+K3L_PRIVILEGED_AGENT_STREAM_MAGIC: str = "K3L"
 
 
 def k_class_info(code: str) -> Optional[Dict[str, str]]:
@@ -731,4 +798,9 @@ __all__ = [
     "K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED",
     "K3I_GENERATOR_HANDLER_PRODUCED_INVALID_HASH",
     "K3J_GENERATOR_PROVENANCE_MISSING",
+    "K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT",
+    "K3L_PRIVILEGED_AGENT_STREAM_MAGIC",
+    # PLAN-S5.0.4 emit_magic_cell schemas
+    "EMIT_MAGIC_CELL_INPUT",
+    "EMIT_MAGIC_CELL_OUTPUT",
 ]

@@ -124,12 +124,13 @@ def test_all_schema_files_parseable() -> None:
 def test_schema_file_count() -> None:
     """wire/schemas/ has the expected number of files.
 
-    13 tools * 2 (input + output) + 5 families + 2 handshake (request +
-    response, S5.0.3d) = 33 JSON files.
+    13 RFC-001 tools + 1 PLAN-S5.0.4 ``emit_magic_cell`` privileged-
+    emit tool = 14 tools * 2 (input + output) + 5 families + 2
+    handshake (request + response, S5.0.3d) = 35 JSON files.
     """
     schemas_dir = _schemas_dir()
     json_files = list(schemas_dir.glob("*.json"))
-    expected_tool_count = 13  # per RFC-001 / TOOL_CATALOG
+    expected_tool_count = 14  # RFC-001 (13) + PLAN-S5.0.4 emit_magic_cell
     expected_family_count = 5  # A, B, C, F, G
     expected_handshake_count = 2  # handshake.request, handshake.response (S5.0.3d)
     expected_total = (

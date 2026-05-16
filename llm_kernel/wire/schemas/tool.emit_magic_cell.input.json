@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "default": "1.0.0",
+      "type": "string"
+    },
+    "args": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "body": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "minLength": 1,
+      "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+      "type": "string"
+    },
+    "position": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "after_cell_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "after_cell_id"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "name",
+    "position"
+  ],
+  "type": "object"
+}

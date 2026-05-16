@@ -83,19 +83,26 @@ def test_server_identity(bridge: OperatorBridgeServer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_catalog_lists_thirteen_tools(bridge: OperatorBridgeServer) -> None:
-    """All thirteen RFC-001 tools MUST be registered."""
+async def test_catalog_lists_fourteen_tools(bridge: OperatorBridgeServer) -> None:
+    """All fourteen registered tools MUST be exposed.
+
+    Thirteen RFC-001 tools (ask, clarify, propose, request_approval,
+    report_progress, report_completion, report_problem, present,
+    notify, escalate, read_file, write_file, run_command) plus the
+    PLAN-S5.0.4 ``emit_magic_cell`` privileged-emit tool.
+    """
     handler = bridge.server.request_handlers[types.ListToolsRequest]
     request = types.ListToolsRequest(method="tools/list")
     server_result = await handler(request)
     tools = server_result.root.tools
-    assert len(tools) == 13
+    assert len(tools) == 14
     names = {tool.name for tool in tools}
     expected = {
         "ask", "clarify", "propose", "request_approval",
         "report_progress", "report_completion", "report_problem",
         "present", "notify", "escalate",
         "read_file", "write_file", "run_command",
+        "emit_magic_cell",
     }
     assert names == expected
 

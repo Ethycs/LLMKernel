@@ -101,6 +101,10 @@ def test_valid_tool_args_return_none_from_validator() -> None:
         "read_file": {"path": "x.txt"},
         "write_file": {"path": "x.txt", "content": "y"},
         "run_command": {"command": "echo"},
+        "emit_magic_cell": {
+            "name": "scratch",
+            "position": {"after_cell_id": "c_anchor"},
+        },
     }
     for tool_name in TOOL_CATALOG:
         assert tool_name in fixtures, (
