@@ -212,9 +212,36 @@ class _CompareCellMagic(CellMagicHandler):
 
 
 class _SectionCellMagic(CellMagicHandler):
+    """``@@section <title> [id:"sec_..."]`` handler.
+
+    PLAN-S5.5 Phase 4 — operator-typable section declaration cell.
+    Extracts ``title`` from positional[0] (or named ``title:``) and
+    optional explicit ``id:`` (otherwise the runtime dispatcher mints
+    one from the title). ``section_name`` is kept as a back-compat
+    alias so callers that read it pre-Phase-4 don't break.
+
+    Runtime behavior: when the cell is run, the driver translates it
+    into an ``apply_overlay_commit`` envelope with a ``create_section``
+    op. The section is created EMPTY (V1); operators populate it
+    afterward via the Command Palette ``llmnb.section.openActions``
+    QuickPick or by editing cell membership directly through the
+    ``move_cells_into_section`` op. A V1.5+ refinement could add
+    "auto-claim cells until the next @@section" semantics, but that
+    requires a layout-positional walk the V1 dispatch doesn't carry.
+    """
+
     def _refine_args(self, cell, positional, named):
+        title = ""
         if positional:
-            cell.args["section_name"] = positional[0]
+            title = positional[0]
+        elif "title" in named:
+            title = named["title"]
+        if title:
+            cell.args["title"] = title
+            # Back-compat alias — pre-Phase-4 callers may read this.
+            cell.args["section_name"] = title
+        if "id" in named and isinstance(named["id"], str) and named["id"]:
+            cell.args["section_id"] = named["id"]
 
 
 class _ExportCellMagic(CellMagicHandler):
@@ -293,10 +320,11 @@ CELL_MAGICS: Dict[str, CellMagicHandler] = {
     "compare": _CompareCellMagic(
         name="compare", kind="compare", status="stub", pending_slice="V1.5+",
     ),
-    # S5.5 — sections.
-    "section": _SectionCellMagic(
-        name="section", kind="section", status="stub", pending_slice="S5.5",
-    ),
+    # S5.5 Phase 4 — section cell magic. Parses ``@@section <title>
+    # [id:"sec_..."]`` to ``kind=section`` + typed args. The runtime
+    # dispatch (driver-side) translates this into an
+    # ``apply_overlay_commit`` with a ``create_section`` op.
+    "section": _SectionCellMagic(name="section", kind="section"),
     # V2+ reserved kinds — round-trip identically; renderer falls
     # through to kind-label-only view per cell-kinds atom invariants.
     "tool": CellMagicHandler(

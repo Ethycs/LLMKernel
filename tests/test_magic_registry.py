@@ -171,3 +171,52 @@ def test_branch_line_magic_dispatches_agent_branch_envelope() -> None:
     # Confirm status is active (no _pending flag injected by the handler).
     assert MR.LINE_MAGICS["branch"].status == "active"
     assert not getattr(MR.LINE_MAGICS["branch"], "pending_slice", None)
+
+
+# PLAN-S5.5 Phase 4 — @@section cell magic.
+
+
+def test_section_magic_active_post_phase4() -> None:
+    """``@@section`` is no longer status="stub" — Phase 4 flipped it
+    active and the parser routes ``@@section <title>`` to typed args."""
+    assert MR.CELL_MAGICS["section"].status == "active"
+    assert not getattr(MR.CELL_MAGICS["section"], "pending_slice", "")
+
+
+def test_section_magic_extracts_title_from_positional() -> None:
+    cell = parse_cell("@@section Architecture\nnotes about the section")
+    assert cell.kind == "section"
+    assert cell.args.get("title") == "Architecture"
+    # Back-compat alias is preserved for pre-Phase-4 callers.
+    assert cell.args.get("section_name") == "Architecture"
+
+
+def test_section_magic_extracts_quoted_title() -> None:
+    """Quoted titles survive shlex tokenization."""
+    cell = parse_cell('@@section "Runtime Concerns"\nnotes')
+    assert cell.kind == "section"
+    assert cell.args.get("title") == "Runtime Concerns"
+
+
+def test_section_magic_named_title_kwarg() -> None:
+    """``title:`` named arg works in place of positional."""
+    cell = parse_cell('@@section title:"Architecture"\nnotes')
+    assert cell.kind == "section"
+    assert cell.args.get("title") == "Architecture"
+
+
+def test_section_magic_extracts_explicit_id() -> None:
+    """``id:"sec_xxx"`` named arg pins the section_id."""
+    cell = parse_cell('@@section Tests id:"sec_tests_42"\nbody')
+    assert cell.kind == "section"
+    assert cell.args.get("title") == "Tests"
+    assert cell.args.get("section_id") == "sec_tests_42"
+
+
+def test_section_magic_no_title_still_classifies_as_section() -> None:
+    """A bare ``@@section`` cell parses as kind=section but lacks title.
+    Runtime dispatch is responsible for failing the create gracefully."""
+    cell = parse_cell("@@section\nbody")
+    assert cell.kind == "section"
+    assert "title" not in cell.args
+    assert "section_id" not in cell.args
