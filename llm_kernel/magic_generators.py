@@ -406,13 +406,74 @@ def _handle_import(
             K30_GENERATOR_INPUT_INVALID,
             f"import_file_unreadable: {file_arg!r}: {exc}",
         ) from None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise GeneratorError(
-            K30_GENERATOR_INPUT_INVALID,
-            f"import_file_not_json: {file_arg!r}: {exc.msg}",
-        ) from None
+
+    # PLAN-S5.0.5 §5.2 — multi-format import. Explicit ``format:`` named
+    # arg overrides extension-based detection. Supported formats:
+    # ``llmnb`` (native, the legacy path), ``magic`` (operator-edit
+    # form; split at @@break), ``ipynb`` (Jupyter; route through
+    # notebook_format.ipynb_to_llmnb then walk cells).
+    explicit_format = named.get("format") if isinstance(named, dict) else None
+    if explicit_format is not None:
+        if explicit_format not in ("llmnb", "magic", "ipynb"):
+            raise GeneratorError(
+                K30_GENERATOR_INPUT_INVALID,
+                f"import_unsupported_format: {explicit_format!r} "
+                "(must be one of llmnb / magic / ipynb)",
+            )
+        fmt = explicit_format
+    else:
+        # Late import keeps magic_generators' import graph minimal.
+        from . import notebook_format
+        fmt = notebook_format.detect_format(candidate)
+        if fmt == "unknown":
+            # Fall back to llmnb (legacy behavior) — the caller likely
+            # has a misnamed file; the JSON parse below will surface a
+            # clearer error than "unknown format" alone.
+            fmt = "llmnb"
+
+    # Magic format: split at @@break and return fragments verbatim. No
+    # JSON parse, no notebook_format round-trip — each fragment is
+    # already operator-edit cell text. The dispatcher will run them
+    # through ``cell_manager.insert_cells_with_provenance`` which
+    # invokes ``parse_cell`` per fragment, so malformed magic surfaces
+    # there with the full K30 message.
+    if fmt == "magic":
+        from .cell_text import split_at_breaks
+        fragments = [f for f in split_at_breaks(raw) if f.strip()]
+        if not fragments:
+            raise GeneratorError(
+                K30_GENERATOR_INPUT_INVALID,
+                f"import_yielded_no_cells: {file_arg!r}",
+            )
+        return fragments
+
+    # Ipynb format: parse JSON, convert through ipynb_to_llmnb, then
+    # fall through to the llmnb cell-walk below.
+    if fmt == "ipynb":
+        try:
+            ipynb_data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GeneratorError(
+                K30_GENERATOR_INPUT_INVALID,
+                f"import_file_not_json: {file_arg!r}: {exc.msg}",
+            ) from None
+        from . import notebook_format
+        try:
+            data = notebook_format.ipynb_to_llmnb(ipynb_data)
+        except Exception as exc:  # noqa: BLE001 — defensive; surface as K30
+            raise GeneratorError(
+                K30_GENERATOR_INPUT_INVALID,
+                f"import_ipynb_conversion_failed: {file_arg!r}: {exc}",
+            ) from None
+    else:
+        # Native llmnb branch.
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GeneratorError(
+                K30_GENERATOR_INPUT_INVALID,
+                f"import_file_not_json: {file_arg!r}: {exc.msg}",
+            ) from None
     # Must be a `.llmnb` shape: ``metadata.rts.cells`` (or root-level
     # ``cells`` in the snapshot wrapper).
     rts = None

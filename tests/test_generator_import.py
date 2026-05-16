@@ -137,3 +137,120 @@ def test_import_invalid_json_raises_K30(tmp_path, writer, cell_manager) -> None:
         )
     assert exc.value.code == K30_GENERATOR_INPUT_INVALID
     assert "not_json" in exc.value.reason
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S5.0.5 — multi-format @@import (.magic / .ipynb)
+# ---------------------------------------------------------------------------
+
+
+def test_import_magic_format_happy_path(tmp_path, writer, cell_manager) -> None:
+    """@@import sample.magic → cells split at @@break, inserted with provenance."""
+    target = tmp_path / "sample.magic"
+    target.write_text(
+        "@@scratch\nfirst\n@@break\n@@scratch\nsecond\n",
+        encoding="utf-8",
+    )
+    args = {"positional": ["sample.magic"], "named": {}}
+    new_ids = dispatch_generator(
+        "c_gen", "import", args, "", writer, cell_manager,
+    )
+    assert len(new_ids) == 2
+    rec0 = writer.get_cell_record(new_ids[0])
+    rec1 = writer.get_cell_record(new_ids[1])
+    assert "first" in rec0["text"]
+    assert "second" in rec1["text"]
+    assert rec0["generated_by"] == "c_gen"
+    assert rec1["generated_by"] == "c_gen"
+
+
+def test_import_ipynb_format_happy_path(tmp_path, writer, cell_manager) -> None:
+    """@@import sample.ipynb → code cells map to @@scratch, markdown to @@markdown."""
+    ipynb = {
+        "cells": [
+            {"cell_type": "code", "source": "print('hello')", "outputs": [],
+             "execution_count": None, "metadata": {}},
+            {"cell_type": "markdown", "source": "# heading", "metadata": {}},
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    target = tmp_path / "sample.ipynb"
+    target.write_text(json.dumps(ipynb), encoding="utf-8")
+    args = {"positional": ["sample.ipynb"], "named": {}}
+    new_ids = dispatch_generator(
+        "c_gen", "import", args, "", writer, cell_manager,
+    )
+    assert len(new_ids) == 2
+    rec0 = writer.get_cell_record(new_ids[0])
+    rec1 = writer.get_cell_record(new_ids[1])
+    assert rec0["text"].startswith("@@scratch")
+    assert "print('hello')" in rec0["text"]
+    assert rec1["text"].startswith("@@markdown")
+    assert "heading" in rec1["text"]
+
+
+def test_import_explicit_format_overrides_extension(
+    tmp_path, writer, cell_manager,
+) -> None:
+    """`format:` kwarg supersedes extension-based detection."""
+    target = tmp_path / "sample.magic"
+    target.write_text(
+        "@@scratch\nfrom-magic-via-explicit-kwarg\n",
+        encoding="utf-8",
+    )
+    args = {"positional": ["sample.magic"], "named": {"format": "magic"}}
+    new_ids = dispatch_generator(
+        "c_gen", "import", args, "", writer, cell_manager,
+    )
+    assert len(new_ids) == 1
+    assert "from-magic-via-explicit-kwarg" in writer.get_cell_record(new_ids[0])["text"]
+
+
+def test_import_explicit_format_mismatch_routes_to_specified_format(
+    tmp_path, writer, cell_manager,
+) -> None:
+    """A .magic-extension file with format:"llmnb" tries JSON parse → K30."""
+    target = tmp_path / "looks_like_magic.magic"
+    target.write_text("@@scratch\nbody\n", encoding="utf-8")
+    args = {
+        "positional": ["looks_like_magic.magic"],
+        "named": {"format": "llmnb"},
+    }
+    with pytest.raises(GeneratorError) as exc:
+        dispatch_generator(
+            "c_gen", "import", args, "", writer, cell_manager,
+        )
+    assert exc.value.code == K30_GENERATOR_INPUT_INVALID
+    assert "not_json" in exc.value.reason
+
+
+def test_import_unsupported_format_raises_K30(
+    tmp_path, writer, cell_manager,
+) -> None:
+    """format:"bogus" rejected before file read."""
+    target = tmp_path / "x.llmnb"
+    target.write_text("{}", encoding="utf-8")
+    args = {"positional": ["x.llmnb"], "named": {"format": "bogus"}}
+    with pytest.raises(GeneratorError) as exc:
+        dispatch_generator(
+            "c_gen", "import", args, "", writer, cell_manager,
+        )
+    assert exc.value.code == K30_GENERATOR_INPUT_INVALID
+    assert "unsupported_format" in exc.value.reason
+
+
+def test_import_magic_empty_file_raises_K30(
+    tmp_path, writer, cell_manager,
+) -> None:
+    """An empty .magic file yields no cells → K30."""
+    target = tmp_path / "empty.magic"
+    target.write_text("", encoding="utf-8")
+    args = {"positional": ["empty.magic"], "named": {}}
+    with pytest.raises(GeneratorError) as exc:
+        dispatch_generator(
+            "c_gen", "import", args, "", writer, cell_manager,
+        )
+    assert exc.value.code == K30_GENERATOR_INPUT_INVALID
+    assert "yielded_no_cells" in exc.value.reason
