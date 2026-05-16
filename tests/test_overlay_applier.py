@@ -379,6 +379,181 @@ def test_section_delete_requires_empty() -> None:
     assert result["response"]["details"]["reason"] == "section_not_empty"
 
 
+# PLAN-S5.5 §5 — comprehensive coverage for the four section overlay ops.
+# Verifies the shipped BSP-007 (3a430cb) validators against the design.
+
+
+def test_create_section_happy_path() -> None:
+    """§5 — create a section; snapshot reflects id/title/empty cell_range/
+    status defaulted to ``open`` and collapsed defaulted to ``false``."""
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "create_section",
+         "section_id": "sec_arch", "title": "Architecture"},
+    ], intent_id="i-create-sec")
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    sec = snap["zone"]["sections"]["sec_arch"]
+    assert sec["id"] == "sec_arch"
+    assert sec["title"] == "Architecture"
+    assert sec["parent_section_id"] is None
+    assert sec["cell_range"] == []
+    assert sec["status"] == "open"
+    assert sec["collapsed"] is False
+
+
+def test_create_section_rejects_parent_section_id() -> None:
+    """§5 — non-null ``parent_section_id`` → K90 (decision D3: flat-only)."""
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "create_section",
+         "section_id": "sec_nested",
+         "title": "Nested",
+         "parent_section_id": "sec_outer"},
+    ], intent_id="i-nested")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "nested_sections_forbidden"
+
+
+def test_create_section_rejects_duplicate_id() -> None:
+    """§5 — creating an already-existing section_id → K90."""
+    writer = _new_writer()
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_dup", "title": "First"},
+    ], intent_id="i-first")
+    result = _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_dup", "title": "Second"},
+    ], intent_id="i-second")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "duplicate_section_id"
+
+
+def test_create_section_preserves_explicit_status_and_collapsed() -> None:
+    """Operator-supplied status / collapsed flags persist verbatim.
+    (Status state machine is Phase 1b; persistence is Phase 1a.)"""
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "create_section",
+         "section_id": "sec_done",
+         "title": "Wrapped Up",
+         "status": "complete",
+         "collapsed": True},
+    ], intent_id="i-done")
+    assert result["applied"] is True, result
+    sec = writer.snapshot()["zone"]["sections"]["sec_done"]
+    assert sec["status"] == "complete"
+    assert sec["collapsed"] is True
+
+
+def test_rename_section_changes_title_keeps_id() -> None:
+    """§5 — rename mutates title only; id remains stable per atom."""
+    writer = _new_writer()
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_r", "title": "Old"},
+    ], intent_id="i-create")
+    result = _apply_commit(writer, [
+        {"kind": "rename_section", "section_id": "sec_r", "title": "New"},
+    ], intent_id="i-rename")
+    assert result["applied"] is True, result
+    sec = writer.snapshot()["zone"]["sections"]["sec_r"]
+    assert sec["id"] == "sec_r"
+    assert sec["title"] == "New"
+
+
+def test_rename_section_unknown_id_rejected() -> None:
+    """§5 — rename of a non-existent section → K90 unknown_section."""
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "rename_section",
+         "section_id": "sec_ghost", "title": "Phantom"},
+    ], intent_id="i-rename-ghost")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "unknown_section"
+
+
+def test_delete_section_happy_path_empty() -> None:
+    """§5 — delete an empty section; snapshot.sections no longer contains it."""
+    writer = _new_writer()
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_temp", "title": "Temp"},
+    ], intent_id="i-create")
+    result = _apply_commit(writer, [
+        {"kind": "delete_section", "section_id": "sec_temp"},
+    ], intent_id="i-delete")
+    assert result["applied"] is True, result
+    snap_sections = writer.snapshot().get("zone", {}).get("sections", {})
+    assert "sec_temp" not in snap_sections
+
+
+def test_delete_section_unknown_id_rejected() -> None:
+    """§5 — delete of an unknown section → K90 unknown_section."""
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "delete_section", "section_id": "sec_void"},
+    ], intent_id="i-delete-void")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "unknown_section"
+
+
+def test_move_cells_into_section_appends_to_cell_range() -> None:
+    """§5 — move_cells_into_section bulk-appends; dual-rep cells.section_id
+    and sections.cell_range[] agree."""
+    writer = _new_writer()
+    _seed_cell(writer, "c_a", kind="agent")
+    _seed_cell(writer, "c_b", kind="agent")
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_x", "title": "X"},
+    ], intent_id="i-create-x")
+    result = _apply_commit(writer, [
+        {"kind": "move_cells_into_section",
+         "target_section_id": "sec_x",
+         "cell_ids": ["c_a", "c_b"],
+         "position": 0},
+    ], intent_id="i-move-batch")
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    assert snap["zone"]["sections"]["sec_x"]["cell_range"] == ["c_a", "c_b"]
+    assert snap["cells"]["c_a"]["section_id"] == "sec_x"
+    assert snap["cells"]["c_b"]["section_id"] == "sec_x"
+
+
+def test_move_cells_into_section_empty_list_rejected() -> None:
+    """§5 — empty ``cell_ids`` list → K90 cell_ids_required."""
+    writer = _new_writer()
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_y", "title": "Y"},
+    ], intent_id="i-create-y")
+    result = _apply_commit(writer, [
+        {"kind": "move_cells_into_section",
+         "target_section_id": "sec_y", "cell_ids": [], "position": 0},
+    ], intent_id="i-move-empty")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "cell_ids_required"
+
+
+def test_set_section_status_not_yet_shipped() -> None:
+    """PLAN-S5.5 Phase 1b: ``set_section_status`` is queued; the
+    operation kind is not yet in OVERLAY_OPERATION_KINDS, so submitting
+    it surfaces an unknown-operation rejection. This test pins the
+    current state so a Phase 1b implementer knows where to wire."""
+    writer = _new_writer()
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_s", "title": "S"},
+    ], intent_id="i-create-s")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_s", "new_status": "in_progress"},
+    ], intent_id="i-status-not-yet")
+    # Phase 1b: this assertion flips to ``True`` when the op lands.
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+
+
 # ---------------------------------------------------------------------
 # Promote span.
 # ---------------------------------------------------------------------
