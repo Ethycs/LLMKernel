@@ -2358,6 +2358,192 @@ class MetadataWriter:
         """Return the workspace root path. PLAN-S5.0.2 §4.2 helper."""
         return self._workspace_root
 
+    # -- PLAN-S5.0.4 -- magic-emit privilege store --------------------
+
+    def grant_magic_emit_privilege(
+        self,
+        *,
+        agent_id: str,
+        zone_id: str,
+        scope: Dict[str, Any],
+    ) -> None:
+        """Grant an agent the ``emit_magic_cell`` MCP tool privilege.
+
+        PLAN-S5.0.4 §3.2 / certified-magic-emitter atom clause 1.
+        Records under ``metadata.rts.config.magic_emit_privileges[]``::
+
+            [{ agent_id, zone_id, granted_at, scope:
+               { magics: [name, ...] | "all" } }]
+
+        Idempotent on the ``(agent_id, zone_id)`` pair: re-granting the
+        same key updates the ``scope`` and ``granted_at`` in place
+        rather than appending a duplicate entry. The operator-action
+        intent ``grant_magic_emit_privilege`` flows here via the
+        overlay applier path so the grant lands in History mode like
+        any other operator-rooted mutation.
+
+        Raises ``ValueError`` on malformed input (empty id, bad scope
+        shape) so the wire-side validator can surface a typed error.
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("grant_magic_emit_privilege: agent_id required")
+        if not isinstance(zone_id, str) or not zone_id:
+            raise ValueError("grant_magic_emit_privilege: zone_id required")
+        if not isinstance(scope, dict):
+            raise ValueError(
+                "grant_magic_emit_privilege: scope must be a dict "
+                "{magics: [name, ...] | 'all'}"
+            )
+        magics = scope.get("magics")
+        if magics != "all":
+            if not isinstance(magics, list):
+                raise ValueError(
+                    "grant_magic_emit_privilege: scope.magics must be "
+                    "a list of name strings or the literal 'all'"
+                )
+            if not all(isinstance(n, str) and n for n in magics):
+                raise ValueError(
+                    "grant_magic_emit_privilege: scope.magics entries "
+                    "must be non-empty strings"
+                )
+        granted_at = datetime.now(tz=timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+        with self._lock:
+            entries = self._config.get("magic_emit_privileges")
+            if not isinstance(entries, list):
+                entries = []
+            # Idempotent: update an existing (agent_id, zone_id) record
+            # rather than appending a duplicate.
+            updated = False
+            for record in entries:
+                if not isinstance(record, dict):
+                    continue
+                if (record.get("agent_id") == agent_id
+                        and record.get("zone_id") == zone_id):
+                    record["granted_at"] = granted_at
+                    record["scope"] = (
+                        {"magics": list(magics)}
+                        if magics != "all"
+                        else {"magics": "all"}
+                    )
+                    updated = True
+                    break
+            if not updated:
+                entries.append({
+                    "agent_id": agent_id,
+                    "zone_id": zone_id,
+                    "granted_at": granted_at,
+                    "scope": (
+                        {"magics": list(magics)}
+                        if magics != "all"
+                        else {"magics": "all"}
+                    ),
+                })
+            self._config["magic_emit_privileges"] = entries
+            self._dirty = True
+
+    def revoke_magic_emit_privilege(
+        self,
+        *,
+        agent_id: str,
+        zone_id: str,
+    ) -> None:
+        """Remove a magic-emit privilege grant.
+
+        PLAN-S5.0.4 §3.2. Idempotent: removing a non-existent
+        ``(agent_id, zone_id)`` is a no-op (does not raise). The
+        operator may revoke a grant they never made (e.g. defensive
+        clean-up) without tripping an error path.
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("revoke_magic_emit_privilege: agent_id required")
+        if not isinstance(zone_id, str) or not zone_id:
+            raise ValueError("revoke_magic_emit_privilege: zone_id required")
+        with self._lock:
+            entries = self._config.get("magic_emit_privileges")
+            if not isinstance(entries, list):
+                return
+            remaining = [
+                r for r in entries
+                if not (
+                    isinstance(r, dict)
+                    and r.get("agent_id") == agent_id
+                    and r.get("zone_id") == zone_id
+                )
+            ]
+            if len(remaining) == len(entries):
+                return  # idempotent
+            if remaining:
+                self._config["magic_emit_privileges"] = remaining
+            else:
+                # Drop the empty list so the snapshot stays lean.
+                self._config.pop("magic_emit_privileges", None)
+            self._dirty = True
+
+    def get_magic_emit_privileges(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        zone_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the current privilege grants matching the filter.
+
+        PLAN-S5.0.4 §3.2. ``agent_id`` / ``zone_id`` are optional
+        filters; passing both yields at most one entry (the store is
+        idempotent on that pair). Returns a copy so callers can mutate
+        the result without racing the writer.
+        """
+        with self._lock:
+            entries = self._config.get("magic_emit_privileges")
+            if not isinstance(entries, list):
+                return []
+            out: List[Dict[str, Any]] = []
+            for record in entries:
+                if not isinstance(record, dict):
+                    continue
+                if agent_id is not None and record.get("agent_id") != agent_id:
+                    continue
+                if zone_id is not None and record.get("zone_id") != zone_id:
+                    continue
+                out.append(dict(record))
+            return out
+
+    def has_magic_emit_privilege(
+        self,
+        *,
+        agent_id: str,
+        zone_id: str,
+        magic_name: str,
+    ) -> bool:
+        """Return True iff the grant covers (agent_id, zone_id, magic_name).
+
+        PLAN-S5.0.4 §3.1 — the privilege check the ``emit_magic_cell``
+        tool handler performs before dispatching. Scope ``"all"``
+        matches every magic name; a name list matches if and only if
+        ``magic_name`` is in it. Missing inputs return False (defense-
+        in-depth -- the caller validates separately and the wire
+        validator would have already rejected).
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            return False
+        if not isinstance(zone_id, str) or not zone_id:
+            return False
+        if not isinstance(magic_name, str) or not magic_name:
+            return False
+        for record in self.get_magic_emit_privileges(
+            agent_id=agent_id, zone_id=zone_id,
+        ):
+            scope = record.get("scope")
+            if not isinstance(scope, dict):
+                continue
+            magics = scope.get("magics")
+            if magics == "all":
+                return True
+            if isinstance(magics, list) and magic_name in magics:
+                return True
+        return False
+
     def get_cell_record(self, cell_id: str) -> Optional[Dict[str, Any]]:
         """Return a shallow copy of ``cells[cell_id]`` (or None).
 
@@ -2415,18 +2601,25 @@ class MetadataWriter:
         after_cell_id: str,
         generated_by: str,
         generated_at: str,
+        promoted_from_stream: bool = False,
     ) -> None:
         """Persist a generator-emitted cell with provenance.
 
-        PLAN-S5.0.2 §3 / §6. Writes the canonical fields:
+        PLAN-S5.0.2 §3 / §6 + PLAN-S5.0.4 §3.6. Writes the canonical
+        fields:
 
         * ``cells[new_cell_id].text = text``
         * ``cells[new_cell_id].generated_by = generated_by``
         * ``cells[new_cell_id].generated_at = generated_at``
+        * ``cells[new_cell_id].promoted_from_stream = promoted_from_stream``
+          (only set when True, default omitted to keep the snapshot lean)
 
-        Validates: ``generated_by`` (when non-null) must reference a
-        known cell id; the ISO timestamp must parse. Marks the writer
-        dirty.
+        Validates: ``generated_by`` is required (K3J). It may reference
+        either a known cell id (generator-handler path) OR an
+        ``agent_id`` (PLAN-S5.0.4 privileged-emit / stream-promotion
+        path) -- the validator no longer requires the value be a
+        registered cell key. The ISO timestamp must parse. Marks the
+        writer dirty.
 
         Raises ``ValueError`` (mapped to K3J at the dispatch boundary)
         when ``generated_by`` is None / empty.
@@ -2444,15 +2637,12 @@ class MetadataWriter:
                 "insert_generated_cell: generated_at required"
             )
         with self._lock:
-            if generated_by not in self._cells:
-                raise ValueError(
-                    "insert_generated_cell: generated_by references "
-                    f"unknown cell {generated_by!r}"
-                )
             record = dict(self._cells.get(new_cell_id, {}))
             record["text"] = text
             record["generated_by"] = generated_by
             record["generated_at"] = generated_at
+            if promoted_from_stream:
+                record["promoted_from_stream"] = True
             self._cells[new_cell_id] = record
             if hasattr(self, "_cell_view_cache"):
                 self._cell_view_cache.pop(new_cell_id, None)

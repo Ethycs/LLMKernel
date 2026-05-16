@@ -56,6 +56,7 @@ __all__ = (
     "strip_hash_from_line",
     "strip_hashes_from_text",
     "escape_leading_at",
+    "emit_magic_line",
 )
 
 
@@ -248,6 +249,52 @@ def strip_hashes_from_text(text: str, known_names: Iterable[str]) -> str:
     # drops it; the agent-visible-surface callers prefer round-trip).
     suffix = "\n" if text.endswith("\n") else ""
     return "\n".join(stripped) + suffix
+
+
+def emit_magic_line(
+    name: str,
+    args: str,
+    *,
+    hash_enabled: bool,
+    pin: Optional[str] = None,
+    sigil: str = "@@",
+    length: int = 8,
+) -> str:
+    """Compose a canonical magic-line for a certified emitter.
+
+    PLAN-S5.0.4 §3.1 helper. Returns:
+
+    * Plain form ``"@@<name> <args>"`` (or ``"@<name> <args>"`` for
+      line magics when ``sigil="@"``) when ``hash_enabled`` is False
+      OR ``pin`` is None.
+    * Hashed form ``"@@<HMAC(pin, name)>:<name> <args>"`` when
+      ``hash_enabled`` is True AND ``pin`` is a non-empty string.
+
+    Used by certified emitters (Cell Manager primitives,
+    ``emit_magic_cell`` MCP tool, generator handlers via
+    ``_with_optional_hmac``) so the hash-mode awareness lives in
+    exactly one place. ``args`` is appended verbatim with a single
+    leading space when non-empty; when empty/None the line carries
+    just the name.
+
+    The standard's clause 3 (hash-mode-aware) is satisfied by routing
+    every emission through this helper -- callers never hand-build
+    ``"@@<name>"`` strings.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"emit_magic_line: name must be a non-empty str; got {name!r}")
+    if sigil not in ("@@", "@"):
+        raise ValueError(f"emit_magic_line: sigil must be '@@' or '@'; got {sigil!r}")
+    args_part = ""
+    if args is not None:
+        if not isinstance(args, str):
+            raise TypeError(f"emit_magic_line: args must be a str or None; got {type(args).__name__}")
+        if args:
+            args_part = f" {args}" if not args.startswith(" ") else args
+    if hash_enabled and isinstance(pin, str) and pin:
+        h = magic_hash(pin, name, length=length)
+        return f"{sigil}{h}:{name}{args_part}"
+    return f"{sigil}{name}{args_part}"
 
 
 def escape_leading_at(line: str) -> str:

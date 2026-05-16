@@ -106,13 +106,22 @@ def test_insert_without_generated_at_raises_K3J(writer, cell_manager) -> None:
     assert exc.value.k_code == K3J_GENERATOR_PROVENANCE_MISSING
 
 
-def test_writer_rejects_unknown_generated_by(writer) -> None:
-    """Writer-level validation rejects generated_by referencing unknown cell."""
-    with pytest.raises(ValueError) as exc:
-        writer.insert_generated_cell(
-            "c_new", "@@scratch x",
-            after_cell_id="c_gen",
-            generated_by="c_does_not_exist",
-            generated_at="2025-01-01T00:00:00Z",
-        )
-    assert "unknown cell" in str(exc.value)
+def test_writer_accepts_agent_id_for_generated_by(writer) -> None:
+    """PLAN-S5.0.4 §3.6 extends generated_by to accept agent_id values.
+
+    Pre-S5.0.4 the writer required ``generated_by`` to reference a
+    known cell id (the operator-rooted generator-handler path).
+    PLAN-S5.0.4 ratifies the privileged-emit / stream-promotion
+    paths whose ``generated_by`` is an ``agent_id`` that is NOT in
+    ``cells[]``. The writer trusts the dispatcher boundary's privilege
+    validation; only empty/None still raises K3J.
+    """
+    writer.insert_generated_cell(
+        "c_new", "@@scratch x",
+        after_cell_id="c_gen",
+        generated_by="agent_id_not_in_cells",
+        generated_at="2025-01-01T00:00:00Z",
+    )
+    record = writer.get_cell_record("c_new")
+    assert record is not None
+    assert record["generated_by"] == "agent_id_not_in_cells"

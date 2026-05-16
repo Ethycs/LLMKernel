@@ -596,6 +596,8 @@ class CellManager:
         magic_texts: List[str],
         generated_by: str,
         generated_at: str,
+        *,
+        promoted_from_stream: bool = False,
     ) -> List[str]:
         """Insert each fragment as a new cell after ``after_cell_id``.
 
@@ -679,6 +681,7 @@ class CellManager:
                 after_cell_id=after_cell_id,
                 generated_by=generated_by,
                 generated_at=generated_at,
+                promoted_from_stream=promoted_from_stream,
             )
             new_ids.append(new_id)
         # Update layout tree to position new cells after the generator
