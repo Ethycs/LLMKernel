@@ -1066,6 +1066,106 @@ def _replace_dict_in_place(target: Dict[str, Any], source: Dict[str, Any]) -> No
     target.update(source)
 
 
+def _assert_dual_representation_consistent(work_state: Dict[str, Any]) -> None:
+    """Enforce ``cells.section_id`` ↔ ``sections.cell_range[]`` agreement.
+
+    PLAN-S5.5 §3 step 4. Called by :func:`apply_commit` after every op
+    in a commit has applied; raises :class:`OverlayRejected` with code
+    K90 / reason ``section_membership_mismatch`` if the two views
+    disagree. The error details include the offending ids so an
+    operator UI can show the operator exactly which cell and section
+    are inconsistent.
+
+    Three kinds of mismatch detected:
+
+    1. ``cell.section_id`` references a section that doesn't exist.
+    2. ``cell.section_id`` references a section, but the cell isn't in
+       that section's ``cell_range``.
+    3. A ``section.cell_range[]`` entry references a cell whose
+       ``cell.section_id`` doesn't match (or the cell doesn't exist).
+    """
+    cells = work_state.get("cells") or {}
+    sections = work_state.get("sections") or {}
+    if not isinstance(cells, dict) or not isinstance(sections, dict):
+        return
+
+    # Pass 1: walk cells -> sections direction.
+    for cell_id, record in cells.items():
+        if not isinstance(record, dict):
+            continue
+        sec_id = record.get("section_id")
+        if sec_id is None:
+            continue
+        if not isinstance(sec_id, str):
+            raise OverlayRejected(
+                "K90",
+                f"section_membership_mismatch: cell {cell_id!r} has "
+                f"non-string section_id {sec_id!r}",
+                details={"reason": "section_membership_mismatch",
+                         "cell_id": cell_id, "section_id": sec_id,
+                         "direction": "cell_to_section"},
+            )
+        section = sections.get(sec_id)
+        if not isinstance(section, dict):
+            raise OverlayRejected(
+                "K90",
+                f"section_membership_mismatch: cell {cell_id!r} "
+                f"references unknown section {sec_id!r}",
+                details={"reason": "section_membership_mismatch",
+                         "cell_id": cell_id, "section_id": sec_id,
+                         "direction": "cell_references_unknown_section"},
+            )
+        cell_range = section.get("cell_range") or []
+        if not isinstance(cell_range, list) or cell_id not in cell_range:
+            raise OverlayRejected(
+                "K90",
+                f"section_membership_mismatch: cell {cell_id!r} has "
+                f"section_id={sec_id!r} but is not in that section's "
+                f"cell_range",
+                details={"reason": "section_membership_mismatch",
+                         "cell_id": cell_id, "section_id": sec_id,
+                         "direction": "cell_to_section"},
+            )
+
+    # Pass 2: walk sections -> cells direction.
+    for sec_id, section in sections.items():
+        if not isinstance(section, dict):
+            continue
+        cell_range = section.get("cell_range") or []
+        if not isinstance(cell_range, list):
+            continue
+        for cell_id in cell_range:
+            if not isinstance(cell_id, str):
+                raise OverlayRejected(
+                    "K90",
+                    f"section_membership_mismatch: section {sec_id!r} "
+                    f"cell_range contains non-string entry {cell_id!r}",
+                    details={"reason": "section_membership_mismatch",
+                             "section_id": sec_id, "cell_id": cell_id,
+                             "direction": "section_range_invalid"},
+                )
+            record = cells.get(cell_id)
+            if not isinstance(record, dict):
+                raise OverlayRejected(
+                    "K90",
+                    f"section_membership_mismatch: section {sec_id!r} "
+                    f"cell_range references unknown cell {cell_id!r}",
+                    details={"reason": "section_membership_mismatch",
+                             "section_id": sec_id, "cell_id": cell_id,
+                             "direction": "section_references_unknown_cell"},
+                )
+            if record.get("section_id") != sec_id:
+                raise OverlayRejected(
+                    "K90",
+                    f"section_membership_mismatch: section {sec_id!r} "
+                    f"claims cell {cell_id!r} but cell.section_id="
+                    f"{record.get('section_id')!r}",
+                    details={"reason": "section_membership_mismatch",
+                             "section_id": sec_id, "cell_id": cell_id,
+                             "direction": "section_to_cell"},
+                )
+
+
 def apply_commit(
     state: Dict[str, Any],
     operations: List[Dict[str, Any]],
@@ -1116,6 +1216,14 @@ def apply_commit(
     # touching live state (the work copies are dropped on the floor).
     for idx, op in enumerate(operations):
         dispatch_operation(work_state, op, idx)
+
+    # PLAN-S5.5 §3 step 4 — dual-representation invariant. After every
+    # op in the commit applies, ``cells[<id>].section_id`` and
+    # ``sections[<id>].cell_range[]`` MUST agree. Catches any op (or
+    # composition of ops) that mutates one side without the other.
+    # Atomic: a failure here drops the entire commit, leaving live
+    # state byte-identical to its pre-call shape.
+    _assert_dual_representation_consistent(work_state)
 
     # Mint commit + advance HEAD on the WORK overlay before swap-back.
     # ``ensure_overlay_state`` operates on a parent dict whose

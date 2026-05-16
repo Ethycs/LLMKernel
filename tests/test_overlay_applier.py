@@ -699,6 +699,96 @@ def test_set_section_status_invalid_status_rejected_K90() -> None:
     assert result["response"]["details"]["reason"] == "invalid_status"
 
 
+# PLAN-S5.5 Phase 1c — dual-representation invariant.
+# ``cells[<id>].section_id`` and ``sections[<id>].cell_range[]`` MUST
+# agree at the end of every apply_commit. The check is atomic: a
+# violation drops the entire commit so live state stays consistent.
+
+
+def test_dual_rep_invariant_holds_after_move_cells() -> None:
+    """The move_cells_into_section op produces dual-rep-consistent state;
+    the invariant check is silent on the happy path."""
+    writer = _new_writer()
+    _seed_cell(writer, "c_a", kind="agent")
+    _seed_cell(writer, "c_b", kind="agent")
+    result = _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_dr", "title": "DR"},
+        {"kind": "move_cells_into_section",
+         "target_section_id": "sec_dr",
+         "cell_ids": ["c_a", "c_b"],
+         "position": 0},
+    ], intent_id="i-dr-ok")
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    # Both sides agree.
+    assert snap["zone"]["sections"]["sec_dr"]["cell_range"] == ["c_a", "c_b"]
+    assert snap["cells"]["c_a"]["section_id"] == "sec_dr"
+    assert snap["cells"]["c_b"]["section_id"] == "sec_dr"
+
+
+def test_dual_rep_invariant_rejects_orphan_section_id() -> None:
+    """Setting a cell's ``section_id`` to a section that doesn't exist
+    fires section_membership_mismatch K90; commit dropped atomically."""
+    writer = _new_writer()
+    _seed_cell(writer, "c_orph", kind="agent")
+    result = _apply_commit(writer, [
+        # set_cell_metadata can stamp section_id without going through
+        # the proper move_cell path; the post-commit invariant catches it.
+        {"kind": "set_cell_metadata",
+         "cell_id": "c_orph", "section_id": "sec_ghost"},
+    ], intent_id="i-orph")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "section_membership_mismatch"
+    # Atomic rollback: cell.section_id is still null on the live writer.
+    snap = writer.snapshot()
+    rec = snap["cells"]["c_orph"]
+    assert rec.get("section_id") in (None, "")
+
+
+def test_dual_rep_invariant_rejects_section_id_without_range_membership() -> None:
+    """Cell has section_id but isn't in that section's cell_range →
+    section_membership_mismatch K90."""
+    writer = _new_writer()
+    _seed_cell(writer, "c_mis", kind="agent")
+    result = _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_mis", "title": "Mis"},
+        # Stamp section_id without adding to cell_range.
+        {"kind": "set_cell_metadata",
+         "cell_id": "c_mis", "section_id": "sec_mis"},
+    ], intent_id="i-mis")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "section_membership_mismatch"
+
+
+def test_dual_rep_invariant_atomic_rollback_preserves_pre_state() -> None:
+    """A commit that fails the invariant leaves live state untouched —
+    not even the operations that succeeded before the invariant check."""
+    writer = _new_writer()
+    _seed_cell(writer, "c_atomic", kind="agent")
+    # Create a known-good section first; the post-commit live state
+    # for this section will be empty.
+    _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_keep", "title": "Keep"},
+    ], intent_id="i-keep")
+    # Now a commit that creates a NEW section AND stamps an orphan
+    # section_id. The orphan fails the invariant; both ops should
+    # roll back atomically. Verify the new section never persisted.
+    pre_sections = set(writer.snapshot().get("zone", {}).get("sections", {}).keys())
+    result = _apply_commit(writer, [
+        {"kind": "create_section", "section_id": "sec_new", "title": "New"},
+        {"kind": "set_cell_metadata",
+         "cell_id": "c_atomic", "section_id": "sec_doesnt_exist"},
+    ], intent_id="i-atomic-fail")
+    assert result["applied"] is False
+    post_sections = set(writer.snapshot().get("zone", {}).get("sections", {}).keys())
+    # ``sec_new`` was created in the same failing commit; it MUST NOT
+    # be present in the live snapshot.
+    assert "sec_new" not in post_sections
+    assert pre_sections == post_sections
+
+
 # ---------------------------------------------------------------------
 # Promote span.
 # ---------------------------------------------------------------------
