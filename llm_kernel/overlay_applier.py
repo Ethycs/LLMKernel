@@ -81,6 +81,7 @@ OVERLAY_OPERATION_KINDS: FrozenSet[str] = frozenset({
     "delete_section",
     "rename_section",
     "move_cells_into_section",
+    "set_section_status",
     # Promote / checkpoint.
     "promote_span",
     "checkpoint_section",
@@ -758,6 +759,101 @@ def _validate_promote_span(state: Dict[str, Any], params: Dict[str, Any]) -> Non
                 cr.append(new_cell_id)
 
 
+# PLAN-S5.5 Phase 1b — section status state machine.
+#
+# Allowed transitions (per PLAN-S5.5 §3 step 3 and
+# decisions/v1-section-status-interruptibility):
+#
+#   open ↔ in_progress       (kernel-driven via RunFrame OR operator)
+#   open ↔ complete          (operator only; free transition)
+#   * → frozen               (operator only; freezes the section)
+#   frozen → open            (operator only; explicit unfreeze)
+#
+# Everything else is K95 ``overlay_blocked_by_execution``. In
+# particular: ``frozen → in_progress`` and ``frozen → complete``
+# require unfreeze first; ``complete ↔ in_progress`` is not a
+# permitted direct transition (operator should explicitly reopen).
+# Same-status writes are no-ops (returned as success).
+_SECTION_STATUSES: FrozenSet[str] = frozenset(
+    {"open", "in_progress", "complete", "frozen"}
+)
+_ALLOWED_SECTION_TRANSITIONS: FrozenSet[tuple[str, str]] = frozenset({
+    ("open", "in_progress"),
+    ("open", "complete"),
+    ("open", "frozen"),
+    ("in_progress", "open"),
+    ("in_progress", "frozen"),
+    ("complete", "open"),
+    ("complete", "frozen"),
+    ("frozen", "open"),
+})
+
+
+def _validate_set_section_status(
+    state: Dict[str, Any], params: Dict[str, Any],
+) -> None:
+    """``set_section_status`` operation — PLAN-S5.5 Phase 1b.
+
+    Mutates ``sections[<id>].status`` if the (current, new) transition
+    is in :data:`_ALLOWED_SECTION_TRANSITIONS`. Same-status writes
+    succeed silently as a no-op.
+
+    Rejections:
+
+    * Unknown ``section_id`` → K90 ``unknown_section``.
+    * ``new_status`` not in the 4-value enum → K90 ``invalid_status``.
+    * Forbidden transition (e.g. ``frozen → in_progress``) → K95
+      ``forbidden_section_transition`` (subclassed as
+      ``overlay_blocked_by_execution`` per the K95 marker).
+    """
+    section_id = _require_str(params, "section_id", "set_section_status")
+    new_status = _require_str(params, "new_status", "set_section_status")
+    if new_status not in _SECTION_STATUSES:
+        raise OverlayRejected(
+            "K90",
+            f"set_section_status: invalid status {new_status!r} "
+            f"(must be one of {sorted(_SECTION_STATUSES)})",
+            details={"reason": "invalid_status",
+                     "section_id": section_id,
+                     "new_status": new_status},
+        )
+    sections = state.get("sections") or {}
+    if not isinstance(sections, dict) or section_id not in sections:
+        raise OverlayRejected(
+            "K90",
+            f"set_section_status: unknown_section {section_id!r}",
+            details={"reason": "unknown_section",
+                     "section_id": section_id},
+        )
+    sec = sections[section_id]
+    if not isinstance(sec, dict):
+        raise OverlayRejected(
+            "K90",
+            f"set_section_status: section record malformed {section_id!r}",
+            details={"reason": "section_record_malformed",
+                     "section_id": section_id},
+        )
+    current_status = sec.get("status", "open")
+    if not isinstance(current_status, str) or current_status not in _SECTION_STATUSES:
+        # Defensive: an unrecognised legacy status; treat as ``open``
+        # for transition purposes so the operator can recover.
+        current_status = "open"
+    if current_status == new_status:
+        # Same-status write is a no-op success.
+        return
+    if (current_status, new_status) not in _ALLOWED_SECTION_TRANSITIONS:
+        raise OverlayRejected(
+            "K95",
+            f"set_section_status: forbidden transition "
+            f"{current_status!r} → {new_status!r}",
+            details={"reason": "forbidden_section_transition",
+                     "section_id": section_id,
+                     "from_status": current_status,
+                     "to_status": new_status},
+        )
+    sec["status"] = new_status
+
+
 def _validate_checkpoint_section(
     state: Dict[str, Any], params: Dict[str, Any],
 ) -> None:
@@ -905,6 +1001,7 @@ _OPERATION_DISPATCH: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], None]]
     "delete_section":     _validate_delete_section,
     "rename_section":     _validate_rename_section,
     "move_cells_into_section": _validate_move_cells_into_section,
+    "set_section_status": _validate_set_section_status,
     "promote_span":       _validate_promote_span,
     "checkpoint_section": _validate_checkpoint_section,
 }

@@ -536,22 +536,167 @@ def test_move_cells_into_section_empty_list_rejected() -> None:
     assert result["response"]["details"]["reason"] == "cell_ids_required"
 
 
-def test_set_section_status_not_yet_shipped() -> None:
-    """PLAN-S5.5 Phase 1b: ``set_section_status`` is queued; the
-    operation kind is not yet in OVERLAY_OPERATION_KINDS, so submitting
-    it surfaces an unknown-operation rejection. This test pins the
-    current state so a Phase 1b implementer knows where to wire."""
-    writer = _new_writer()
+# PLAN-S5.5 Phase 1b — set_section_status state machine.
+# Allowed transitions per decisions/v1-section-status-interruptibility:
+#   open ↔ in_progress, open ↔ complete, * → frozen, frozen → open.
+# Same-status writes are no-op successes.
+
+
+def _create_section_with_status(writer, section_id, *, status="open",
+                                intent_id="i-mk"):
+    """Create a section, then move it to ``status`` via the state machine.
+
+    We can't seed status directly through create_section + transition
+    when the target is ``frozen`` (the create allows operator-supplied
+    status, but the test contract is "use the state machine"). Use
+    intermediate transitions where required.
+    """
     _apply_commit(writer, [
-        {"kind": "create_section", "section_id": "sec_s", "title": "S"},
-    ], intent_id="i-create-s")
+        {"kind": "create_section", "section_id": section_id, "title": section_id,
+         "status": "open"},
+    ], intent_id=intent_id)
+    if status != "open":
+        # Drive there via an allowed path. All non-open statuses are
+        # reachable in one hop from open.
+        result = _apply_commit(writer, [
+            {"kind": "set_section_status",
+             "section_id": section_id, "new_status": status},
+        ], intent_id=f"{intent_id}-to-{status}")
+        assert result["applied"] is True, result
+
+
+def test_set_section_status_open_to_in_progress_happy() -> None:
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_t", intent_id="i-t")
     result = _apply_commit(writer, [
         {"kind": "set_section_status",
-         "section_id": "sec_s", "new_status": "in_progress"},
-    ], intent_id="i-status-not-yet")
-    # Phase 1b: this assertion flips to ``True`` when the op lands.
+         "section_id": "sec_t", "new_status": "in_progress"},
+    ], intent_id="i-t-go")
+    assert result["applied"] is True, result
+    sec = writer.snapshot()["zone"]["sections"]["sec_t"]
+    assert sec["status"] == "in_progress"
+
+
+def test_set_section_status_open_to_complete_happy() -> None:
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_done", intent_id="i-done")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_done", "new_status": "complete"},
+    ], intent_id="i-done-go")
+    assert result["applied"] is True, result
+    assert writer.snapshot()["zone"]["sections"]["sec_done"]["status"] == "complete"
+
+
+def test_set_section_status_any_to_frozen_allowed() -> None:
+    """``* → frozen`` is operator-only but allowed from any non-frozen status."""
+    for via in ("open", "in_progress", "complete"):
+        writer = _new_writer()
+        _create_section_with_status(writer, "sec_f", status=via, intent_id=f"i-{via}")
+        result = _apply_commit(writer, [
+            {"kind": "set_section_status",
+             "section_id": "sec_f", "new_status": "frozen"},
+        ], intent_id=f"i-freeze-from-{via}")
+        assert result["applied"] is True, (via, result)
+        assert writer.snapshot()["zone"]["sections"]["sec_f"]["status"] == "frozen"
+
+
+def test_set_section_status_frozen_to_open_unfreezes() -> None:
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_u", status="frozen", intent_id="i-u")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_u", "new_status": "open"},
+    ], intent_id="i-u-unfreeze")
+    assert result["applied"] is True, result
+    assert writer.snapshot()["zone"]["sections"]["sec_u"]["status"] == "open"
+
+
+def test_set_section_status_frozen_to_in_progress_rejected_K95() -> None:
+    """frozen → in_progress must go via open (explicit unfreeze first)."""
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_fb", status="frozen", intent_id="i-fb")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_fb", "new_status": "in_progress"},
+    ], intent_id="i-fb-bad")
+    assert result["applied"] is False
+    assert result["error_code"] == "K95"
+    assert result["response"]["details"]["reason"] == "forbidden_section_transition"
+
+
+def test_set_section_status_frozen_to_complete_rejected_K95() -> None:
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_fc", status="frozen", intent_id="i-fc")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_fc", "new_status": "complete"},
+    ], intent_id="i-fc-bad")
+    assert result["applied"] is False
+    assert result["error_code"] == "K95"
+    assert result["response"]["details"]["reason"] == "forbidden_section_transition"
+
+
+def test_set_section_status_in_progress_to_complete_rejected_K95() -> None:
+    """in_progress → complete is NOT a direct transition; must go via open."""
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_ic", status="in_progress",
+                                intent_id="i-ic")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_ic", "new_status": "complete"},
+    ], intent_id="i-ic-bad")
+    assert result["applied"] is False
+    assert result["error_code"] == "K95"
+
+
+def test_set_section_status_complete_to_in_progress_rejected_K95() -> None:
+    """complete → in_progress is NOT direct; operator must explicitly
+    reopen first."""
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_ci", status="complete",
+                                intent_id="i-ci")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_ci", "new_status": "in_progress"},
+    ], intent_id="i-ci-bad")
+    assert result["applied"] is False
+    assert result["error_code"] == "K95"
+
+
+def test_set_section_status_same_status_is_noop_success() -> None:
+    """Setting status to the current value succeeds without mutation."""
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_n", intent_id="i-n")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_n", "new_status": "open"},
+    ], intent_id="i-n-noop")
+    assert result["applied"] is True, result
+    assert writer.snapshot()["zone"]["sections"]["sec_n"]["status"] == "open"
+
+
+def test_set_section_status_unknown_section_rejected_K90() -> None:
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_void", "new_status": "complete"},
+    ], intent_id="i-void")
     assert result["applied"] is False
     assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "unknown_section"
+
+
+def test_set_section_status_invalid_status_rejected_K90() -> None:
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_b", intent_id="i-b")
+    result = _apply_commit(writer, [
+        {"kind": "set_section_status",
+         "section_id": "sec_b", "new_status": "bogus"},
+    ], intent_id="i-b-bad")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "invalid_status"
 
 
 # ---------------------------------------------------------------------
