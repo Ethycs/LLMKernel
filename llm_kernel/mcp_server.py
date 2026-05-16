@@ -866,6 +866,149 @@ class OperatorBridgeServer:
                         logger.exception("failed to mark span dismissed")
             return
 
+        if action_type == "grant_magic_emit_privilege":
+            # PLAN-S5.0.4 §3.2 — operator-action: record a magic-emit
+            # privilege grant under ``metadata.rts.config.magic_emit_privileges[]``.
+            from . import _diagnostics
+            agent_id = params.get("agent_id")
+            grant_zone_id = params.get("zone_id") or self.zone_id
+            scope = params.get("scope") or {"magics": "all"}
+            writer = self._resolve_metadata_writer()
+            if writer is None:
+                logger.warning(
+                    "grant_magic_emit_privilege: no MetadataWriter attached "
+                    "(agent_id=%s)", agent_id,
+                )
+                _diagnostics.mark(
+                    "grant_magic_emit_privilege_no_writer", agent_id=agent_id,
+                )
+                return
+            grant_fn = getattr(writer, "grant_magic_emit_privilege", None)
+            if not callable(grant_fn):
+                logger.warning(
+                    "grant_magic_emit_privilege: writer does not implement "
+                    "grant_magic_emit_privilege",
+                )
+                return
+            try:
+                grant_fn(
+                    agent_id=agent_id, zone_id=grant_zone_id, scope=scope,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "grant_magic_emit_privilege: rejected (agent_id=%s): %s",
+                    agent_id, exc,
+                )
+                _diagnostics.mark(
+                    "grant_magic_emit_privilege_rejected",
+                    agent_id=agent_id, error=str(exc),
+                )
+                return
+            logger.info(
+                "operator.grant_magic_emit_privilege",
+                extra={
+                    "event.name": "operator.grant_magic_emit_privilege",
+                    "rfc": "PLAN-S5.0.4",
+                    "llmnb.privileged_agent_id": agent_id,
+                    "llmnb.zone_id": grant_zone_id,
+                    "llmnb.scope": scope,
+                },
+            )
+            _diagnostics.mark(
+                "grant_magic_emit_privilege_recorded",
+                agent_id=agent_id, zone_id=grant_zone_id,
+            )
+            return
+
+        if action_type == "revoke_magic_emit_privilege":
+            # PLAN-S5.0.4 §3.2 — operator-action: remove a magic-emit
+            # privilege grant. Idempotent on missing entries.
+            from . import _diagnostics
+            agent_id = params.get("agent_id")
+            revoke_zone_id = params.get("zone_id") or self.zone_id
+            writer = self._resolve_metadata_writer()
+            if writer is None:
+                logger.warning(
+                    "revoke_magic_emit_privilege: no MetadataWriter attached "
+                    "(agent_id=%s)", agent_id,
+                )
+                return
+            revoke_fn = getattr(writer, "revoke_magic_emit_privilege", None)
+            if not callable(revoke_fn):
+                logger.warning(
+                    "revoke_magic_emit_privilege: writer does not implement "
+                    "revoke_magic_emit_privilege",
+                )
+                return
+            try:
+                revoke_fn(agent_id=agent_id, zone_id=revoke_zone_id)
+            except ValueError as exc:
+                logger.warning(
+                    "revoke_magic_emit_privilege: rejected (agent_id=%s): %s",
+                    agent_id, exc,
+                )
+                return
+            logger.info(
+                "operator.revoke_magic_emit_privilege",
+                extra={
+                    "event.name": "operator.revoke_magic_emit_privilege",
+                    "rfc": "PLAN-S5.0.4",
+                    "llmnb.privileged_agent_id": agent_id,
+                    "llmnb.zone_id": revoke_zone_id,
+                },
+            )
+            _diagnostics.mark(
+                "revoke_magic_emit_privilege_recorded",
+                agent_id=agent_id, zone_id=revoke_zone_id,
+            )
+            return
+
+        if action_type == "promote_stream_magic":
+            # PLAN-S5.0.4 §3.3 — operator-action: synthesize an
+            # ``emit_magic_cell`` call from a one-click chip on a
+            # contaminated cell. The privileged source agent is
+            # recovered from the source cell's bound_agent_id.
+            from . import _diagnostics
+            from .intent_handlers import promote_stream_magic as _psm
+            cell_id = params.get("cell_id")
+            writer = self._resolve_metadata_writer()
+            cell_manager = self._resolve_cell_manager()
+            if writer is None or cell_manager is None:
+                logger.warning(
+                    "promote_stream_magic: writer/cell_manager unavailable "
+                    "(cell_id=%s)", cell_id,
+                )
+                _diagnostics.mark(
+                    "promote_stream_magic_no_writer_or_cm",
+                    cell_id=cell_id,
+                )
+                return
+            result = _psm.handle_promote_stream_magic(
+                params=params,
+                writer=writer,
+                cell_manager=cell_manager,
+                zone_id=self.zone_id,
+            )
+            if result is None:
+                _diagnostics.mark(
+                    "promote_stream_magic_refused", cell_id=cell_id,
+                )
+                return
+            logger.info(
+                "operator.promote_stream_magic",
+                extra={
+                    "event.name": "operator.promote_stream_magic",
+                    "rfc": "PLAN-S5.0.4",
+                    "llmnb.source_cell_id": cell_id,
+                    "llmnb.new_cell_id": result.get("cell_id"),
+                },
+            )
+            _diagnostics.mark(
+                "promote_stream_magic_dispatched",
+                source_cell_id=cell_id, new_cell_id=result.get("cell_id"),
+            )
+            return
+
         if action_type == "drift_acknowledged":
             field_path = params.get("field_path")
             detected_at = params.get("detected_at")
@@ -911,6 +1054,43 @@ class OperatorBridgeServer:
             "operator.action: unknown action_type %r; ignoring (forward-compat)",
             action_type,
         )
+
+    def _resolve_cell_manager(self) -> Optional[Any]:
+        """Locate the kernel's CellManager.
+
+        PLAN-S5.0.4 §3.3 helper. Probes the same surfaces as
+        :meth:`_resolve_metadata_writer`: a direct attribute on this
+        server, the kernel's ``_llmnb_cell_manager`` slot, or the
+        IPython shell's ``__llmnb_cell_manager__`` user_ns sentinel.
+        Returns ``None`` when none of the above resolve. Falls back
+        to constructing a fresh :class:`CellManager` on top of the
+        resolved writer when only the writer is wired -- the manager
+        is a thin facade so this is cheap.
+        """
+        direct = getattr(self, "cell_manager", None)
+        if direct is not None:
+            return direct
+        kernel = self.kernel
+        if kernel is not None:
+            attached = getattr(kernel, "_llmnb_cell_manager", None)
+            if attached is not None:
+                return attached
+            shell = getattr(kernel, "shell", None)
+            if shell is not None:
+                user_ns = getattr(shell, "user_ns", None)
+                if isinstance(user_ns, dict):
+                    found = user_ns.get("__llmnb_cell_manager__")
+                    if found is not None:
+                        return found
+        # Fallback: construct one on the resolved writer.
+        writer = self._resolve_metadata_writer()
+        if writer is None:
+            return None
+        try:
+            from .cell_manager import CellManager
+            return CellManager(writer)
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _resolve_metadata_writer(self) -> Optional[Any]:
         """Locate the kernel's MetadataWriter via the documented surfaces.

@@ -68,6 +68,11 @@ _RESTART_WINDOW_MAX: int = 3
 K35_PLAIN_MAGIC_IN_HASH_MODE: str = "K35"
 K36_HASHED_MAGIC_EMISSION_BLOCKED: str = "K36"
 K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED: str = "K3H"
+#: PLAN-S5.0.4 §3.5 -- informational marker emitted when a privileged
+#: agent's stream contains a magic-shaped line. The line is still
+#: sanitized per Layer-2 emission ban; K3L triggers the operator-facing
+#: promotion chip on the contaminated cell.
+K3L_PRIVILEGED_AGENT_STREAM_MAGIC: str = "K3L"
 
 AgentState = str  # starting | running | restarting | failed | terminated
 
@@ -2528,6 +2533,23 @@ class AgentSupervisor:
                     ),
                     line=line,
                 )
+            # PLAN-S5.0.4 §3.5 — when the source agent holds an active
+            # magic-emit privilege grant covering the detected name,
+            # emit K3L (informational marker). The line is still
+            # sanitized per Layer-2; K3L triggers the operator-facing
+            # promotion chip without widening the threat model.
+            if self._privileged_for_magic(
+                handle, emitted_name,
+            ):
+                self._emit_drift_marker(
+                    handle.agent_id,
+                    code=K3L_PRIVILEGED_AGENT_STREAM_MAGIC,
+                    reason=(
+                        f"privileged agent stream-emitted "
+                        f"@@{emitted_name}; promotion chip available"
+                    ),
+                    line=line,
+                )
 
         # Layer 2: hashed magic emission ban (hash-mode-only).
         if self._magic_hash_enabled() and looks_like_hashed_magic(line):
@@ -2555,6 +2577,33 @@ class AgentSupervisor:
             )
             return "ESCAPE_REQUIRED"
         return None
+
+    def _privileged_for_magic(
+        self, handle: "AgentHandle", magic_name: Optional[str],
+    ) -> bool:
+        """Return True iff ``handle``'s agent holds an active grant for ``magic_name``.
+
+        PLAN-S5.0.4 §3.5 — helper for the Layer-1 scan. Consults
+        ``MetadataWriter.has_magic_emit_privilege`` if available;
+        returns False when the writer isn't wired or the API is
+        absent (back-compat: no grant table -> no K3L).
+        """
+        if not isinstance(magic_name, str) or not magic_name:
+            return False
+        writer = self._metadata_writer
+        if writer is None:
+            return False
+        checker = getattr(writer, "has_magic_emit_privilege", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(
+                agent_id=handle.agent_id,
+                zone_id=handle.zone_id,
+                magic_name=magic_name,
+            ))
+        except Exception:  # pragma: no cover - defensive
+            return False
 
     def _magic_hash_enabled(self) -> bool:
         """Best-effort lookup of ``metadata.rts.config.magic_hash_enabled``.
