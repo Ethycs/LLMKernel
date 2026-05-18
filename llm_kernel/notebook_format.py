@@ -216,15 +216,28 @@ def magic_to_llmnb(
 
     cells_dict: dict[str, dict[str, Any]] = {}
     layout_children: list[dict[str, Any]] = []
+    # PLAN-S5.5 Phase 5 — section cells render as markdown-typed cells in
+    # the nbformat shape so VS Code's native markdown-header folding kicks
+    # in on the section range. The original ``@@section <title>`` magic
+    # text is preserved verbatim in ``rts.cells[<id>].text`` (canonical
+    # operator-edit form); the outer nbformat ``source`` field carries
+    # the synthesized ``# <title>`` heading for display + folding. The
+    # divergence is intentional: text-is-canonical for the kernel, source
+    # is the renderer view. ``display_sources`` is local to this function;
+    # it does NOT leak into the persisted ``rts.cells`` snapshot.
+    display_sources: dict[str, str] = {}
     for idx, text in enumerate(fragments):
         cell_id = f"cell-{idx}"
         try:
             parsed = parse_cell(text)
             kind = parsed.kind
-            bound_agent_id = parsed.args.get("agent_id") if isinstance(parsed.args, dict) else None
+            args = parsed.args if isinstance(parsed.args, dict) else {}
+            bound_agent_id = args.get("agent_id")
+            section_title = args.get("title") if kind == "section" else None
         except Exception:  # noqa: BLE001 — defensive; converter must not crash
             kind = "agent"
             bound_agent_id = None
+            section_title = None
         record: dict[str, Any] = {
             "text": text,
             "outputs": [],
@@ -234,6 +247,12 @@ def magic_to_llmnb(
             record["bound_agent_id"] = bound_agent_id
         cells_dict[cell_id] = record
         layout_children.append({"id": cell_id, "kind": "cell"})
+        if (
+            kind == "section"
+            and isinstance(section_title, str)
+            and section_title.strip()
+        ):
+            display_sources[cell_id] = f"# {section_title}"
 
     if base_metadata is not None and isinstance(base_metadata, dict):
         rts: dict[str, Any] = json.loads(json.dumps(base_metadata))  # deep copy
@@ -256,10 +275,20 @@ def magic_to_llmnb(
     return {
         "cells": [
             {
+                # PLAN-S5.5 Phase 5 — section cells with a parseable title
+                # render as markdown so VS Code's native fold kicks in.
+                # Section cells without a title (bare ``@@section``) stay
+                # code-typed so the operator sees the raw magic.
                 "cell_type": (
-                    "markdown" if cells_dict[cid].get("kind") == "markdown" else "code"
+                    "markdown"
+                    if cells_dict[cid].get("kind") == "markdown"
+                    or (
+                        cells_dict[cid].get("kind") == "section"
+                        and cid in display_sources
+                    )
+                    else "code"
                 ),
-                "source": cells_dict[cid]["text"],
+                "source": display_sources.get(cid, cells_dict[cid]["text"]),
                 "metadata": {"rts": {"cell": {"kind": cells_dict[cid]["kind"]}}},
                 "outputs": [],
                 "execution_count": None,

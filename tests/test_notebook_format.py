@@ -208,3 +208,95 @@ def test_llmnb_to_ipynb_then_back_round_trips_code_cells() -> None:
     assert len(back_cells) == 2
     assert "hello" in back_cells[0]["text"]
     assert "world" in back_cells[1]["text"]
+
+
+# ---------------------------------------------------------------------------
+# PLAN-S5.5 Phase 5 — section cells render as markdown headings so VS Code's
+# native markdown-header folding kicks in. The original ``@@section <title>``
+# magic text is preserved verbatim in ``rts.cells[<id>].text``; the outer
+# nbformat ``source`` field carries the synthesized ``# <title>`` heading.
+# ---------------------------------------------------------------------------
+
+
+def test_section_cell_emits_markdown_typed_with_heading_source() -> None:
+    llmnb = magic_to_llmnb("@@section Architecture\nnotes about arch\n")
+    outer_cells = llmnb["cells"]
+    assert len(outer_cells) == 1
+    assert outer_cells[0]["cell_type"] == "markdown"
+    assert outer_cells[0]["source"] == "# Architecture"
+    # Metadata still carries kind=section so the section-header
+    # decoration + Phase 2 commands recognize the cell.
+    assert outer_cells[0]["metadata"]["rts"]["cell"]["kind"] == "section"
+
+
+def test_section_cell_preserves_original_magic_text_in_rts() -> None:
+    """The canonical ``@@section <title>`` text lives in
+    ``rts.cells[<id>].text`` regardless of the markdown-rendered
+    outer source. This is what llmnb_to_magic walks for the reverse
+    direction."""
+    src = "@@section Architecture\nnotes\n"
+    llmnb = magic_to_llmnb(src)
+    rts_cells = llmnb["metadata"]["rts"]["cells"]
+    first = next(iter(rts_cells.values()))
+    assert "@@section Architecture" in first["text"]
+    assert first["kind"] == "section"
+
+
+def test_section_cell_quoted_title_renders_correctly() -> None:
+    llmnb = magic_to_llmnb('@@section "Runtime Concerns"\nfoo\n')
+    outer = llmnb["cells"][0]
+    assert outer["cell_type"] == "markdown"
+    assert outer["source"] == "# Runtime Concerns"
+
+
+def test_section_cell_named_title_kwarg_renders_correctly() -> None:
+    llmnb = magic_to_llmnb('@@section title:"Tests" id:"sec_t_1"\nbody\n')
+    outer = llmnb["cells"][0]
+    assert outer["cell_type"] == "markdown"
+    assert outer["source"] == "# Tests"
+
+
+def test_section_cell_bare_no_title_stays_code_typed() -> None:
+    """Bare ``@@section`` without a parseable title falls back to
+    code-typed rendering so the operator sees the raw magic and can
+    fix it. Phase 4's W4-tolerant no-envelope path handles execution."""
+    llmnb = magic_to_llmnb("@@section\nbody\n")
+    outer = llmnb["cells"][0]
+    assert outer["cell_type"] == "code"
+    # Source is the verbatim magic text (no synthesized heading).
+    assert outer["source"].startswith("@@section")
+    # Metadata still records kind=section.
+    assert outer["metadata"]["rts"]["cell"]["kind"] == "section"
+
+
+def test_section_cell_magic_round_trip_preserves_declaration() -> None:
+    """The critical round-trip invariant for Phase 5: ``.magic`` →
+    ``.llmnb`` → ``.magic`` preserves the ``@@section <title>``
+    declaration verbatim. The intermediate markdown rendering does
+    NOT leak into the .magic output because llmnb_to_magic walks
+    ``rts.cells[<id>].text`` (canonical), not the outer nbformat
+    ``source`` field."""
+    src = "@@section Architecture\nnotes\n@@break\n@@scratch\nbody"
+    llmnb = magic_to_llmnb(src)
+    back = llmnb_to_magic(llmnb)
+    assert "@@section Architecture" in back
+    assert "@@scratch" in back
+    # The synthesized "# Architecture" heading is NOT in the magic
+    # round-trip because the outer source field is not the source of
+    # truth for magic-text emission.
+    assert "# Architecture\n@@break" not in back
+
+
+def test_multiple_sections_each_render_as_markdown() -> None:
+    """A .magic file with multiple sections produces multiple markdown
+    cells with heading sources — VS Code's native fold then handles
+    each section independently."""
+    src = "@@section Architecture\n@@break\n@@scratch\nfoo\n@@break\n@@section Runtime\n"
+    llmnb = magic_to_llmnb(src)
+    outer_cells = llmnb["cells"]
+    assert len(outer_cells) == 3
+    assert outer_cells[0]["cell_type"] == "markdown"
+    assert outer_cells[0]["source"] == "# Architecture"
+    assert outer_cells[1]["cell_type"] == "code"  # scratch
+    assert outer_cells[2]["cell_type"] == "markdown"
+    assert outer_cells[2]["source"] == "# Runtime"
