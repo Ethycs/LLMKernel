@@ -245,6 +245,23 @@ EMIT_MAGIC_CELL_OUTPUT: JSONSchema = _obj(["cell_id"], {
     "_rfc_version": _VS,
     "cell_id": {"type": "string", "minLength": 1}})
 
+# PLAN-substrate-gap-closure G13 — validate_tool_input
+# Dry-run of the RFC-001 input schema for a named tool.  Agents call
+# this BEFORE `tools/call` to verify a payload without triggering the
+# tool's side effects.  Returns ``{valid, violations, tool_name}`` where
+# ``violations`` is the JSON-Pointer-shaped error strings (empty when
+# ``valid`` is true).
+VALIDATE_TOOL_INPUT_INPUT: JSONSchema = _obj(["tool_name"], {
+    "_rfc_version": _VER,
+    "tool_name": {"type": "string", "minLength": 1},
+    "arguments": {"type": "object"}})
+VALIDATE_TOOL_INPUT_OUTPUT: JSONSchema = _obj(
+    ["valid", "violations", "tool_name"], {
+        "_rfc_version": _VS,
+        "valid": {"type": "boolean"},
+        "violations": {"type": "array", "items": {"type": "string"}},
+        "tool_name": {"type": "string", "minLength": 1}})
+
 
 # Public catalog: tool name -> (input_schema, output_schema, description).
 # Order matches RFC-002's mcpServers.allowedTools array exactly.
@@ -268,6 +285,12 @@ TOOL_CATALOG: Dict[str, Tuple[JSONSchema, JSONSchema, str]] = {
         "operator's behalf (PLAN-S5.0.4 / certified-magic-emitter "
         "atom clause 1).",
     ),
+    "validate_tool_input": (
+        VALIDATE_TOOL_INPUT_INPUT, VALIDATE_TOOL_INPUT_OUTPUT,
+        "Meta: dry-run the RFC-001 input schema for a named tool "
+        "without invoking its handler (PLAN-substrate-gap-closure "
+        "G13). Returns {valid, violations, tool_name}.",
+    ),
 }
 
 # Tools whose handlers are real (B1-stub) implementations.
@@ -279,7 +302,8 @@ NATIVE_TOOLS: Tuple[str, ...] = (
     "ask", "clarify", "propose", "request_approval",
     "report_progress", "report_completion", "report_problem",
     "present", "notify", "escalate",
-    "emit_magic_cell")
+    "emit_magic_cell",
+    "validate_tool_input")
 
 # Tools that are proxied; B1 leaves them unimplemented and raises NotImplementedError.
 PROXIED_TOOLS: Tuple[str, ...] = ("read_file", "write_file", "run_command")

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "_rfc_version": {
+      "type": "string"
+    },
+    "tool_name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "valid": {
+      "type": "boolean"
+    },
+    "violations": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "valid",
+    "violations",
+    "tool_name"
+  ],
+  "type": "object"
+}

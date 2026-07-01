@@ -20,6 +20,11 @@ What this module provides:
   pass for in-progress spans (``endTimeUnixNano: null`` AND
   ``status.code: STATUS_CODE_UNSET``).  Mutates the spans in place
   AND returns one drift event per truncation.
+* :func:`truncate_in_progress_run_frames` -- the PLAN-substrate-gap-
+  closure G11 truncation pass for orphan in-progress RunFrames
+  (``status: "running"`` AND ``ended_at`` missing/empty AND ``run_id``
+  not present in the live ``RunTracker``).  Mutates the frames in
+  place and returns one drift event per truncation.
 * Severity classification helpers per RFC-005 §"`metadata.rts.
   drift_log`" :class:`Severity`: ``info`` for benign drift,
   ``warn`` for behavior-affecting drift, ``error`` for
@@ -45,6 +50,10 @@ SEVERITY_ERROR: str = "error"
 _STATUS_UNSET: str = "STATUS_CODE_UNSET"
 #: OTel ERROR status code; used as the truncation status.
 _STATUS_ERROR: str = "STATUS_CODE_ERROR"
+
+#: RunFrame status values per docs/atoms/concepts/run-frame.md §Schema.
+_RUNFRAME_STATUS_RUNNING: str = "running"
+_RUNFRAME_STATUS_INTERRUPTED: str = "interrupted"
 
 
 def _utc_now_iso() -> str:
@@ -130,6 +139,73 @@ def truncate_in_progress_spans(
     return events
 
 
+def truncate_in_progress_run_frames(
+    run_frames: Dict[str, Dict[str, Any]],
+    *,
+    live_run_ids: Optional[Iterable[str]] = None,
+    detected_at: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Truncate orphan in-progress RunFrames per PLAN-substrate-gap-closure G11.
+
+    For each RunFrame entry in ``run_frames`` (a dict keyed by
+    ``run_id`` — the shape written under
+    ``metadata.rts.zone.run_frames`` per
+    :doc:`docs/atoms/concepts/run-frame`) whose ``status`` is
+    ``"running"`` AND ``ended_at`` is missing/None/empty:
+
+    - If ``run_id`` is in ``live_run_ids``, the run is still live in
+      the current process — skip.  Callers pass the live ``RunTracker``'s
+      set so genuine in-flight runs survive.
+    - Otherwise the RunFrame is an orphan from a prior kernel crash —
+      stamp ``ended_at`` to wall-clock ISO now, set ``status`` to
+      ``"interrupted"``, and emit one drift event with
+      ``severity: "info"`` per RFC-005's classification.
+
+    Returns the list of generated drift events (one per truncation).
+    Callers append these to ``metadata.rts.drift_log``.  Mutates
+    ``run_frames`` values in place so the persisted form reflects the
+    normalized terminal state on the next snapshot.
+
+    Rationale: the RunFrame ``status`` invariant per
+    :doc:`docs/atoms/concepts/run-frame` §Invariants — ``"running"`` is
+    intermediate and MUST be replaced by a terminal status via a
+    follow-up ``record_run_frame``.  A crash between start and terminal
+    leaves the frame stuck at ``"running"``.  This function closes the
+    gap on next hydrate so Inspect mode never surfaces phantom
+    in-flight runs.
+    """
+    live_set = set(live_run_ids or ())
+    timestamp_iso = detected_at or _utc_now_iso()
+    events: List[Dict[str, Any]] = []
+    if not isinstance(run_frames, dict):
+        return events
+    for run_id, frame in run_frames.items():
+        if not isinstance(frame, dict):
+            continue
+        if frame.get("status") != _RUNFRAME_STATUS_RUNNING:
+            continue
+        ended = frame.get("ended_at")
+        if ended not in (None, ""):
+            continue
+        if run_id in live_set:
+            continue
+        prev_status = frame.get("status", _RUNFRAME_STATUS_RUNNING)
+        frame["status"] = _RUNFRAME_STATUS_INTERRUPTED
+        frame["ended_at"] = timestamp_iso
+        events.append({
+            "detected_at": timestamp_iso,
+            "field_path": f"zone.run_frames.{run_id}.status",
+            "previous_value": prev_status,
+            "current_value": (
+                f"{_RUNFRAME_STATUS_INTERRUPTED} "
+                "(kernel restart orphaned)"
+            ),
+            "severity": SEVERITY_INFO,
+            "operator_acknowledged": False,
+        })
+    return events
+
+
 class DriftDetector:
     """Compute drift events between persisted state and current environment.
 
@@ -152,6 +228,7 @@ class DriftDetector:
         current_agents: Optional[Iterable[Dict[str, Any]]] = None,
         current_mcp_servers: Optional[Iterable[Dict[str, Any]]] = None,
         current_agent_status: Optional[Dict[str, str]] = None,
+        current_live_run_ids: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Return the drift events for one persisted-vs-current comparison.
 
@@ -161,18 +238,27 @@ class DriftDetector:
         RFC-005 enumerates; pass ``None`` to skip a category.
         ``current_agent_status`` is a mapping of ``agent_id`` to
         currently-observed status (``"idle"`` / ``"busy"`` /
-        ``"crashed"`` / etc.).
+        ``"crashed"`` / etc.).  ``current_live_run_ids`` is the set of
+        run ids currently tracked by the live ``RunTracker``; RunFrames
+        with those ids are preserved as legitimately in-flight.  Pass
+        ``None`` (default) or an empty iterable to truncate every
+        in-progress RunFrame — the correct choice at cold-hydrate when
+        no RunTracker exists yet.
 
         Order of detection: kernel-volatile fields, per-agent volatile
         fields, MCP-server transports, in-progress span truncation,
-        agent-process status drift.  Matches RFC-005's enumeration
-        order so the operator sees the most-impactful drift first.
+        in-progress RunFrame truncation, agent-process status drift.
+        Matches RFC-005's enumeration order so the operator sees the
+        most-impactful drift first.
         """
         events: List[Dict[str, Any]] = []
         events.extend(self._kernel_volatile(persisted, current_kernel))
         events.extend(self._agent_volatile(persisted, current_agents))
         events.extend(self._mcp_volatile(persisted, current_mcp_servers))
         events.extend(self._in_progress_spans(persisted))
+        events.extend(self._in_progress_run_frames(
+            persisted, current_live_run_ids,
+        ))
         events.extend(self._agent_status(persisted, current_agent_status))
         return events
 
@@ -327,6 +413,27 @@ class DriftDetector:
         ) or []
         return truncate_in_progress_spans(runs)
 
+    # -- In-progress RunFrame truncation (G11) -----------------------
+
+    def _in_progress_run_frames(
+        self,
+        persisted: Dict[str, Any],
+        current_live_run_ids: Optional[Iterable[str]],
+    ) -> List[Dict[str, Any]]:
+        """Truncate orphan in-progress RunFrames per G11.
+
+        Mutates ``persisted["zone"]["run_frames"][<run_id>]`` values in
+        place.  Legitimately-live runs (those whose ``run_id`` appears
+        in ``current_live_run_ids``) are preserved; crash-orphaned
+        frames are stamped ``interrupted`` with ``ended_at`` = now.
+        """
+        run_frames: Dict[str, Dict[str, Any]] = (
+            persisted.get("zone", {}).get("run_frames", {})
+        ) or {}
+        return truncate_in_progress_run_frames(
+            run_frames, live_run_ids=current_live_run_ids,
+        )
+
     # -- Agent process status ----------------------------------------
 
     def _agent_status(
@@ -386,4 +493,5 @@ __all__ = [
     "DriftDetector",
     "SEVERITY_ERROR", "SEVERITY_INFO", "SEVERITY_WARN",
     "truncate_in_progress_spans",
+    "truncate_in_progress_run_frames",
 ]

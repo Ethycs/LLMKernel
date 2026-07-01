@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 from llm_kernel.drift_detector import (
     DriftDetector,
     SEVERITY_ERROR, SEVERITY_INFO, SEVERITY_WARN,
+    truncate_in_progress_run_frames,
     truncate_in_progress_spans,
 )
 
@@ -249,3 +250,113 @@ def test_drift_event_carries_required_fields() -> None:
                 "current_value", "severity", "operator_acknowledged"):
         assert key in event
     assert event["operator_acknowledged"] is False
+
+
+# ---------------------------------------------------------------------------
+# G11 — RunFrame in-progress truncation at hydrate
+# ---------------------------------------------------------------------------
+
+
+def _persisted_with_run_frames(
+    run_frames: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a persisted snapshot with ``zone.run_frames`` populated
+    per docs/atoms/concepts/run-frame.md §Schema."""
+    return {
+        "config": {"volatile": {"kernel": {}, "agents": [],
+                                "mcp_servers": []}},
+        "agents": {"nodes": [], "edges": []},
+        "event_log": {"runs": []},
+        "zone": {"run_frames": run_frames},
+    }
+
+
+def test_orphan_running_runframe_truncated() -> None:
+    """Crash-orphaned RunFrame (running + not in live tracker) becomes
+    interrupted with a matching drift event."""
+    detector = DriftDetector()
+    frames = {
+        "r_orphan": {
+            "run_id": "r_orphan",
+            "cell_id": "cell:1",
+            "executor_id": "alpha",
+            "status": "running",
+            "started_at": "2026-06-30T10:00:00.000Z",
+            "ended_at": None,
+        },
+    }
+    persisted = _persisted_with_run_frames(frames)
+    drift = detector.compare(persisted, current_live_run_ids=set())
+    assert len(drift) == 1
+    ev = drift[0]
+    assert ev["severity"] == SEVERITY_INFO
+    assert ev["field_path"] == "zone.run_frames.r_orphan.status"
+    assert ev["previous_value"] == "running"
+    assert "interrupted" in ev["current_value"]
+    # Frame is mutated in place to the terminal state.
+    assert frames["r_orphan"]["status"] == "interrupted"
+    assert frames["r_orphan"]["ended_at"] is not None
+    assert frames["r_orphan"]["ended_at"] != ""
+
+
+def test_live_running_runframe_preserved() -> None:
+    """A RunFrame whose run_id is in the live tracker is legitimately
+    in-flight and MUST NOT be truncated."""
+    detector = DriftDetector()
+    frames = {
+        "r_live": {
+            "run_id": "r_live",
+            "cell_id": "cell:2",
+            "executor_id": "alpha",
+            "status": "running",
+            "started_at": "2026-06-30T10:00:00.000Z",
+            "ended_at": None,
+        },
+    }
+    persisted = _persisted_with_run_frames(frames)
+    drift = detector.compare(persisted, current_live_run_ids={"r_live"})
+    assert drift == []
+    # Frame preserved verbatim.
+    assert frames["r_live"]["status"] == "running"
+    assert frames["r_live"]["ended_at"] is None
+
+
+def test_terminal_runframe_ignored() -> None:
+    """A RunFrame with a terminal status (complete/failed/interrupted)
+    is never touched — the truncation targets only in-progress frames."""
+    detector = DriftDetector()
+    frames = {
+        "r_complete": {
+            "run_id": "r_complete",
+            "cell_id": "cell:3",
+            "executor_id": "alpha",
+            "status": "complete",
+            "started_at": "2026-06-30T09:00:00.000Z",
+            "ended_at": "2026-06-30T09:00:05.000Z",
+        },
+    }
+    persisted = _persisted_with_run_frames(frames)
+    drift = detector.compare(persisted, current_live_run_ids=set())
+    assert drift == []
+    assert frames["r_complete"]["status"] == "complete"
+
+
+def test_truncate_in_progress_run_frames_helper_directly() -> None:
+    """The module-level helper is also part of the contract — callers
+    that don't want the full DriftDetector compare loop can call it
+    against a bare ``run_frames`` dict."""
+    frames = {
+        "r_a": {"status": "running", "ended_at": None},
+        "r_b": {"status": "running", "ended_at": ""},
+        "r_c": {"status": "complete", "ended_at": "2026-06-30T10:00:00Z"},
+    }
+    events = truncate_in_progress_run_frames(
+        frames, live_run_ids={"r_a"},
+    )
+    # r_a preserved (live); r_b truncated (orphan, empty ended_at
+    # treated same as None); r_c untouched (terminal).
+    assert len(events) == 1
+    assert events[0]["field_path"] == "zone.run_frames.r_b.status"
+    assert frames["r_a"]["status"] == "running"
+    assert frames["r_b"]["status"] == "interrupted"
+    assert frames["r_c"]["status"] == "complete"  # terminal, untouched

@@ -125,12 +125,13 @@ def test_schema_file_count() -> None:
     """wire/schemas/ has the expected number of files.
 
     13 RFC-001 tools + 1 PLAN-S5.0.4 ``emit_magic_cell`` privileged-
-    emit tool = 14 tools * 2 (input + output) + 5 families + 2
-    handshake (request + response, S5.0.3d) = 35 JSON files.
+    emit tool + 1 PLAN-substrate-gap-closure G13 ``validate_tool_input``
+    meta-tool = 15 tools * 2 (input + output) + 5 families + 2
+    handshake (request + response, S5.0.3d) = 37 JSON files.
     """
     schemas_dir = _schemas_dir()
     json_files = list(schemas_dir.glob("*.json"))
-    expected_tool_count = 14  # RFC-001 (13) + PLAN-S5.0.4 emit_magic_cell
+    expected_tool_count = 15  # RFC-001 (13) + emit_magic_cell + validate_tool_input
     expected_family_count = 5  # A, B, C, F, G
     expected_handshake_count = 2  # handshake.request, handshake.response (S5.0.3d)
     expected_total = (

@@ -83,19 +83,20 @@ def test_server_identity(bridge: OperatorBridgeServer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_catalog_lists_fourteen_tools(bridge: OperatorBridgeServer) -> None:
-    """All fourteen registered tools MUST be exposed.
+async def test_catalog_lists_fifteen_tools(bridge: OperatorBridgeServer) -> None:
+    """All fifteen registered tools MUST be exposed.
 
     Thirteen RFC-001 tools (ask, clarify, propose, request_approval,
     report_progress, report_completion, report_problem, present,
     notify, escalate, read_file, write_file, run_command) plus the
-    PLAN-S5.0.4 ``emit_magic_cell`` privileged-emit tool.
+    PLAN-S5.0.4 ``emit_magic_cell`` privileged-emit tool and the
+    PLAN-substrate-gap-closure G13 ``validate_tool_input`` meta-tool.
     """
     handler = bridge.server.request_handlers[types.ListToolsRequest]
     request = types.ListToolsRequest(method="tools/list")
     server_result = await handler(request)
     tools = server_result.root.tools
-    assert len(tools) == 14
+    assert len(tools) == 15
     names = {tool.name for tool in tools}
     expected = {
         "ask", "clarify", "propose", "request_approval",
@@ -103,8 +104,82 @@ async def test_catalog_lists_fourteen_tools(bridge: OperatorBridgeServer) -> Non
         "present", "notify", "escalate",
         "read_file", "write_file", "run_command",
         "emit_magic_cell",
+        "validate_tool_input",
     }
     assert names == expected
+
+
+# ---------------------------------------------------------------------------
+# G13 — validate_tool_input meta-tool (PLAN-substrate-gap-closure)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validate_tool_input_returns_valid(
+    bridge: OperatorBridgeServer,
+) -> None:
+    """Well-formed args for a known tool return ``valid: True`` with
+    no violations and echo back the tool name.
+
+    Uses ``notify`` because its schema is small and stable:
+    ``observation`` (non-empty string) + ``importance`` (enum
+    trace/info/warn), per RFC-001 §notify."""
+    result = await _invoke(bridge, "validate_tool_input", {
+        "tool_name": "notify",
+        "arguments": {
+            "observation": "hello operator",
+            "importance": "info",
+        },
+    })
+    payload = _structured(result)
+    assert payload["valid"] is True
+    assert payload["violations"] == []
+    assert payload["tool_name"] == "notify"
+    assert payload["_rfc_version"] == RFC_001_VERSION
+
+
+@pytest.mark.asyncio
+async def test_validate_tool_input_returns_violations_for_bad_payload(
+    bridge: OperatorBridgeServer,
+) -> None:
+    """Malformed args for a known tool return ``valid: False`` with a
+    JSON-Pointer-shaped violation string, and DO NOT invoke the
+    underlying handler (no side effects)."""
+    result = await _invoke(bridge, "validate_tool_input", {
+        "tool_name": "notify",
+        # Missing required `observation`; violates the notify inputSchema.
+        "arguments": {"importance": "info"},
+    })
+    payload = _structured(result)
+    assert payload["valid"] is False
+    assert len(payload["violations"]) >= 1
+    assert payload["tool_name"] == "notify"
+    # The violation string carries the JSON-Pointer shape the
+    # tools/call path would raise via JSONRPC_SCHEMA_VALIDATION.
+    assert (
+        "observation" in payload["violations"][0]
+        or "required" in payload["violations"][0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_tool_input_unknown_tool_returns_violations(
+    bridge: OperatorBridgeServer,
+) -> None:
+    """Unknown tool name returns ``valid: False`` with a violations
+    entry rather than raising ``-32601``.  This keeps the meta-tool
+    safe to speculate against without triggering an actual
+    ``METHOD_NOT_FOUND`` error the way ``tools/call`` would."""
+    result = await _invoke(bridge, "validate_tool_input", {
+        "tool_name": "not_a_real_tool",
+        "arguments": {},
+    })
+    payload = _structured(result)
+    assert payload["valid"] is False
+    assert payload["tool_name"] == "not_a_real_tool"
+    assert any(
+        "not in RFC-001 catalog" in v for v in payload["violations"]
+    )
 
 
 @pytest.mark.asyncio

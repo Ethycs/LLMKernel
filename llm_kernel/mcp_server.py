@@ -197,6 +197,7 @@ class OperatorBridgeServer:
             "read_file": self._handle_read_file,
             "write_file": self._handle_write_file,
             "run_command": self._handle_run_command,
+            "validate_tool_input": self._handle_validate_tool_input,
         }
         self._register_mcp_handlers()
         if self.dispatcher is not None:
@@ -1632,6 +1633,75 @@ class OperatorBridgeServer:
             "stderr": stderr,
             "timed_out": False,
             "duration_ms": duration_ms,
+        }
+
+    async def _handle_validate_tool_input(
+        self, arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Dry-run RFC-001 input validation for a named tool.
+
+        PLAN-substrate-gap-closure G13. Agents call this BEFORE
+        ``tools/call`` when they want to verify a payload without
+        triggering the tool's side effects.
+
+        Return shape ``{valid, violations, tool_name}``:
+
+        - ``valid: bool`` — ``True`` iff the inner arguments pass the
+          named tool's ``inputSchema`` per :func:`validate_tool_input`.
+        - ``violations: list[str]`` — empty when ``valid`` is ``True``;
+          otherwise a single JSON-Pointer-shaped error string (the same
+          shape the ``tools/call`` path raises via
+          ``JSONRPC_SCHEMA_VALIDATION``).
+        - ``tool_name: str`` — echoed from the request so the caller
+          can correlate responses when it validates several tools in
+          parallel.
+
+        Unknown ``tool_name`` returns ``valid=false`` with a violations
+        entry so the agent gets a machine-readable signal (rather than
+        the ``-32601`` the actual ``tools/call`` would raise on the
+        same input).  This keeps the tool safe to speculate against.
+        """
+        tool_name = str(arguments.get("tool_name") or "")
+        inner_args = arguments.get("arguments") or {}
+        if not tool_name:
+            return {
+                "valid": False,
+                "violations": ["$.tool_name: required non-empty string"],
+                "tool_name": "",
+                "_rfc_version": RFC_001_VERSION,
+            }
+        if tool_name not in TOOL_CATALOG:
+            return {
+                "valid": False,
+                "violations": [
+                    f"$.tool_name: {tool_name!r} not in RFC-001 catalog"
+                ],
+                "tool_name": tool_name,
+                "_rfc_version": RFC_001_VERSION,
+            }
+        if not isinstance(inner_args, dict):
+            return {
+                "valid": False,
+                "violations": [
+                    f"$.arguments: expected object, got "
+                    f"{type(inner_args).__name__}"
+                ],
+                "tool_name": tool_name,
+                "_rfc_version": RFC_001_VERSION,
+            }
+        error = validate_tool_input(tool_name, inner_args)
+        if error is None:
+            return {
+                "valid": True,
+                "violations": [],
+                "tool_name": tool_name,
+                "_rfc_version": RFC_001_VERSION,
+            }
+        return {
+            "valid": False,
+            "violations": [error],
+            "tool_name": tool_name,
+            "_rfc_version": RFC_001_VERSION,
         }
 
     async def run_stdio(self) -> None:

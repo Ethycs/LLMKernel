@@ -105,6 +105,9 @@ def test_valid_tool_args_return_none_from_validator() -> None:
             "name": "scratch",
             "position": {"after_cell_id": "c_anchor"},
         },
+        "validate_tool_input": {
+            "tool_name": "notify",
+        },
     }
     for tool_name in TOOL_CATALOG:
         assert tool_name in fixtures, (
