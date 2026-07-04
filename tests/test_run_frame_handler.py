@@ -29,7 +29,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, Optional
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _new_writer() -> MetadataWriter:

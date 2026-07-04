@@ -7,7 +7,7 @@ and the dispatcher's ``validate_envelope`` call.  Exhaustive payload
 typing is a V2+ concern (see PLAN-S5.0.3 §10 risk #2).
 
 These shapes are derived from the envelope patterns dispatched in
-``llm_kernel.custom_messages``.  That module's dispatcher STAYS
+``llm_kernel.capture.custom_messages``.  That module's dispatcher STAYS
 unchanged; it continues to route inbound traffic.  The *shape
 definitions* live here as the public contract so external drivers can
 construct correct envelopes without reading kernel internals.

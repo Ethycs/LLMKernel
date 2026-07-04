@@ -25,7 +25,7 @@ import pytest
 from mcp import types
 from mcp.shared.exceptions import McpError
 
-from llm_kernel.mcp_server import (
+from llm_kernel.mcp.mcp_server import (
     JSONRPC_PROXIED_IO_FAILURE,
     JSONRPC_PROXIED_REFUSED,
     OperatorBridgeServer,
@@ -278,7 +278,7 @@ async def test_proxied_read_file_emits_lifecycle_envelopes(
     tmp_path, monkeypatch,
 ) -> None:
     """Proxied tools MUST emit run.start -> tool_call -> tool_result -> run.complete."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:

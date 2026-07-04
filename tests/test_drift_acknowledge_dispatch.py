@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 import pytest
 
-from llm_kernel.mcp_server import OperatorBridgeServer
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
 
 
 class _MockMetadataWriter:

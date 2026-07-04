@@ -7,13 +7,13 @@ from typing import Any, Dict, List
 
 import pytest
 
-from llm_kernel.custom_messages import CustomMessageDispatcher
-from llm_kernel.event_log import (
+from llm_kernel.capture.custom_messages import CustomMessageDispatcher
+from llm_kernel.capture.event_log import (
     EventLogReplayError, EventLogReplayer, EventLogReplayUnsafeError,
     EventLogVersionMismatchError,
 )
-from llm_kernel.metadata_writer import MetadataWriter
-from llm_kernel.run_envelope import (
+from llm_kernel.capture.metadata_writer import MetadataWriter
+from llm_kernel.capture.run_envelope import (
     DIRECTION_EXTENSION_TO_KERNEL, DIRECTION_KERNEL_TO_EXTENSION, make_envelope,
 )
 
@@ -274,7 +274,7 @@ def test_minor_version_mismatch_warns(caplog: pytest.LogCaptureFixture) -> None:
             rfc_version="1.1.0",
         ),
     ]
-    with caplog.at_level(logging.WARNING, logger="llm_kernel.event_log"):
+    with caplog.at_level(logging.WARNING, logger="llm_kernel.capture.event_log"):
         replayer = EventLogReplayer(log)
     assert any("minor differs" in rec.message for rec in caplog.records), (
         "expected minor-mismatch warning but got: "

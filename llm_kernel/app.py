@@ -17,7 +17,8 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
 
-from . import _diagnostics, pty_mode
+from llm_kernel._internal import _diagnostics
+from llm_kernel.transports import pty_mode
 
 #: Module-level holder for the kernel state so /health and future routes
 #: can read it without pulling app.state typing gymnastics. Set on

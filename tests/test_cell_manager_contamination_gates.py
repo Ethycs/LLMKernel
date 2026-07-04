@@ -13,12 +13,12 @@ from typing import Optional
 
 import pytest
 
-from llm_kernel.cell_manager import (
+from llm_kernel.notebook.cell_manager import (
     CellManager,
     CellManagerPreconditionError,
     K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED,
 )
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

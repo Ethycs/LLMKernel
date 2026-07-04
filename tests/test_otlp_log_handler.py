@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`llm_kernel._otlp_log_handler` (RFC-008 §7).
+"""Contract tests for :mod:`llm_kernel.capture._otlp_log_handler` (RFC-008 §7).
 
 Exercises:
 
@@ -20,8 +20,8 @@ from typing import Any, Dict, List
 
 import pytest
 
-from llm_kernel._attrs import decode_attrs
-from llm_kernel._otlp_log_handler import SEVERITY_MAP, OtlpDataPlaneHandler
+from llm_kernel._internal._attrs import decode_attrs
+from llm_kernel.capture._otlp_log_handler import SEVERITY_MAP, OtlpDataPlaneHandler
 
 
 class _CaptureWriter:
@@ -161,7 +161,7 @@ def test_logger_namespace_propagation() -> None:
     handler = OtlpDataPlaneHandler(writer)
     handler.setFormatter(logging.Formatter("%(message)s"))
 
-    log = logging.getLogger("llm_kernel._otlp_log_handler.test")
+    log = logging.getLogger("llm_kernel.capture._otlp_log_handler.test")
     log.setLevel(logging.DEBUG)
     log.addHandler(handler)
     try:

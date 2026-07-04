@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from llm_kernel.agent_supervisor import AgentHandle, AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentHandle, AgentSupervisor
 
 
 # ---------------------------------------------------------------------------
@@ -92,11 +92,11 @@ class _FakePopen:
 def _patch_health(status_code: int = 200) -> Any:
     fake = MagicMock()
     fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 def _make_supervisor() -> AgentSupervisor:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -272,8 +272,8 @@ def test_send_user_turn_empty_text_rejected(tmp_path: Path) -> None:
 
 def test_dispatcher_routes_send_user_turn_intent_to_supervisor() -> None:
     """The full envelope path MUST land at supervisor.send_user_turn."""
-    from llm_kernel.mcp_server import OperatorBridgeServer
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.mcp.mcp_server import OperatorBridgeServer
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:

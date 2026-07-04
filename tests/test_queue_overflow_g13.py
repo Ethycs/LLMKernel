@@ -21,7 +21,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _envelope(intent_id: str) -> Dict[str, Any]:

@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from llm_kernel.serve_mode import _build_parser, _parse_bind, main
+from llm_kernel.transports.serve_mode import _build_parser, _parse_bind, main
 
 
 def test_parse_bind_default() -> None:

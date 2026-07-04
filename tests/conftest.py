@@ -45,7 +45,7 @@ def _isolate_root_logger():
     """Snapshot/restore root + ``llm_kernel`` logger state around every test.
 
     Several tests install ``OtlpDataPlaneHandler`` (or similar) on the
-    root logger via :func:`llm_kernel.pty_mode._install_handler` or
+    root logger via :func:`llm_kernel.transports.pty_mode._install_handler` or
     directly. Without isolation a leaked handler from one test would
     intercept :func:`caplog`-captured records in subsequent tests in
     the same worker process, producing spurious failures or hangs.

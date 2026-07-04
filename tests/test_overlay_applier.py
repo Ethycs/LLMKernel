@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 # ---------------------------------------------------------------------

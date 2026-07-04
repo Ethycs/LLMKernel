@@ -15,8 +15,8 @@ import pytest
 from mcp import types
 from mcp.shared.exceptions import McpError
 
-from llm_kernel._rfc_schemas import TOOL_CATALOG, validate_tool_input
-from llm_kernel.mcp_server import (
+from llm_kernel._internal._rfc_schemas import TOOL_CATALOG, validate_tool_input
+from llm_kernel.mcp.mcp_server import (
     JSONRPC_SCHEMA_VALIDATION,
     OperatorBridgeServer,
 )

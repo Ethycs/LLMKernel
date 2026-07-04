@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`llm_kernel.pty_mode` (RFC-008 §3 + §4).
+"""Contract tests for :mod:`llm_kernel.transports.pty_mode` (RFC-008 §3 + §4).
 
 Exercises:
 
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from llm_kernel._attrs import decode_attrs
+from llm_kernel._internal._attrs import decode_attrs
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +128,7 @@ def _wait_for_frame(
 
 def test_main_without_ipc_socket_returns_2(monkeypatch: pytest.MonkeyPatch) -> None:
     """RFC-008 §4 step 1: kernel MUST fail fast when no socket address is set."""
-    from llm_kernel import pty_mode
+    from llm_kernel.transports import pty_mode
 
     monkeypatch.delenv(pty_mode.ENV_IPC_SOCKET, raising=False)
     rc = pty_mode.main([])
@@ -143,7 +143,7 @@ def test_main_without_ipc_socket_returns_2(monkeypatch: pytest.MonkeyPatch) -> N
 def _run_main_in_thread(
     monkeypatch: pytest.MonkeyPatch, address: str, session_id: str,
 ) -> threading.Thread:
-    from llm_kernel import pty_mode
+    from llm_kernel.transports import pty_mode
 
     monkeypatch.setenv(pty_mode.ENV_IPC_SOCKET, address)
     monkeypatch.setenv(pty_mode.ENV_SESSION_ID, session_id)
@@ -297,7 +297,7 @@ def test_main_with_invalid_address_returns_3(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
 ) -> None:
     """A socket address pointing at nothing yields exit code 3."""
-    from llm_kernel import pty_mode
+    from llm_kernel.transports import pty_mode
 
     # A UDS path that doesn't exist (POSIX) or a TCP port nothing is on
     # (Windows) both produce ``OSError`` at connect.
@@ -320,8 +320,8 @@ def test_main_with_invalid_address_returns_3(
 def test_install_handler_strips_stdout_stream_handler() -> None:
     """RFC-008 §7: pre-existing stdout sinks are removed when handler installs."""
     import logging
-    from llm_kernel import pty_mode
-    from llm_kernel._otlp_log_handler import OtlpDataPlaneHandler
+    from llm_kernel.transports import pty_mode
+    from llm_kernel.capture._otlp_log_handler import OtlpDataPlaneHandler
 
     root = logging.getLogger()
     saved_handlers = list(root.handlers)

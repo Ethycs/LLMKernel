@@ -19,7 +19,7 @@ import ast
 import inspect
 from pathlib import Path
 
-import llm_kernel.magic_generators as magic_generators
+import llm_kernel.magics.magic_generators as magic_generators
 
 
 def _module_source() -> str:

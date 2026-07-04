@@ -7,7 +7,7 @@ to flip ``operator_acknowledged`` on a specific drift entry.
 
 from __future__ import annotations
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def test_acknowledge_drift_returns_true_on_match() -> None:

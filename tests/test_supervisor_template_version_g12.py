@@ -2,7 +2,7 @@
 
 The G12 audit found template-version validation is already implemented:
 
-* :data:`llm_kernel._provisioning.EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION`
+* :data:`llm_kernel.supervision._provisioning.EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION`
   pins the expected version (currently ``"1.0.0"``) per RFC-002
   §"Versioning" / "Failure modes" Template-version-mismatch row.
 * :meth:`AgentSupervisor._validate_template_version` is invoked from
@@ -29,11 +29,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_kernel._provisioning import (
+from llm_kernel.supervision._provisioning import (
     EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION,
     PreSpawnValidationError,
 )
-from llm_kernel.agent_supervisor import AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ from llm_kernel.agent_supervisor import AgentSupervisor
 def _patch_health(status_code: int = 200):
     fake = MagicMock()
     fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 class _CollectingSink:
@@ -58,7 +58,7 @@ class _CollectingSink:
 
 
 def _make_supervisor() -> tuple[AgentSupervisor, _CollectingSink]:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     sink = _CollectingSink()
     tracker = RunTracker(
@@ -112,7 +112,7 @@ def test_spawn_rejects_template_version_mismatch(tmp_path: Path) -> None:
         )
 
     with _patch_health(), \
-         patch("llm_kernel.agent_supervisor.render_system_prompt",
+         patch("llm_kernel.supervision.agent_supervisor.render_system_prompt",
                return_value=bad), \
          patch("subprocess.Popen", side_effect=fake_popen):
         with pytest.raises(PreSpawnValidationError) as ei:
@@ -169,7 +169,7 @@ def test_spawn_accepts_matching_template_version(tmp_path: Path) -> None:
         return p
 
     with _patch_health(), \
-         patch("llm_kernel.agent_supervisor.render_system_prompt",
+         patch("llm_kernel.supervision.agent_supervisor.render_system_prompt",
                return_value=good), \
          patch("subprocess.Popen", side_effect=make_stub):
         handle = sup.spawn(
@@ -205,7 +205,7 @@ def test_template_version_kclass_emitted_on_mismatch(tmp_path: Path) -> None:
     with _patch_health(), \
          patch.object(sup, "_record_synthetic_problem",
                       side_effect=record) as _, \
-         patch("llm_kernel.agent_supervisor.render_system_prompt",
+         patch("llm_kernel.supervision.agent_supervisor.render_system_prompt",
                return_value=bad), \
          patch("subprocess.Popen") as popen_mock:
         with pytest.raises(PreSpawnValidationError):

@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import pytest
 
-from llm_kernel.cell_manager import CellManager
-from llm_kernel.intent_handlers.promote_stream_magic import (
+from llm_kernel.notebook.cell_manager import CellManager
+from llm_kernel.mcp.intent_handlers.promote_stream_magic import (
     PromoteStreamMagicError,
     _parse_magic_line,
     handle_promote_stream_magic,
 )
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

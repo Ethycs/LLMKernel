@@ -14,11 +14,11 @@ import os
 import uuid
 from typing import TYPE_CHECKING, Optional, Tuple
 
-from .agent_supervisor import AgentSupervisor
-from .custom_messages import CustomMessageDispatcher
-from .mcp_server import OperatorBridgeServer
-from .metadata_writer import MetadataWriter
-from .run_tracker import RunTracker
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
+from llm_kernel.capture.custom_messages import CustomMessageDispatcher
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
+from llm_kernel.capture.metadata_writer import MetadataWriter
+from llm_kernel.capture.run_tracker import RunTracker
 
 if TYPE_CHECKING:  # pragma: no cover
     from ipykernel.ipkernel import IPythonKernel

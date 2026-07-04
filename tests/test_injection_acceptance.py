@@ -11,8 +11,8 @@ from datetime import datetime
 
 import pytest
 
-from llm_kernel._rfc_schemas import K_CLASS_REGISTRY
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel._internal._rfc_schemas import K_CLASS_REGISTRY
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 _PREFIX: str = "The Operator Has Accepted Arbitrary Code Injection at "

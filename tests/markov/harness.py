@@ -1,9 +1,9 @@
 """RFC-004 Markov harness driver — the :class:`EventSequencer`.
 
 Wires the eight :mod:`scenarios` against an in-memory kernel-side
-stack: a real :class:`llm_kernel.run_tracker.RunTracker` whose sink
+stack: a real :class:`llm_kernel.capture.run_tracker.RunTracker` whose sink
 captures every RFC-003 envelope, plus a real
-:class:`llm_kernel.mcp_server.OperatorBridgeServer` invoked through
+:class:`llm_kernel.mcp.mcp_server.OperatorBridgeServer` invoked through
 ``server.request_handlers[CallToolRequest]``.
 
 The fault injector lives in :mod:`.faults` and the replay harness in
@@ -24,12 +24,12 @@ from unittest.mock import patch
 from mcp import types
 from mcp.shared.exceptions import McpError
 
-from llm_kernel.custom_messages import CustomMessageDispatcher
-from llm_kernel.mcp_server import OperatorBridgeServer
-from llm_kernel.run_envelope import (
+from llm_kernel.capture.custom_messages import CustomMessageDispatcher
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
+from llm_kernel.capture.run_envelope import (
     DIRECTION_EXTENSION_TO_KERNEL, make_envelope, validate_envelope,
 )
-from llm_kernel.run_tracker import RunTracker
+from llm_kernel.capture.run_tracker import RunTracker
 
 from .scenarios import Event
 
@@ -262,7 +262,7 @@ class EventSequencer:
         (``exception.type`` / ``exception.message``).
         """
         import time as _time
-        from llm_kernel._attrs import encode_attrs
+        from llm_kernel._internal._attrs import encode_attrs
         envelope = make_envelope(
             "run.complete",
             {

@@ -5,7 +5,7 @@ Per ``docs/atoms/contracts/agent-supervisor.md`` and
 interrupt button (X-EXT commit 5de3401) is
 
 * :meth:`AgentSupervisor.interrupt` -- send SIGINT to the live PID.
-* the ``operator.action`` dispatcher in :mod:`llm_kernel.mcp_server`
+* the ``operator.action`` dispatcher in :mod:`llm_kernel.mcp.mcp_server`
   routes ``{action_type: "agent_interrupt", agent_id: ...}`` to it.
 
 Tests are sync, dependency-free, and patch ``os.kill`` so no real
@@ -20,7 +20,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
-from llm_kernel.agent_supervisor import AgentHandle, AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentHandle, AgentSupervisor
 
 
 class _FakePopen:
@@ -39,7 +39,7 @@ class _FakePopen:
 
 def _make_supervisor() -> AgentSupervisor:
     """Build a supervisor with stub run-tracker + dispatcher (no real kernel)."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -86,7 +86,7 @@ def test_interrupt_running_agent_sends_sigint() -> None:
     """A live agent receives SIGINT via os.kill(pid, signal.SIGINT)."""
     sup = _make_supervisor()
     _seed_handle(sup, "alpha", pid=4242, returncode=None)
-    with patch("llm_kernel.agent_supervisor.os.kill") as fake_kill:
+    with patch("llm_kernel.supervision.agent_supervisor.os.kill") as fake_kill:
         result = sup.interrupt("alpha")
     fake_kill.assert_called_once_with(4242, signal.SIGINT)
     assert result == {"agent_id": "alpha", "status": "interrupted"}
@@ -101,7 +101,7 @@ def test_interrupt_idle_agent_returns_not_running() -> None:
     """
     sup = _make_supervisor()
     _seed_handle(sup, "alpha", pid=4242, returncode=0)
-    with patch("llm_kernel.agent_supervisor.os.kill") as fake_kill:
+    with patch("llm_kernel.supervision.agent_supervisor.os.kill") as fake_kill:
         result = sup.interrupt("alpha")
     fake_kill.assert_not_called()
     assert result == {"agent_id": "alpha", "status": "not_running"}
@@ -110,7 +110,7 @@ def test_interrupt_idle_agent_returns_not_running() -> None:
 def test_interrupt_unknown_agent_returns_unknown() -> None:
     """An agent_id with no spawn record yields ``unknown``."""
     sup = _make_supervisor()
-    with patch("llm_kernel.agent_supervisor.os.kill") as fake_kill:
+    with patch("llm_kernel.supervision.agent_supervisor.os.kill") as fake_kill:
         result = sup.interrupt("ghost")
     fake_kill.assert_not_called()
     assert result == {"agent_id": "ghost", "status": "unknown"}
@@ -126,7 +126,7 @@ def test_interrupt_pid_gone_downgrades_to_not_running() -> None:
     sup = _make_supervisor()
     _seed_handle(sup, "alpha", pid=4242, returncode=None)
     with patch(
-        "llm_kernel.agent_supervisor.os.kill",
+        "llm_kernel.supervision.agent_supervisor.os.kill",
         side_effect=ProcessLookupError(),
     ):
         result = sup.interrupt("alpha")
@@ -160,7 +160,7 @@ def _make_dispatcher_target(supervisor: Optional[Any]):
     the test stays sync and dependency-free. We override
     ``_resolve_agent_supervisor`` to return our recording stand-in.
     """
-    from llm_kernel.mcp_server import OperatorBridgeServer
+    from llm_kernel.mcp.mcp_server import OperatorBridgeServer
 
     class _Stub(OperatorBridgeServer):  # type: ignore[misc]
         def __init__(self) -> None:  # noqa: D401 -- bypass parent __init__

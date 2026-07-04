@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from llm_kernel.event_log import EventLogReplayer
-from llm_kernel.metadata_writer import MetadataWriter
-from llm_kernel.run_envelope import (
+from llm_kernel.capture.event_log import EventLogReplayer
+from llm_kernel.capture.metadata_writer import MetadataWriter
+from llm_kernel.capture.run_envelope import (
     DIRECTION_EXTENSION_TO_KERNEL, DIRECTION_KERNEL_TO_EXTENSION, make_envelope,
 )
 

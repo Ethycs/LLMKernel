@@ -1,4 +1,4 @@
-"""Tests for ``llm_kernel.notebook_format`` — PLAN-S5.0.5 §3.1.
+"""Tests for ``llm_kernel.notebook.notebook_format`` — PLAN-S5.0.5 §3.1.
 
 The bulk of these converters were promoted from
 ``llm_client/notebook.py``; equivalence with the driver-side shim is
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 
-from llm_kernel.notebook_format import (
+from llm_kernel.notebook.notebook_format import (
     detect_format,
     ipynb_to_llmnb,
     llmnb_to_ipynb,

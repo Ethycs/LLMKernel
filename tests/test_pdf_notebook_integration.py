@@ -68,7 +68,7 @@ def test_pdf_upload_simulation():
         
         try:
             # This simulates what the magic command does
-            from llm_kernel.magic_commands.multimodal_native_pdf import NativePDFMagics
+            from llm_kernel.magics.commands.multimodal_native_pdf import NativePDFMagics
             
             # Create magic instance
             class MockShell:
@@ -111,7 +111,7 @@ def test_provider_detection():
     print("\nTesting Provider Detection")
     print("="*60)
     
-    from llm_kernel.magic_commands.multimodal_native_pdf import NativePDFMagics
+    from llm_kernel.magics.commands.multimodal_native_pdf import NativePDFMagics
     
     # Create a mock instance
     class MockKernel:

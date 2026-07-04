@@ -12,7 +12,7 @@ from typing import Any, Dict
 
 import pytest
 
-from llm_kernel.metadata_writer import (
+from llm_kernel.capture.metadata_writer import (
     SCHEMA_VERSION,
     MetadataWriter,
 )
@@ -168,7 +168,7 @@ import uuid as _uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from llm_kernel.agent_supervisor import AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 
 class _FakeStdinH:
@@ -218,7 +218,7 @@ class _FakePopenH:
 
 def _make_sup_h() -> AgentSupervisor:
     """Build a hydrate-test supervisor with a real writer wired (PLAN-S4.1)."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _Sink:
         def emit(self, e: Any) -> None:
@@ -261,7 +261,7 @@ def _seed_turn_h(
 def _patch_health_h(status_code: int = 200):
     fake = MagicMock()
     fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 def test_hydrate_restores_last_seen_turn_id_per_agent(tmp_path: Path) -> None:

@@ -47,13 +47,13 @@ if 'PIXI_ENVIRONMENT_NAME' in os.environ:
 # Try importing the multimodal module
 print("\nChecking LLM Kernel multimodal module...")
 try:
-    from llm_kernel.multimodal import MultimodalContent
+    from llm_kernel.providers.multimodal import MultimodalContent
     print("✓ MultimodalContent imported successfully")
 except ImportError as e:
     print(f"✗ MultimodalContent import failed: {e}")
 
 try:
-    from llm_kernel.magic_commands.multimodal import MultimodalMagics
+    from llm_kernel.magics.commands.multimodal import MultimodalMagics
     print("✓ MultimodalMagics imported successfully")
 except ImportError as e:
     print(f"✗ MultimodalMagics import failed: {e}")

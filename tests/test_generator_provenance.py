@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from llm_kernel.cell_manager import (
+from llm_kernel.notebook.cell_manager import (
     CellManager,
     CellManagerPreconditionError,
     K3J_GENERATOR_PROVENANCE_MISSING,
 )
-from llm_kernel.magic_generators import dispatch_generator
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.magics.magic_generators import dispatch_generator
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

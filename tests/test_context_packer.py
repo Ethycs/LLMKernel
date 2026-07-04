@@ -22,11 +22,11 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
-from llm_kernel.context_packer import (
+from llm_kernel.capture.context_packer import (
     K100OrphanCellError,
     pack,
 )
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _envelope(

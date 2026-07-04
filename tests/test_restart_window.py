@@ -21,12 +21,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_kernel import agent_supervisor as supervisor_mod
-from llm_kernel.agent_supervisor import AgentHandle, AgentSupervisor
+from llm_kernel.supervision import agent_supervisor as supervisor_mod
+from llm_kernel.supervision.agent_supervisor import AgentHandle, AgentSupervisor
 
 
 def _make_supervisor() -> AgentSupervisor:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:

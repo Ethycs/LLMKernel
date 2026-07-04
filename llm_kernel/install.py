@@ -191,7 +191,7 @@ LLM_KERNEL_AUTO_PRUNE=true
         print(f"📝 Created example environment file: {env_example}")
     
     # Create example config file
-    from .config_manager import ConfigManager
+    from llm_kernel.config_manager import ConfigManager
     config_manager = ConfigManager()
     config_manager.create_example_configs()
     

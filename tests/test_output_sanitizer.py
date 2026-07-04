@@ -24,7 +24,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from llm_kernel.socket_writer import (
+from llm_kernel.capture.socket_writer import (
     SocketWriter,
     sanitize_outbound_line, sanitize_outbound_record,
     sanitize_outbound_text,

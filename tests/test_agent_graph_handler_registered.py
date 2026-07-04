@@ -13,7 +13,7 @@ import uuid
 from typing import Any, Callable, Dict
 from unittest.mock import MagicMock
 
-from llm_kernel.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
+from llm_kernel.capture.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
 
 
 class _StubCommManager:

@@ -1,4 +1,4 @@
-"""Tests for ``llm_kernel.file_actions.apply_export`` — PLAN-S5.0.5 Phase 2.
+"""Tests for ``llm_kernel.notebook.file_actions.apply_export`` — PLAN-S5.0.5 Phase 2.
 
 Covers:
 
@@ -17,13 +17,13 @@ import json
 
 import pytest
 
-from llm_kernel.file_actions import apply_export, ExportOutcome
+from llm_kernel.notebook.file_actions import apply_export, ExportOutcome
 from llm_kernel.wire.tools import (
     K3M_NOTEBOOK_EXPORT_PATH_OUTSIDE_WORKSPACE,
     K3N_NOTEBOOK_EXPORT_REFUSED_OVERWRITE,
     K3O_NOTEBOOK_IO_FAILED,
 )
-from llm_kernel.notebook_format import magic_to_llmnb
+from llm_kernel.notebook.notebook_format import magic_to_llmnb
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +328,7 @@ def test_export_then_import_round_trips_cell_text(
     # in Phase 1). We call the function directly with a constructed ctx
     # rather than going through dispatch_generator (which needs a full
     # cell_manager fixture).
-    from llm_kernel.magic_generators import _handle_import, GeneratorContext
+    from llm_kernel.magics.magic_generators import _handle_import, GeneratorContext
     from datetime import datetime, timezone
 
     ctx: GeneratorContext = {
@@ -357,7 +357,7 @@ def test_export_then_import_round_trips_cell_text(
 
 
 def test_export_registered_in_cell_magics() -> None:
-    from llm_kernel.magic_registry import CELL_MAGICS, RESERVED_NAMES
+    from llm_kernel.text.magic_registry import CELL_MAGICS, RESERVED_NAMES
     assert "export" in CELL_MAGICS
     assert CELL_MAGICS["export"].kind == "export"
     assert CELL_MAGICS["export"].status == "active"
@@ -367,7 +367,7 @@ def test_export_registered_in_cell_magics() -> None:
 def test_export_parses_args_to_typed_fields() -> None:
     """``@@export path:"x.llmnb" format:"magic" overwrite:true`` populates
     cell.args with typed fields."""
-    from llm_kernel.cell_text import parse_cell
+    from llm_kernel.text.cell_text import parse_cell
 
     cell = parse_cell(
         '@@export path:"x.llmnb" format:"magic" overwrite:true\n'
@@ -379,7 +379,7 @@ def test_export_parses_args_to_typed_fields() -> None:
 
 
 def test_export_overwrite_defaults_false() -> None:
-    from llm_kernel.cell_text import parse_cell
+    from llm_kernel.text.cell_text import parse_cell
 
     cell = parse_cell('@@export path:"x.llmnb"\n')
     assert cell.args.get("overwrite") is False

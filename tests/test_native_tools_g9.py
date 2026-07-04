@@ -30,7 +30,7 @@ import pytest
 from mcp import types
 from mcp.shared.exceptions import McpError
 
-from llm_kernel.mcp_server import (
+from llm_kernel.mcp.mcp_server import (
     ESCALATE_FLOOD_MAX,
     JSONRPC_OPERATOR_TIMEOUT,
     JSONRPC_PROXIED_REFUSED,

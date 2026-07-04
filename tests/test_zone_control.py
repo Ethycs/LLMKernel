@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from llm_kernel import zone_control
+from llm_kernel.notebook import zone_control
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +293,7 @@ def test_diagnostic_marker_per_resolution(
     def _capture(stage: str, **kwargs):
         captured.append((stage, kwargs))
 
-    with patch("llm_kernel.zone_control._diagnostics") as mock_diag:
+    with patch("llm_kernel.notebook.zone_control._diagnostics") as mock_diag:
         mock_diag.mark = _capture
         zone_control.effective_use_bare()
         zone_control.locate_claude_bin()
@@ -316,7 +316,7 @@ def test_secrets_value_redacted_in_marker(
     def _capture(stage: str, **kwargs):
         captured.append((stage, kwargs))
 
-    with patch("llm_kernel.zone_control._diagnostics") as mock_diag:
+    with patch("llm_kernel.notebook.zone_control._diagnostics") as mock_diag:
         mock_diag.mark = _capture
         zone_control.effective_anthropic_api_key()
 

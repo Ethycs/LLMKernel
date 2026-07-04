@@ -1,8 +1,8 @@
-"""Tests for ``llm_kernel.cell_manager`` — BSP-005 S5.0 text-mutation ops."""
+"""Tests for ``llm_kernel.notebook.cell_manager`` — BSP-005 S5.0 text-mutation ops."""
 
 from __future__ import annotations
 
-from llm_kernel.cell_manager import (
+from llm_kernel.notebook.cell_manager import (
     insert_line_magic_text,
     merge_cells_text,
     remove_line_magic_text,

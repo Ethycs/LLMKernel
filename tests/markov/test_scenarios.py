@@ -163,7 +163,7 @@ def test_unknown_tool_yields_agent_emit_invalid_tool_use() -> None:
     ``run.start`` + one ``run.complete`` for that agent_emit span;
     no tool-typed run.
     """
-    from llm_kernel._attrs import decode_attrs
+    from llm_kernel._internal._attrs import decode_attrs
 
     factory = SCENARIOS["unknown_tool_rejected"]
     result = EventSequencer(factory.build()).run()
@@ -190,7 +190,7 @@ def test_request_approval_timeout_marks_error() -> None:
     ``payload.error`` envelope is gone.  The status is the OTel
     canonical ``STATUS_CODE_ERROR``.
     """
-    from llm_kernel._attrs import decode_attrs
+    from llm_kernel._internal._attrs import decode_attrs
 
     factory = SCENARIOS["request_approval_timeout"]
     result = EventSequencer(factory.build()).run()

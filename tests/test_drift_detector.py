@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`llm_kernel.drift_detector` (RFC-005 §drift_log).
+"""Contract tests for :mod:`llm_kernel.capture.drift_detector` (RFC-005 §drift_log).
 
 Covers each volatile field RFC-005 enumerates plus in-progress span
 truncation and agent-process status drift, with severity classification
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from llm_kernel.drift_detector import (
+from llm_kernel.capture.drift_detector import (
     DriftDetector,
     SEVERITY_ERROR, SEVERITY_INFO, SEVERITY_WARN,
     truncate_in_progress_run_frames,

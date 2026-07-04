@@ -30,9 +30,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
-from llm_kernel.mcp_server import OperatorBridgeServer
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def test_kernel_shutdown_request_with_reason_logs_marker(
         kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
             MagicMock(), {"content": {}}
         )
-        with caplog.at_level(logging.INFO, logger="llm_kernel.custom_messages"):
+        with caplog.at_level(logging.INFO, logger="llm_kernel.capture.custom_messages"):
             dispatcher._on_comm_msg(  # noqa: SLF001
                 {"content": {"data": {
                     "type": "kernel.shutdown_request",

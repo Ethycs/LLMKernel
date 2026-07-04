@@ -1,4 +1,4 @@
-"""Unit tests for ``llm_kernel.magic_hash`` — S5.0.1a foundation slice.
+"""Unit tests for ``llm_kernel.text.magic_hash`` — S5.0.1a foundation slice.
 
 Covers:
 
@@ -24,7 +24,7 @@ import re
 
 import pytest
 
-from llm_kernel import magic_hash as MH
+from llm_kernel.text import magic_hash as MH
 
 
 # --- magic_hash ------------------------------------------------------

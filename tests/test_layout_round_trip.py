@@ -8,7 +8,7 @@ returning the new ``{snapshot_version, tree}`` payload.
 
 from __future__ import annotations
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _new_writer() -> MetadataWriter:

@@ -23,7 +23,7 @@ import pytest
 from mcp import types
 from mcp.shared.exceptions import McpError
 
-from llm_kernel.mcp_server import (
+from llm_kernel.mcp.mcp_server import (
     JSONRPC_PROXIED_IO_FAILURE,
     JSONRPC_PROXIED_REFUSED,
     OperatorBridgeServer,

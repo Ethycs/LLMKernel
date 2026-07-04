@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
+from llm_kernel.capture.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
 
 
 class _StubCommManager:
@@ -79,7 +79,7 @@ def test_shutdown_request_logs_reason_with_event_name(
         kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
             MagicMock(), {"content": {}}
         )
-        with caplog.at_level(logging.INFO, logger="llm_kernel.custom_messages"):
+        with caplog.at_level(logging.INFO, logger="llm_kernel.capture.custom_messages"):
             dispatcher._on_comm_msg(  # noqa: SLF001
                 {"content": {"data": {
                     "type": "kernel.shutdown_request",
@@ -108,7 +108,7 @@ def test_shutdown_request_without_bound_event_warns_and_returns(
         kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
             MagicMock(), {"content": {}}
         )
-        with caplog.at_level(logging.WARNING, logger="llm_kernel.custom_messages"):
+        with caplog.at_level(logging.WARNING, logger="llm_kernel.capture.custom_messages"):
             dispatcher._on_comm_msg(  # noqa: SLF001
                 {"content": {"data": {
                     "type": "kernel.shutdown_request",

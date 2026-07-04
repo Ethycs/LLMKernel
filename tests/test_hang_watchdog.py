@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_kernel.agent_supervisor import AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 
 class _StallPopen:
@@ -74,12 +74,12 @@ class _StallPopen:
 def _patch_health(status_code: int = 200):
     fake = MagicMock()
     fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 def _make_supervisor(threshold: float, granularity: float) -> AgentSupervisor:
     """Build a supervisor with stub run-tracker + dispatcher."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -110,7 +110,7 @@ def test_silence_watchdog_terminates_after_threshold(
     # Keep the Popen patch alive for the duration of the test so the
     # crash-restart watchdog (which fires after the silence watchdog
     # SIGTERMs) does not re-enter real subprocess.Popen.
-    with caplog.at_level("ERROR", logger="llm_kernel.agent_supervisor"):
+    with caplog.at_level("ERROR", logger="llm_kernel.supervision.agent_supervisor"):
         with _patch_health(), patch("subprocess.Popen", return_value=fake):
             handle = sup.spawn(
                 zone_id="z1", agent_id="alpha", task="x",
@@ -190,7 +190,7 @@ def test_silence_watchdog_logs_event_with_attributes(
     """Hang detection MUST log ``agent.hang_detected`` at ERROR level."""
     sup = _make_supervisor(threshold=0.2, granularity=0.05)
     fake = _StallPopen()
-    with caplog.at_level("ERROR", logger="llm_kernel.agent_supervisor"):
+    with caplog.at_level("ERROR", logger="llm_kernel.supervision.agent_supervisor"):
         with _patch_health(), patch("subprocess.Popen", return_value=fake):
             handle = sup.spawn(
                 zone_id="z1", agent_id="alpha", task="x",

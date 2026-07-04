@@ -20,7 +20,7 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict, List
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _new_writer() -> MetadataWriter:

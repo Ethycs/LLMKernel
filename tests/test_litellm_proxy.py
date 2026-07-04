@@ -12,8 +12,8 @@ from typing import Any, AsyncIterator, Dict, List
 import pytest
 from fastapi.testclient import TestClient
 
-from llm_kernel import litellm_proxy as proxy_module
-from llm_kernel.litellm_proxy import LiteLLMProxyServer
+from llm_kernel.providers import litellm_proxy as proxy_module
+from llm_kernel.providers.litellm_proxy import LiteLLMProxyServer
 
 
 class StubRunTracker:

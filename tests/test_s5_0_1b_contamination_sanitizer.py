@@ -25,8 +25,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel.agent_supervisor import AgentHandle, AgentSupervisor
-from llm_kernel.socket_writer import SocketWriter
+from llm_kernel.supervision.agent_supervisor import AgentHandle, AgentSupervisor
+from llm_kernel.capture.socket_writer import SocketWriter
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ from llm_kernel.socket_writer import SocketWriter
 
 def _make_supervisor() -> AgentSupervisor:
     """Bare supervisor with stub run-tracker; no kernel process wiring."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:

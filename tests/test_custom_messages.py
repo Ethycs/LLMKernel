@@ -1,6 +1,6 @@
 """Track B3 / RFC-006 v2 contract tests for the custom-message dispatcher.
 
-Exercises :class:`llm_kernel.custom_messages.CustomMessageDispatcher`
+Exercises :class:`llm_kernel.capture.custom_messages.CustomMessageDispatcher`
 against a stub kernel mirroring the IPython surface the dispatcher
 reads (``iopub_socket``, ``session.send``,
 ``shell.comm_manager.register_target``).
@@ -26,11 +26,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel.custom_messages import (
+from llm_kernel.capture.custom_messages import (
     DEFAULT_BUFFER_SIZE, DEFAULT_COMM_TARGET, MIME_ENVELOPE, MIME_RUN,
     CustomMessageDispatcher,
 )
-from llm_kernel.run_envelope import DIRECTION_EXTENSION_TO_KERNEL, make_envelope
+from llm_kernel.capture.run_envelope import DIRECTION_EXTENSION_TO_KERNEL, make_envelope
 
 
 class StubSession:
@@ -237,7 +237,7 @@ def test_notebook_metadata_family_f_envelope_emits() -> None:
 
 def test_buffer_overflow_drops_oldest_with_warning(caplog: pytest.LogCaptureFixture) -> None:
     dispatcher, _ = _new()
-    with caplog.at_level(logging.WARNING, logger="llm_kernel.custom_messages"):
+    with caplog.at_level(logging.WARNING, logger="llm_kernel.capture.custom_messages"):
         for _ in range(DEFAULT_BUFFER_SIZE + 2):
             dispatcher.emit(_layout_env())
     assert len(dispatcher._buffer) == DEFAULT_BUFFER_SIZE  # noqa: SLF001
@@ -291,7 +291,7 @@ def test_inbound_unknown_type_is_dropped_with_warning(caplog: pytest.LogCaptureF
     dispatcher, _ = _new()
     seen: List[Dict[str, Any]] = []
     dispatcher.register_handler("operator.action", seen.append)
-    with caplog.at_level(logging.WARNING, logger="llm_kernel.custom_messages"):
+    with caplog.at_level(logging.WARNING, logger="llm_kernel.capture.custom_messages"):
         # RFC-006 W4: inbound type values outside the catalog are
         # logged and dropped (V1 fail-closed).
         dispatcher._on_comm_msg(  # noqa: SLF001

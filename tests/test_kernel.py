@@ -25,13 +25,13 @@ class TestImports:
     
     def test_import_context_manager(self):
         """Test ContextManager and ExecutionTracker imports."""
-        from llm_kernel.context_manager import ContextManager, ExecutionTracker
+        from llm_kernel.providers.context_manager import ContextManager, ExecutionTracker
         assert ContextManager is not None
         assert ExecutionTracker is not None
     
     def test_import_dialogue_pruner(self):
         """Test DialoguePruner import."""
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         assert DialoguePruner is not None
     
     def test_import_config_manager(self):
@@ -96,7 +96,7 @@ class TestExecutionTracker:
     
     def test_execution_tracker_creation(self):
         """Test ExecutionTracker can be created."""
-        from llm_kernel.context_manager import ExecutionTracker
+        from llm_kernel.providers.context_manager import ExecutionTracker
         
         tracker = ExecutionTracker()
         assert tracker is not None
@@ -104,7 +104,7 @@ class TestExecutionTracker:
     
     def test_track_execution(self):
         """Test execution tracking."""
-        from llm_kernel.context_manager import ExecutionTracker
+        from llm_kernel.providers.context_manager import ExecutionTracker
         
         tracker = ExecutionTracker()
         
@@ -118,7 +118,7 @@ class TestExecutionTracker:
     
     def test_dependency_detection(self):
         """Test dependency detection."""
-        from llm_kernel.context_manager import ExecutionTracker
+        from llm_kernel.providers.context_manager import ExecutionTracker
         
         tracker = ExecutionTracker()
         
@@ -136,7 +136,7 @@ class TestExecutionTracker:
     
     def test_pin_unpin_cells(self):
         """Test cell pinning functionality."""
-        from llm_kernel.context_manager import ExecutionTracker
+        from llm_kernel.providers.context_manager import ExecutionTracker
         
         tracker = ExecutionTracker()
         
@@ -150,7 +150,7 @@ class TestExecutionTracker:
     
     def test_ignore_include_cells(self):
         """Test cell ignoring functionality."""
-        from llm_kernel.context_manager import ExecutionTracker
+        from llm_kernel.providers.context_manager import ExecutionTracker
         
         tracker = ExecutionTracker()
         
@@ -168,7 +168,7 @@ class TestContextManager:
     
     def test_context_manager_creation(self):
         """Test ContextManager can be created."""
-        from llm_kernel.context_manager import ContextManager
+        from llm_kernel.providers.context_manager import ContextManager
         
         context_manager = ContextManager()
         assert context_manager is not None
@@ -176,7 +176,7 @@ class TestContextManager:
     
     def test_add_exchange(self):
         """Test adding exchanges to conversation history."""
-        from llm_kernel.context_manager import ContextManager
+        from llm_kernel.providers.context_manager import ContextManager
         
         context_manager = ContextManager()
         
@@ -193,7 +193,7 @@ class TestContextManager:
     
     def test_context_strategies(self):
         """Test different context strategies."""
-        from llm_kernel.context_manager import ContextManager
+        from llm_kernel.providers.context_manager import ContextManager
         
         context_manager = ContextManager()
         
@@ -228,7 +228,7 @@ class TestContextManager:
     
     def test_context_limits(self):
         """Test context window limits."""
-        from llm_kernel.context_manager import ContextManager
+        from llm_kernel.providers.context_manager import ContextManager
         
         context_manager = ContextManager()
         
@@ -239,7 +239,7 @@ class TestContextManager:
     
     def test_token_estimation(self):
         """Test token estimation."""
-        from llm_kernel.context_manager import ContextManager
+        from llm_kernel.providers.context_manager import ContextManager
         
         context_manager = ContextManager()
         
@@ -258,7 +258,7 @@ class TestDialoguePruner:
     
     def test_dialogue_pruner_creation(self):
         """Test DialoguePruner can be created."""
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         
         pruner = DialoguePruner()
         assert pruner is not None
@@ -266,7 +266,7 @@ class TestDialoguePruner:
     
     def test_pruning_strategies(self):
         """Test different pruning strategies."""
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         
         pruner = DialoguePruner()
         
@@ -298,7 +298,7 @@ class TestDialoguePruner:
     
     def test_relevance_scoring(self):
         """Test relevance scoring."""
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         
         pruner = DialoguePruner()
         
@@ -315,7 +315,7 @@ class TestDialoguePruner:
     
     def test_keyword_similarity(self):
         """Test keyword similarity calculation."""
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         
         pruner = DialoguePruner()
         
@@ -333,7 +333,7 @@ class TestDialoguePruner:
     
     def test_exchange_summarization(self):
         """Test exchange summarization."""
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         
         pruner = DialoguePruner()
         
@@ -435,8 +435,8 @@ class TestIntegration:
     
     def test_end_to_end_workflow(self):
         """Test a complete workflow without external dependencies."""
-        from llm_kernel.context_manager import ContextManager, ExecutionTracker
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.context_manager import ContextManager, ExecutionTracker
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         
         # Create components
         context_manager = ContextManager()

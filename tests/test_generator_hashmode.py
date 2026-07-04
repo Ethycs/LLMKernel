@@ -6,15 +6,15 @@ import os
 
 import pytest
 
-from llm_kernel.cell_manager import CellManager
-from llm_kernel.magic_generators import (
+from llm_kernel.notebook.cell_manager import CellManager
+from llm_kernel.magics.magic_generators import (
     GeneratorError,
     K3I_GENERATOR_HANDLER_PRODUCED_INVALID_HASH,
     _with_optional_hmac,
     dispatch_generator,
 )
-from llm_kernel.magic_hash import magic_hash, magic_pin_fingerprint
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.text.magic_hash import magic_hash, magic_pin_fingerprint
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

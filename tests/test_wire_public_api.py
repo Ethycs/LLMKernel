@@ -62,14 +62,14 @@ def test_wire_version_parts_consistent_with_version_string() -> None:
 def test_tool_catalog_alias_identity() -> None:
     """wire.tools.TOOL_CATALOG is identical to _rfc_schemas.TOOL_CATALOG."""
     from llm_kernel.wire import tools as wire_tools
-    import llm_kernel._rfc_schemas as rfc
+    import llm_kernel._internal._rfc_schemas as rfc
     assert wire_tools.TOOL_CATALOG is rfc.TOOL_CATALOG
 
 
 def test_rfc_schemas_validate_tool_input_alias() -> None:
     """_rfc_schemas.validate_tool_input delegates to wire.tools."""
     from llm_kernel.wire.tools import validate_tool_input as wire_fn
-    from llm_kernel._rfc_schemas import validate_tool_input as rfc_fn
+    from llm_kernel._internal._rfc_schemas import validate_tool_input as rfc_fn
     assert wire_fn is rfc_fn
 
 

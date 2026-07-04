@@ -20,13 +20,13 @@ from __future__ import annotations
 
 import pytest
 
-from llm_kernel.cell_manager import CellManager
-from llm_kernel.magic_emit_tool import (
+from llm_kernel.notebook.cell_manager import CellManager
+from llm_kernel.magics.magic_emit_tool import (
     K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT,
     MagicEmitError,
     emit_magic_cell,
 )
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

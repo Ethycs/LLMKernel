@@ -15,8 +15,8 @@ load_dotenv()
 # Add the project root to the path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from llm_kernel.openai_assistant_integration import OpenAIAssistantIntegration
-from llm_kernel.file_upload_manager import FileUploadManager
+from llm_kernel.providers.openai_assistant_integration import OpenAIAssistantIntegration
+from llm_kernel.providers.file_upload_manager import FileUploadManager
 
 def test_pdf_upload():
     """Test PDF upload and query with OpenAI Assistant API."""

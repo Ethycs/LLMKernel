@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel.agent_supervisor import (
+from llm_kernel.supervision.agent_supervisor import (
     AgentHandle, AgentSupervisor,
     K35_PLAIN_MAGIC_IN_HASH_MODE, K36_HASHED_MAGIC_EMISSION_BLOCKED,
 )
@@ -35,7 +35,7 @@ from llm_kernel.agent_supervisor import (
 
 def _make_supervisor() -> AgentSupervisor:
     """Bare supervisor with a stub run-tracker; no kernel wiring."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -299,7 +299,7 @@ def test_k_class_constants_present() -> None:
 
 def test_k_class_registry_has_k35_k36() -> None:
     """The central K-class registry documents K35 + K36."""
-    from llm_kernel._rfc_schemas import K_CLASS_REGISTRY, k_class_info
+    from llm_kernel._internal._rfc_schemas import K_CLASS_REGISTRY, k_class_info
 
     assert "K35" in K_CLASS_REGISTRY
     assert "K36" in K_CLASS_REGISTRY
@@ -313,7 +313,7 @@ def test_k_class_registry_has_k35_k36() -> None:
 
 def test_k_class_registry_includes_pre_s5_codes() -> None:
     """Pre-S5.0.1 codes (K30/K31/K32/K34) are registered for audit completeness."""
-    from llm_kernel._rfc_schemas import K_CLASS_REGISTRY
+    from llm_kernel._internal._rfc_schemas import K_CLASS_REGISTRY
 
     for code in ("K30", "K31", "K32", "K34"):
         assert code in K_CLASS_REGISTRY, f"missing {code} in registry"

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from llm_kernel import magic_hash as MH
-from llm_kernel.auth_handlers import (
+from llm_kernel.text import magic_hash as MH
+from llm_kernel.mcp.auth_handlers import (
     AuthCommandResult,
     K38_PIN_TOO_SHORT,
     K39_PIN_COLLISION,
@@ -24,8 +24,8 @@ from llm_kernel.auth_handlers import (
     auth_verify,
     validate_pin,
 )
-from llm_kernel.cell_manager import CellManager
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.notebook.cell_manager import CellManager
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

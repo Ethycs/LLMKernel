@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`llm_kernel.socket_writer` (RFC-008 §2).
+"""Contract tests for :mod:`llm_kernel.capture.socket_writer` (RFC-008 §2).
 
 Exercises:
 
@@ -21,7 +21,7 @@ from typing import List
 
 import pytest
 
-from llm_kernel.socket_writer import SocketWriter, parse_address
+from llm_kernel.capture.socket_writer import SocketWriter, parse_address
 
 
 # ---------------------------------------------------------------------------

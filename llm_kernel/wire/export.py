@@ -26,8 +26,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-from .tools import TOOL_CATALOG
-from .version import WIRE_VERSION
+from llm_kernel.wire.tools import TOOL_CATALOG
+from llm_kernel.wire.version import WIRE_VERSION
 
 
 def _family_schema(

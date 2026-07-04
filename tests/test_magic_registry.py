@@ -1,11 +1,11 @@
-"""Tests for ``llm_kernel.magic_registry`` — BSP-005 S5.0."""
+"""Tests for ``llm_kernel.text.magic_registry`` — BSP-005 S5.0."""
 
 from __future__ import annotations
 
 import pytest
 
-from llm_kernel import magic_registry as MR
-from llm_kernel.cell_text import parse_cell
+from llm_kernel.text import magic_registry as MR
+from llm_kernel.text.cell_text import parse_cell
 
 
 # --- registry shape --------------------------------------------------
@@ -50,8 +50,8 @@ def test_is_reserved_name_llmnb_prefix() -> None:
 
 def test_k32_on_reserved_agent_id_via_supervisor() -> None:
     """AgentSupervisor.spawn raises K32 when agent_id is reserved."""
-    from llm_kernel._provisioning import PreSpawnValidationError
-    from llm_kernel.agent_supervisor import AgentSupervisor
+    from llm_kernel.supervision._provisioning import PreSpawnValidationError
+    from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
     # Build a minimal supervisor — we only need spawn() to reach the
     # K32 guard before any real work happens.
@@ -71,8 +71,8 @@ def test_k32_on_reserved_agent_id_via_supervisor() -> None:
 
 def test_k32_on_break_agent_id() -> None:
     """``@@spawn break`` would shadow the splitter — rejected."""
-    from llm_kernel._provisioning import PreSpawnValidationError
-    from llm_kernel.agent_supervisor import AgentSupervisor
+    from llm_kernel.supervision._provisioning import PreSpawnValidationError
+    from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
     sup = AgentSupervisor.__new__(AgentSupervisor)
     with pytest.raises(PreSpawnValidationError) as ei:
@@ -122,7 +122,7 @@ def test_mark_line_magic_flips_kind() -> None:
 
 def test_mark_line_magic_unknown_kind_raises_k34() -> None:
     """``@mark xyzzy`` raises K34 (incompatible kind change)."""
-    from llm_kernel.cell_text import (
+    from llm_kernel.text.cell_text import (
         CellParseError,
         K34_INCOMPATIBLE_KIND_CHANGE,
     )

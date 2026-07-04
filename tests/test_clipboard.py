@@ -4,7 +4,7 @@ def test_clipboard():
     print("Testing clipboard image handling...\n")
     
     try:
-        from llm_kernel.multimodal import MultimodalContent
+        from llm_kernel.providers.multimodal import MultimodalContent
         
         # Create a mock kernel object
         class MockKernel:

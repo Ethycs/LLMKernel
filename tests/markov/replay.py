@@ -11,7 +11,7 @@ V1 mode semantics:
   envelopes are folded into the final state via :func:`fold_state`.
 * **LIVE** — V1 echoes the captured envelopes (no real model calls).
   ``TODO(T2-future)``: re-drive a fresh
-  :class:`llm_kernel.mcp_server.OperatorBridgeServer` so live replay
+  :class:`llm_kernel.mcp.mcp_server.OperatorBridgeServer` so live replay
   produces NEW outputs against the recorded inputs.
 * **PARTIAL** — filter the captured envelopes by a selector predicate
   before folding. Useful for replaying one cell, one agent, or one

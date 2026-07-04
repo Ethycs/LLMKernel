@@ -261,7 +261,7 @@ class TestAsyncOperations:
         query = "What is 2 + 2?"
         
         # Execute async query
-        from llm_kernel.llm_integration import LLMIntegration
+        from llm_kernel.providers.llm_integration import LLMIntegration
         llm = LLMIntegration(kernel_instance)
         
         result = await llm.query_llm_async(query)

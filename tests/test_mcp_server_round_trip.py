@@ -1,7 +1,7 @@
 """Track B1 contract test for RFC-001 v1.0.0 MCP tool catalog.
 
 This test exercises the in-process tool registry of
-:class:`llm_kernel.mcp_server.OperatorBridgeServer` without going over
+:class:`llm_kernel.mcp.mcp_server.OperatorBridgeServer` without going over
 stdio. It is the deliverable acceptance test for Stage 2 Track B1: the
 server starts, registers all thirteen RFC-001 tools, and round-trips a
 ``notify`` plus ``report_completion`` end-to-end.
@@ -25,7 +25,7 @@ import pytest
 from mcp import types
 from mcp.shared.exceptions import McpError
 
-from llm_kernel.mcp_server import (
+from llm_kernel.mcp.mcp_server import (
     RFC_001_VERSION,
     SERVER_NAME,
     OperatorBridgeServer,
@@ -256,8 +256,8 @@ async def test_unknown_tool_emits_agent_emit_invalid_tool_use() -> None:
     JSON-RPC denial.
     """
     from typing import Any, Dict, List
-    from llm_kernel.run_tracker import RunTracker
-    from llm_kernel._attrs import decode_attrs
+    from llm_kernel.capture.run_tracker import RunTracker
+    from llm_kernel._internal._attrs import decode_attrs
 
     class _ListSink:
         def __init__(self) -> None:

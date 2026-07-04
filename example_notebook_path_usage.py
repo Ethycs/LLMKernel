@@ -22,7 +22,7 @@ class NotebookInfoMagics(Magics):
         
         # Initialize notebook utils if available
         try:
-            from llm_kernel.notebook_utils import NotebookUtils
+            from llm_kernel.notebook.notebook_utils import NotebookUtils
             self.notebook_utils = NotebookUtils(kernel_instance)
         except ImportError:
             self.notebook_utils = None
@@ -191,7 +191,7 @@ def add_notebook_path_to_kernel(kernel_class):
         
         # Add notebook utils
         try:
-            from llm_kernel.notebook_utils import NotebookUtils
+            from llm_kernel.notebook.notebook_utils import NotebookUtils
             self.notebook_utils = NotebookUtils(self)
             
             # Try to get notebook path on initialization
@@ -237,7 +237,7 @@ def get_context_from_notebook_file(kernel_instance):
 
 if __name__ == "__main__":
     # Example of standalone usage
-    from llm_kernel.notebook_utils import NotebookUtils
+    from llm_kernel.notebook.notebook_utils import NotebookUtils
     
     utils = NotebookUtils()
     notebook_path = utils.get_notebook_path()

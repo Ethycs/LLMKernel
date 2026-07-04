@@ -1,6 +1,6 @@
 """RFC-001 v1.0.0 tool input/output JSON Schemas — public wire surface.
 
-Promoted from ``llm_kernel._rfc_schemas`` (private) to
+Promoted from ``llm_kernel._internal._rfc_schemas`` (private) to
 ``llm_kernel.wire.tools`` (public) in S5.0.3a.  All content is
 identical to the original; the move makes the contract surface
 importable by external drivers without depending on underscore-prefixed
@@ -9,7 +9,7 @@ internals.
 JSON Schemas (Draft 2020-12) for the thirteen RFC-001 tools — ten native
 operator-interaction primitives and three proxied system tools — extracted
 verbatim from ``docs/rfcs/RFC-001-mcp-tool-taxonomy.md``.  The MCP server
-in :mod:`llm_kernel.mcp_server` registers these as the ``inputSchema`` /
+in :mod:`llm_kernel.mcp.mcp_server` registers these as the ``inputSchema`` /
 ``outputSchema`` for each tool.
 
 Per RFC-001 common conventions, every schema sets

@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
-from llm_kernel.agent_supervisor import AgentHandle, AgentSupervisor
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.supervision.agent_supervisor import AgentHandle, AgentSupervisor
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ class _StubStdin:
 
 
 def _make_supervisor() -> AgentSupervisor:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:

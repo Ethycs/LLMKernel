@@ -1,6 +1,6 @@
 """Stage 2 Track B2 contract tests for the run-tracker (OTLP/JSON form).
 
-These pytest tests exercise :class:`llm_kernel.run_tracker.RunTracker`
+These pytest tests exercise :class:`llm_kernel.capture.run_tracker.RunTracker`
 through an in-memory list-sink, asserting:
 
 * RFC-003 envelope shapes for ``run.start`` / ``run.event`` /
@@ -30,13 +30,13 @@ from typing import Any, Dict, List
 
 import pytest
 
-from llm_kernel._attrs import decode_attrs
-from llm_kernel.run_envelope import (
+from llm_kernel._internal._attrs import decode_attrs
+from llm_kernel.capture.run_envelope import (
     DIRECTION_KERNEL_TO_EXTENSION,
     RFC003_VERSION,
     validate_envelope,
 )
-from llm_kernel.run_tracker import RunRecord, RunTracker, Span
+from llm_kernel.capture.run_tracker import RunRecord, RunTracker, Span
 
 #: 16-lowercase-hex regex (OTLP spanId).
 _SPAN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -308,7 +308,7 @@ def test_run_tracker_with_dispatcher_sink() -> None:
     """
     from unittest.mock import MagicMock
 
-    from llm_kernel.custom_messages import CustomMessageDispatcher
+    from llm_kernel.capture.custom_messages import CustomMessageDispatcher
 
     sent: List[tuple] = []
 

@@ -16,7 +16,7 @@ import time
 from typing import Any, Callable, Dict, List
 from unittest.mock import MagicMock
 
-from llm_kernel.custom_messages import (
+from llm_kernel.capture.custom_messages import (
     DEFAULT_COMM_TARGET, DEFAULT_HEARTBEAT_INTERVAL_SEC,
     CustomMessageDispatcher,
 )

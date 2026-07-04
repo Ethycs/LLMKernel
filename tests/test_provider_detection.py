@@ -10,7 +10,7 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from llm_kernel.magic_commands.multimodal_native_pdf import NativePDFMagics
+from llm_kernel.magics.commands.multimodal_native_pdf import NativePDFMagics
 
 
 class TestProviderDetection(unittest.TestCase):
@@ -91,7 +91,7 @@ class TestFileUploadManager(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures."""
-        from llm_kernel.file_upload_manager import FileUploadManager
+        from llm_kernel.providers.file_upload_manager import FileUploadManager
         
         # Create a mock logger
         class MockLogger:

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import pytest
 
-from llm_kernel.cell_manager import CellManager, restamp_text
-from llm_kernel.magic_hash import magic_hash
-from llm_kernel.magic_registry import CELL_MAGICS, LINE_MAGICS
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.notebook.cell_manager import CellManager, restamp_text
+from llm_kernel.text.magic_hash import magic_hash
+from llm_kernel.text.magic_registry import CELL_MAGICS, LINE_MAGICS
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 PIN_OLD = "first-pin-aaaaa"

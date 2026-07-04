@@ -9,7 +9,7 @@ four pieces, one per public module below:
   interaction patterns the harness drives, per RFC-004 §"Worked example"
   and §"Replay harness modes").
 * :mod:`harness` — the driver: an in-memory event sequencer wired
-  against a real :class:`llm_kernel.mcp_server.OperatorBridgeServer`,
+  against a real :class:`llm_kernel.mcp.mcp_server.OperatorBridgeServer`,
   plus the fault injector and the three RFC-004 replay modes
   (LIVE / DRY / PARTIAL).
 * :mod:`invariants` — the nine RFC-004 §"Property-based invariants"

@@ -20,16 +20,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel._provisioning import (
+from llm_kernel.supervision._provisioning import (
     EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION,
     PreSpawnValidationError,
     extract_template_version,
 )
-from llm_kernel.agent_supervisor import AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 
 def _make_supervisor() -> AgentSupervisor:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -89,7 +89,7 @@ def test_minor_mismatch_warns_but_proceeds(
     expected_major = EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION.split(".")[0]
     drift = f"{expected_major}.9.0"
     rendered = _prompt_with_version(drift)
-    with caplog.at_level(logging.WARNING, logger="llm_kernel.agent_supervisor"):
+    with caplog.at_level(logging.WARNING, logger="llm_kernel.supervision.agent_supervisor"):
         sup._validate_template_version(rendered)  # no exception
     msgs = " | ".join(r.getMessage() for r in caplog.records)
     assert "minor version drift" in msgs
@@ -103,7 +103,7 @@ def test_patch_mismatch_proceeds_silently(
     parts = EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION.split(".")
     drift = f"{parts[0]}.{parts[1]}.99"
     rendered = _prompt_with_version(drift)
-    with caplog.at_level(logging.WARNING, logger="llm_kernel.agent_supervisor"):
+    with caplog.at_level(logging.WARNING, logger="llm_kernel.supervision.agent_supervisor"):
         sup._validate_template_version(rendered)
     msgs = " | ".join(r.getMessage() for r in caplog.records)
     assert "minor version drift" not in msgs
@@ -115,7 +115,7 @@ def test_missing_marker_logs_warning_proceeds(
 ) -> None:
     """Absent marker -> warning + proceed (not a fatal pre-spawn error)."""
     sup = _make_supervisor()
-    with caplog.at_level(logging.WARNING, logger="llm_kernel.agent_supervisor"):
+    with caplog.at_level(logging.WARNING, logger="llm_kernel.supervision.agent_supervisor"):
         sup._validate_template_version("plain prompt with no marker at all")
     msgs = " | ".join(r.getMessage() for r in caplog.records)
     assert "missing version marker" in msgs
@@ -130,7 +130,7 @@ def test_unparseable_version_refuses_spawn() -> None:
     # via the regex (it pins three integer groups). Skip — the
     # _split_semver branch is reachable only via in-process API misuse
     # and is covered by importing the helper directly.
-    from llm_kernel._provisioning import _split_semver
+    from llm_kernel.supervision._provisioning import _split_semver
 
     with pytest.raises(ValueError):
         _split_semver("not-a-version")

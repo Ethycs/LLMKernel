@@ -27,13 +27,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from llm_kernel._provisioning import (
+from llm_kernel.supervision._provisioning import (
     ALLOWED_TOOLS, CANONICAL_SYSTEM_PROMPT_TEMPLATE, DISABLED_TOOLS,
     MCP_SERVER_NAME, PreSpawnValidationError, RFC001_ALLOWED_TOOLS,
     build_argv, build_env, is_secret_var,
     render_mcp_config, render_system_prompt, validate_pre_spawn,
 )
-from llm_kernel.agent_supervisor import AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ def test_render_mcp_config_has_thirteen_tools() -> None:
     assert tuple(server["allowedTools"]) == RFC001_ALLOWED_TOOLS
     assert server["transport"] == "stdio"
     assert server["command"] == "/usr/bin/python"
-    assert server["args"][:2] == ["-m", "llm_kernel.mcp_server"]
+    assert server["args"][:2] == ["-m", "llm_kernel.mcp.mcp_server"]
     assert server["env"]["LLMKERNEL_RUN_TRACE_ID"] == "t1"
 
 
@@ -182,7 +182,7 @@ def test_pre_spawn_rejects_unreachable_litellm(tmp_path: Path) -> None:
     sp = tmp_path / "sp.txt"
     mcp.write_text("{}")
     sp.write_text("prompt")
-    with patch("llm_kernel._provisioning.httpx.head",
+    with patch("llm_kernel.supervision._provisioning.httpx.head",
                side_effect=httpx.ConnectError("nope")):
         with pytest.raises(PreSpawnValidationError) as ei:
             validate_pre_spawn(
@@ -200,7 +200,7 @@ def test_pre_spawn_rejects_litellm_non_200(tmp_path: Path) -> None:
     sp.write_text("prompt")
     fake = MagicMock()
     fake.status_code = 503
-    with patch("llm_kernel._provisioning.httpx.head", return_value=fake):
+    with patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake):
         with pytest.raises(PreSpawnValidationError):
             validate_pre_spawn(
                 api_key="sk-x", llm_endpoint_url="http://127.0.0.1:1/v1",
@@ -215,7 +215,7 @@ def test_pre_spawn_rejects_empty_mcp_config(tmp_path: Path) -> None:
     mcp.write_text("")  # empty
     sp.write_text("prompt")
     fake = MagicMock(); fake.status_code = 200
-    with patch("llm_kernel._provisioning.httpx.head", return_value=fake):
+    with patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake):
         with pytest.raises(PreSpawnValidationError) as ei:
             validate_pre_spawn(
                 api_key="sk-x", llm_endpoint_url="http://127.0.0.1:1/v1",
@@ -266,7 +266,7 @@ class _FakePopen:
 
 def _patch_health(status_code: int = 200):
     fake = MagicMock(); fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 def _make_supervisor() -> AgentSupervisor:
@@ -277,8 +277,8 @@ def _make_supervisor() -> AgentSupervisor:
     ``metadata.rts.zone.agents.<*>.turns[]``.  Tests seed turns via
     :func:`_seed_turn` (which submits ``append_turn`` intents).
     """
-    from llm_kernel.run_tracker import RunTracker
-    from llm_kernel.metadata_writer import MetadataWriter
+    from llm_kernel.capture.run_tracker import RunTracker
+    from llm_kernel.capture.metadata_writer import MetadataWriter
 
     class _ListSink:
         def __init__(self) -> None: self.envelopes: List[Dict[str, Any]] = []
@@ -366,7 +366,7 @@ def test_supervisor_spawn_creates_artifact_files(tmp_path: Path) -> None:
 def test_supervisor_pre_spawn_failure_raises_no_files_left(tmp_path: Path) -> None:
     """Health-check failure raises PreSpawnValidationError; no Popen invoked."""
     sup = _make_supervisor()
-    with patch("llm_kernel._provisioning.httpx.head",
+    with patch("llm_kernel.supervision._provisioning.httpx.head",
                side_effect=httpx.ConnectError("nope")), \
             patch("subprocess.Popen") as popen:
         with pytest.raises(PreSpawnValidationError):
@@ -420,7 +420,7 @@ def test_supervisor_stdout_prose_logs_violation(tmp_path: Path) -> None:
 
 def _decode_attrs(attrs: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Tiny attr decoder so tests can read ``llmnb.*`` without importing _attrs."""
-    from llm_kernel._attrs import decode_attrs
+    from llm_kernel._internal._attrs import decode_attrs
     return decode_attrs(attrs)
 
 

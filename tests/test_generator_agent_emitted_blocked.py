@@ -14,19 +14,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel import _diagnostics
-from llm_kernel.agent_supervisor import (
+from llm_kernel._internal import _diagnostics
+from llm_kernel.supervision.agent_supervisor import (
     AgentHandle,
     AgentSupervisor,
     K35_PLAIN_MAGIC_IN_HASH_MODE,
     K36_HASHED_MAGIC_EMISSION_BLOCKED,
     K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED,
 )
-from llm_kernel.magic_hash import magic_hash, magic_pin_fingerprint
+from llm_kernel.text.magic_hash import magic_hash, magic_pin_fingerprint
 
 
 def _make_supervisor() -> AgentSupervisor:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:

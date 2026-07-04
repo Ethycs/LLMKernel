@@ -15,15 +15,15 @@ from typing import Optional
 
 import pytest
 
-from llm_kernel import _diagnostics
-from llm_kernel.cell_manager import (
+from llm_kernel._internal import _diagnostics
+from llm_kernel.notebook.cell_manager import (
     CellManager,
     CellManagerPreconditionError,
     K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED,
     K3D_RUNNING_CELL_KIND_CHANGE_BLOCKED,
     K3F_RUNNING_CELL_EDIT_TEXT_ONLY_PATH,
 )
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @dataclass

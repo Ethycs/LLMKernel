@@ -6,13 +6,13 @@ import json
 
 import pytest
 
-from llm_kernel.cell_manager import CellManager
-from llm_kernel.magic_generators import (
+from llm_kernel.notebook.cell_manager import CellManager
+from llm_kernel.magics.magic_generators import (
     GeneratorError,
     K30_GENERATOR_INPUT_INVALID,
     dispatch_generator,
 )
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 @pytest.fixture

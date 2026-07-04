@@ -16,22 +16,22 @@ def test_imports():
         print("✓")
         
         print("  - Importing magic command modules...", end=" ")
-        from llm_kernel.magic_commands import (
+        from llm_kernel.magics.commands import (
             BaseMagics, ContextMagics, MCPMagics, 
             RerankingMagics, ConfigMagics
         )
         print("✓")
         
         print("  - Importing support modules...", end=" ")
-        from llm_kernel.context_manager import ContextManager, ExecutionTracker
-        from llm_kernel.dialogue_pruner import DialoguePruner
+        from llm_kernel.providers.context_manager import ContextManager, ExecutionTracker
+        from llm_kernel.providers.dialogue_pruner import DialoguePruner
         from llm_kernel.config_manager import ConfigManager
-        from llm_kernel.llm_integration import LLMIntegration
+        from llm_kernel.providers.llm_integration import LLMIntegration
         print("✓")
         
         print("  - Checking optional imports...", end=" ")
         try:
-            from llm_kernel.mcp_manager import MCPManager
+            from llm_kernel.mcp.mcp_manager import MCPManager
             print("✓ (MCP available)")
         except ImportError:
             print("⚠ (MCP not available - fastmcp not installed)")

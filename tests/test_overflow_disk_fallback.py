@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_kernel.metadata_writer import MetadataWriter
+from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _make_span(name: str) -> Dict[str, Any]:
@@ -45,7 +45,7 @@ def test_overflow_writes_marker_and_snapshot(
         workspace_root=tmp_path,
         session_id="s-overflow",
     )
-    with caplog.at_level(_logging.WARNING, logger="llm_kernel.metadata_writer"):
+    with caplog.at_level(_logging.WARNING, logger="llm_kernel.capture.metadata_writer"):
         for i in range(cap + 3):
             writer.record_run(_make_span(f"run-{i}"))
 
@@ -115,7 +115,7 @@ def test_overflow_emits_metadata_queue_overflow_log_record(
         event_log_queue_cap=cap,
         workspace_root=tmp_path,
     )
-    with caplog.at_level(_logging.WARNING, logger="llm_kernel.metadata_writer"):
+    with caplog.at_level(_logging.WARNING, logger="llm_kernel.capture.metadata_writer"):
         for i in range(cap + 1):
             writer.record_run(_make_span(f"run-{i}"))
 
@@ -164,7 +164,7 @@ def test_overflow_log_emitted_after_lock_release(
 
     handler = _ReentrantHandler()
     handler.setLevel(_logging.WARNING)
-    target_logger = _logging.getLogger("llm_kernel.metadata_writer")
+    target_logger = _logging.getLogger("llm_kernel.capture.metadata_writer")
     target_logger.addHandler(handler)
     try:
         for i in range(cap + 1):

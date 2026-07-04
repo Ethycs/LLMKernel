@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`llm_kernel.metadata_writer` (RFC-005 / RFC-006).
+"""Contract tests for :mod:`llm_kernel.capture.metadata_writer` (RFC-005 / RFC-006).
 
 Covers:
 
@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from llm_kernel.metadata_writer import (
+from llm_kernel.capture.metadata_writer import (
     DEFAULT_BLOB_THRESHOLD_BYTES,
     DEFAULT_EVENT_LOG_QUEUE_CAP,
     MetadataWriter,
@@ -218,7 +218,7 @@ class _CaptureDispatcher:
         self.envelopes: List[Dict[str, Any]] = []
 
     def emit(self, envelope: Dict[str, Any]) -> None:
-        from llm_kernel.run_envelope import validate_envelope
+        from llm_kernel.capture.run_envelope import validate_envelope
         validate_envelope(envelope)
         self.envelopes.append(envelope)
 
@@ -295,7 +295,7 @@ def test_writer_event_log_bounded_queue_overflow(
         workspace_root=tmp_path,
     )
     import logging as _logging
-    with caplog.at_level(_logging.WARNING, logger="llm_kernel.metadata_writer"):
+    with caplog.at_level(_logging.WARNING, logger="llm_kernel.capture.metadata_writer"):
         for i in range(cap + 5):
             writer.record_run({
                 "traceId": secrets.token_hex(16),

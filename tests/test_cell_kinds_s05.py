@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from llm_kernel.metadata_writer import (
+from llm_kernel.capture.metadata_writer import (
     CELL_KINDS_RESERVED,
     DEFAULT_CELL_KIND,
     MetadataWriter,

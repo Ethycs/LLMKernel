@@ -24,10 +24,10 @@ load_dotenv()
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from llm_kernel.file_upload_manager import FileUploadManager
-from llm_kernel.openai_assistant_integration import OpenAIAssistantIntegration
-from llm_kernel.anthropic_file_integration import AnthropicFileIntegration
-from llm_kernel.gemini_file_integration import GeminiFileIntegration
+from llm_kernel.providers.file_upload_manager import FileUploadManager
+from llm_kernel.providers.openai_assistant_integration import OpenAIAssistantIntegration
+from llm_kernel.providers.anthropic_file_integration import AnthropicFileIntegration
+from llm_kernel.providers.gemini_file_integration import GeminiFileIntegration
 
 # Test configuration
 TEST_PDF_PATH = r"F:\Keytone\OneDrive\LaTex\Tex\AI_Research\dense_humans\the_measure_of_apocalypse.pdf"

@@ -20,14 +20,14 @@ from unittest.mock import Mock, patch, MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from llm_kernel.kernel import LLMKernel
-from llm_kernel.magic_commands.base import BaseMagics
-from llm_kernel.magic_commands.context import ContextMagics
-from llm_kernel.magic_commands.models import ModelMagics
-from llm_kernel.magic_commands.config import ConfigMagics
-from llm_kernel.magic_commands.mcp import MCPMagics
-from llm_kernel.magic_commands.multimodal import MultimodalMagics
-from llm_kernel.magic_commands.multimodal_native_pdf import NativePDFMagics
-from llm_kernel.magic_commands.cache import CacheMagics
+from llm_kernel.magics.commands.base import BaseMagics
+from llm_kernel.magics.commands.context import ContextMagics
+from llm_kernel.magics.commands.models import ModelMagics
+from llm_kernel.magics.commands.config import ConfigMagics
+from llm_kernel.magics.commands.mcp import MCPMagics
+from llm_kernel.magics.commands.multimodal import MultimodalMagics
+from llm_kernel.magics.commands.multimodal_native_pdf import NativePDFMagics
+from llm_kernel.magics.commands.cache import CacheMagics
 
 
 @pytest.fixture
@@ -301,7 +301,7 @@ class TestMultimodalMagics:
         mock_kernel.multimodal = Mock()
         
         # Test paste (will depend on clipboard content)
-        with patch('llm_kernel.multimodal.MultimodalContent.get_clipboard_content', 
+        with patch('llm_kernel.providers.multimodal.MultimodalContent.get_clipboard_content', 
                    return_value={'type': 'text', 'data': 'test'}):
             magics.llm_paste("")
 

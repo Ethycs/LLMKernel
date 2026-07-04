@@ -8,8 +8,8 @@ Imported by both the kernel (llm_kernel.*) and external clients.
 Has no imports of other llm_kernel modules -- only stdlib and this package.
 """
 
-from .version import WIRE_VERSION, WIRE_MAJOR, WIRE_MINOR, WIRE_PATCH
-from .families import (
+from llm_kernel.wire.version import WIRE_VERSION, WIRE_MAJOR, WIRE_MINOR, WIRE_PATCH
+from llm_kernel.wire.families import (
     Envelope,
     FamilyA_OperatorAction,
     FamilyB_LayoutEdit,
@@ -22,7 +22,7 @@ from .families import (
     HandshakeResponse,
     HandshakeResponsePayload,
 )
-from .tools import TOOL_CATALOG, validate_tool_input, validate_tool_output
+from llm_kernel.wire.tools import TOOL_CATALOG, validate_tool_input, validate_tool_output
 
 __all__ = [
     # Version constants

@@ -20,9 +20,9 @@ from typing import Any, Dict, List
 
 import pytest
 
-from llm_kernel._attrs import decode_attrs
-from llm_kernel.mcp_server import OperatorBridgeServer
-from llm_kernel.run_tracker import RunTracker
+from llm_kernel._internal._attrs import decode_attrs
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
+from llm_kernel.capture.run_tracker import RunTracker
 
 
 class _ListSink:

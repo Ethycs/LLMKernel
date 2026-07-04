@@ -1,7 +1,7 @@
 """K-AS-B / G10 — 120s stdout-silence hang watchdog (acceptance tests).
 
 The G10 audit found the hang-watchdog is already implemented end-to-end
-in :mod:`llm_kernel.agent_supervisor` (see ``_silence_watchdog``,
+in :mod:`llm_kernel.supervision.agent_supervisor` (see ``_silence_watchdog``,
 ``DEFAULT_AGENT_SILENCE_THRESHOLD_SEC = 120.0``, ``_last_stdout_ts``
 bumped per stdout chunk in ``_read_stdout``, ``_hang_terminated`` flag
 threading the regular crash-restart watchdog). Existing unit tests in
@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_kernel.agent_supervisor import AgentSupervisor
+from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 
 # ---------------------------------------------------------------------------
@@ -150,11 +150,11 @@ class _ExitedPopen:
 def _patch_health(status_code: int = 200):
     fake = MagicMock()
     fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 def _make_supervisor(threshold: float, granularity: float) -> AgentSupervisor:
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -217,7 +217,7 @@ def test_kill_after_120s_silence(tmp_path: Path) -> None:
     ``DEFAULT_AGENT_SILENCE_THRESHOLD_SEC = 120.0`` is asserted at the
     module level.
     """
-    from llm_kernel.agent_supervisor import DEFAULT_AGENT_SILENCE_THRESHOLD_SEC
+    from llm_kernel.supervision.agent_supervisor import DEFAULT_AGENT_SILENCE_THRESHOLD_SEC
 
     # Pin the canonical 120s default so a future RFC bump triggers the
     # contract test rather than silently shipping.
@@ -257,7 +257,7 @@ def test_marker_emitted_on_hang_kill(
     """
     sup = _make_supervisor(threshold=0.2, granularity=0.05)
     fake = _StallPopen()
-    with caplog.at_level("ERROR", logger="llm_kernel.agent_supervisor"):
+    with caplog.at_level("ERROR", logger="llm_kernel.supervision.agent_supervisor"):
         with _patch_health(), patch("subprocess.Popen", return_value=fake):
             handle = sup.spawn(
                 zone_id="z1", agent_id="alpha", task="x",
@@ -299,7 +299,7 @@ def test_watchdog_no_op_for_idle_agent() -> None:
     sup = _make_supervisor(threshold=10.0, granularity=0.05)
     fake = _ExitedPopen()
 
-    from llm_kernel.agent_supervisor import AgentHandle
+    from llm_kernel.supervision.agent_supervisor import AgentHandle
 
     handle = AgentHandle(
         agent_id="alpha", zone_id="z1", popen=fake,  # type: ignore[arg-type]

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from llm_kernel.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
+from llm_kernel.capture.custom_messages import DEFAULT_COMM_TARGET, CustomMessageDispatcher
 
 
 class _StubCommManager:
@@ -221,7 +221,7 @@ def test_second_hydrate_is_rejected_with_wire_failure_log(
         assert writer.hydrate.call_count == 1
         assert supervisor.respawn_from_config.call_count == 1
 
-        with caplog.at_level(logging.WARNING, logger="llm_kernel.custom_messages"):
+        with caplog.at_level(logging.WARNING, logger="llm_kernel.capture.custom_messages"):
             dispatcher._on_comm_msg({"content": {"data": envelope_data}})  # noqa: SLF001
         # No additional hydrate / respawn calls.
         assert writer.hydrate.call_count == 1
@@ -248,7 +248,7 @@ def test_patch_mode_is_rejected_with_wire_failure_log(
         kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
             MagicMock(), {"content": {}}
         )
-        with caplog.at_level(logging.WARNING, logger="llm_kernel.custom_messages"):
+        with caplog.at_level(logging.WARNING, logger="llm_kernel.capture.custom_messages"):
             dispatcher._on_comm_msg(  # noqa: SLF001
                 {"content": {"data": {
                     "type": "notebook.metadata",
@@ -276,7 +276,7 @@ def test_inbound_snapshot_mode_is_logged_and_ignored(
         kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
             MagicMock(), {"content": {}}
         )
-        with caplog.at_level(logging.INFO, logger="llm_kernel.custom_messages"):
+        with caplog.at_level(logging.INFO, logger="llm_kernel.capture.custom_messages"):
             dispatcher._on_comm_msg(  # noqa: SLF001
                 {"content": {"data": {
                     "type": "notebook.metadata",

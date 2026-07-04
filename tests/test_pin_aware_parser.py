@@ -15,15 +15,15 @@ from __future__ import annotations
 
 import pytest
 
-from llm_kernel.cell_text import (
+from llm_kernel.text.cell_text import (
     K33_MAGIC_HASH_MISMATCH,
     K35_PLAIN_MAGIC_IN_HASH_MODE,
     ParsedCell,
     ParserContext,
     parse_cell,
 )
-from llm_kernel.magic_hash import magic_hash
-from llm_kernel.magic_registry import CELL_MAGICS, LINE_MAGICS
+from llm_kernel.text.magic_hash import magic_hash
+from llm_kernel.text.magic_registry import CELL_MAGICS, LINE_MAGICS
 
 
 PIN = "hunter2-test"
@@ -194,7 +194,7 @@ def test_parse_cell_in_hash_mode_preserves_body_verbatim() -> None:
 
 def test_parse_cell_unknown_kind_still_raises_K31_in_hash_mode() -> None:
     """K31 still raises in hash mode — operator typo surfaces."""
-    from llm_kernel.cell_text import CellParseError, K31_UNKNOWN_CELL_MAGIC
+    from llm_kernel.text.cell_text import CellParseError, K31_UNKNOWN_CELL_MAGIC
 
     with pytest.raises(CellParseError) as exc:
         parse_cell("@@notamagic alpha\n", parser_context=_ctx())

@@ -36,7 +36,7 @@ import sys
 
 try:
     from ipykernel.kernelapp import IPKernelApp
-    from .kernel import LLMKernel
+    from llm_kernel.kernel import LLMKernel
 
     class LLMKernelApp(IPKernelApp):
         """Application for launching the LLM kernel."""
@@ -76,7 +76,7 @@ def _run_litellm_proxy(argv: list) -> None:
     import signal
     import threading
 
-    from . import litellm_proxy as _proxy
+    from llm_kernel.providers import litellm_proxy as _proxy
 
     parser = argparse.ArgumentParser(prog="llm_kernel litellm-proxy")
     parser.add_argument("--host", default="127.0.0.1")
@@ -118,10 +118,10 @@ def _run_paper_telephone_smoke() -> int:
     import uuid as _uuid
     from unittest.mock import MagicMock
 
-    from . import litellm_proxy as _proxy
-    from .custom_messages import CustomMessageDispatcher
-    from .mcp_server import OperatorBridgeServer
-    from .run_tracker import RunTracker
+    from llm_kernel.providers import litellm_proxy as _proxy
+    from llm_kernel.capture.custom_messages import CustomMessageDispatcher
+    from llm_kernel.mcp.mcp_server import OperatorBridgeServer
+    from llm_kernel.capture.run_tracker import RunTracker
 
     emitted: list = []
 
@@ -190,7 +190,7 @@ def _run_agent_supervisor_smoke() -> int:
     from pathlib import Path
 
     from llm_client.boot import boot_minimal_kernel
-    from .agent_supervisor import AgentSupervisor
+    from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
     # Load secrets from a project-root .env if python-dotenv is available.
     # Walks up from CWD; first .env found wins. Safe no-op if missing.
@@ -368,9 +368,9 @@ def _run_metadata_writer_smoke() -> int:
     from typing import Any, Dict, List
     from unittest.mock import MagicMock
 
-    from .custom_messages import CustomMessageDispatcher
-    from .metadata_writer import MetadataWriter, SecretRejected
-    from .run_tracker import RunTracker
+    from llm_kernel.capture.custom_messages import CustomMessageDispatcher
+    from llm_kernel.capture.metadata_writer import MetadataWriter, SecretRejected
+    from llm_kernel.capture.run_tracker import RunTracker
 
     # Stub kernel mirroring the IPython surface the dispatcher uses.
     sent: List[tuple] = []
@@ -684,7 +684,7 @@ if __name__ == '__main__':
     #   ``metadata-writer-smoke``    -> RFC-005 / RFC-006 Family F smoke
     #   ``pty-mode``                 -> RFC-008 PTY+socket kernel for extension
     if len(sys.argv) > 1 and sys.argv[1] == "mcp-server":
-        from . import mcp_server as _mcp_server
+        from llm_kernel.mcp import mcp_server as _mcp_server
 
         _mcp_server.main(sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "litellm-proxy":
@@ -717,8 +717,8 @@ if __name__ == '__main__':
         # PLAN-S5.0.3d: TCP transport + bearer-token auth + handshake
         # envelope. Default bind 127.0.0.1; token is read from
         # ``--auth-token-env`` (default LLMNB_AUTH_TOKEN). See
-        # ``llm_kernel.serve_mode.main`` for full security surface.
-        from .serve_mode import main as _serve_main
+        # ``llm_kernel.transports.serve_mode.main`` for full security surface.
+        from llm_kernel.transports.serve_mode import main as _serve_main
         sys.exit(_serve_main(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode":
         # Legacy synchronous dispatch — the known-good V1 path. BSP-004
@@ -737,7 +737,7 @@ if __name__ == '__main__':
         # (app.py, boot_kernel, shutdown_kernel, _async_serve_socket)
         # in pty_mode.py so V3 can pick up where V2 left off without
         # recreating the lifecycle abstraction.
-        from .pty_mode import main as _pty_main
+        from llm_kernel.transports.pty_mode import main as _pty_main
         sys.exit(_pty_main(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "pty-mode-smoke":
         print(

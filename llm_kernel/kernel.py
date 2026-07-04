@@ -32,15 +32,15 @@ try:
 except ImportError:
     litellm = None
 
-from .context_manager import ContextManager, ExecutionTracker
-from .dialogue_pruner import DialoguePruner
-from .config_manager import ConfigManager
-from .mcp_manager import MCPManager
-from .llm_integration import LLMIntegration
-from .notebook_utils import NotebookUtils
+from llm_kernel.providers.context_manager import ContextManager, ExecutionTracker
+from llm_kernel.providers.dialogue_pruner import DialoguePruner
+from llm_kernel.config_manager import ConfigManager
+from llm_kernel.mcp.mcp_manager import MCPManager
+from llm_kernel.providers.llm_integration import LLMIntegration
+from llm_kernel.notebook.notebook_utils import NotebookUtils
 
 # Import magic command modules
-from .magic_commands import (
+from llm_kernel.magics.commands import (
     BaseMagics,
     ContextMagics,
     MCPMagics,
@@ -49,8 +49,8 @@ from .magic_commands import (
 )
 
 try:
-    from .magic_commands.multimodal import MultimodalMagics
-    from .magic_commands.multimodal_native_pdf import NativePDFMagics
+    from llm_kernel.magics.commands.multimodal import MultimodalMagics
+    from llm_kernel.magics.commands.multimodal_native_pdf import NativePDFMagics
     HAS_MULTIMODAL = True
 except ImportError:
     HAS_MULTIMODAL = False
@@ -146,7 +146,7 @@ class LLMKernel(IPythonKernel):
         
         # Multimodal content support
         try:
-            from .multimodal import MultimodalContent
+            from llm_kernel.providers.multimodal import MultimodalContent
             self.multimodal = MultimodalContent(self)
         except ImportError:
             self.multimodal = None
@@ -172,7 +172,7 @@ class LLMKernel(IPythonKernel):
         if os.environ.get("LLMKERNEL_LLMNB_ENABLED", "0") != "1":
             return
         try:
-            from ._kernel_hooks import attach_kernel_subsystems
+            from llm_kernel._kernel_hooks import attach_kernel_subsystems
             attach_kernel_subsystems(self)
             self.log.info("LLMNB subsystems attached (dispatcher + run-tracker + bridge)")
         except Exception as exc:  # pragma: no cover - defensive

@@ -38,8 +38,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llm_kernel._provisioning import build_argv
-from llm_kernel.agent_supervisor import AgentHandle, AgentSupervisor
+from llm_kernel.supervision._provisioning import build_argv
+from llm_kernel.supervision.agent_supervisor import AgentHandle, AgentSupervisor
 
 
 class _FakePopen:
@@ -80,12 +80,12 @@ class _FakePopen:
 
 def _patch_health(status_code: int = 200):
     fake = MagicMock(); fake.status_code = status_code
-    return patch("llm_kernel._provisioning.httpx.head", return_value=fake)
+    return patch("llm_kernel.supervision._provisioning.httpx.head", return_value=fake)
 
 
 def _make_supervisor() -> AgentSupervisor:
     """Stub run-tracker + dispatcher (no real kernel)."""
-    from llm_kernel.run_tracker import RunTracker
+    from llm_kernel.capture.run_tracker import RunTracker
 
     class _ListSink:
         def __init__(self) -> None:
@@ -400,7 +400,7 @@ def test_resume_failure_emits_k24_marker_and_falls_back_to_fresh(
     with patch.object(sup, "spawn", side_effect=fake_spawn), \
             patch.object(sup, "_record_synthetic_problem",
                          side_effect=fake_report_problem), \
-            patch("llm_kernel._diagnostics.mark", side_effect=fake_mark):
+            patch("llm_kernel._internal._diagnostics.mark", side_effect=fake_mark):
         results = sup.respawn_from_config([
             _resumable_entry(
                 agent_id="alpha", runtime_status="idle",

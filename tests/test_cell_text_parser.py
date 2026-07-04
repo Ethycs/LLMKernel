@@ -1,10 +1,10 @@
-"""Tests for ``llm_kernel.cell_text`` — BSP-005 S5.0 parser."""
+"""Tests for ``llm_kernel.text.cell_text`` — BSP-005 S5.0 parser."""
 
 from __future__ import annotations
 
 import pytest
 
-from llm_kernel.cell_text import (
+from llm_kernel.text.cell_text import (
     CellParseError,
     K30_MULTIPLE_KINDS,
     K31_UNKNOWN_CELL_MAGIC,
