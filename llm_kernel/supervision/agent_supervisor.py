@@ -1,14 +1,13 @@
-"""LLMKernel agent-process supervisor (Stage 2 Track B4).
+"""Agent-process supervisor.
 
-Spawns Claude Code subprocesses per RFC-002 v1.0.0, captures their MCP
-tool calls, enforces DR-0010 (suppressed text channel), and feeds
-run-lifecycle records into the Track B2 :class:`RunTracker` (which in
-turn flows them through Track B3 :class:`CustomMessageDispatcher`).
+Spawns Claude Code subprocesses, captures their MCP tool calls,
+suppresses their free-text channel, and feeds run-lifecycle records
+into the run tracker.
 
-The supervisor is sync (threads, not asyncio). Each agent gets two
-daemon reader threads (stdout, stderr) and a watchdog. Per RFC-004 V1
-fails closed: at most three restart attempts; on exhaustion a synthetic
-``report_problem`` lands and the supervisor halts that agent.
+Runs on threads, not asyncio. Each agent gets two daemon reader
+threads (stdout, stderr) and a watchdog. Fails closed: at most three
+restart attempts, after which the agent is halted with a problem
+report.
 """
 
 from __future__ import annotations
@@ -43,56 +42,49 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger: logging.Logger = logging.getLogger("llm_kernel.supervision.agent_supervisor")
 
-#: Restart-policy backoffs (seconds) per RFC-002 §"Process lifecycle" 5.
+# Delay before each restart attempt, in seconds.
 _RESTART_BACKOFFS_SEC: tuple[float, ...] = (0.0, 5.0, 25.0)
-#: DR-0010 prose-violation flood threshold: >5 within 60s -> escalate.
+# Escalate when more than 5 prose violations arrive within 60 seconds.
 _VIOLATION_FLOOD_COUNT: int = 5
 _VIOLATION_FLOOD_WINDOW_SEC: float = 60.0
-#: Default stdout-silence threshold (RFC-002 §"Failure modes" — Hang).
-#: Configurable per-supervisor via the ``agent_silence_threshold_seconds``
-#: ctor kwarg (kernel config maps onto it via ``config.kernel``).
+# How long an agent may emit no stdout before it counts as hung,
+# in seconds. Overridable via the constructor.
 DEFAULT_AGENT_SILENCE_THRESHOLD_SEC: float = 120.0
-#: Granularity at which the silence watchdog wakes to check the timer.
+# How often the silence watchdog wakes to check the timer, in seconds.
 _SILENCE_WATCHDOG_GRANULARITY_SEC: float = 5.0
-#: Per-agent restart-window per RFC-002 §"Process lifecycle" 5
-#: ("≤3 attempts in 5 minutes"). Sliding window of monotonic
-#: timestamps; on overflow the supervisor refuses further restarts.
+# Restart rate limit: at most 3 attempts within any 5-minute window.
+# Tracked as a sliding window of timestamps; further restarts are
+# refused once the limit is reached.
 _RESTART_WINDOW_SEC: float = 300.0
 _RESTART_WINDOW_MAX: int = 3
 
-#: PLAN-S5.0.1 §3.9 K-class identifiers wired in slice 5.0.1a.
-#: The remaining K3C..K3G land with the precondition-gates +
-#: acceptance-flag slice (5.0.1c). K35 itself fires from the
-#: hash-aware parser in 5.0.1b — the constant ships here so the
-#: drift-marker emit path can reference the canonical name.
+# Error codes flagged when an agent's stream mishandles magic lines.
 K35_PLAIN_MAGIC_IN_HASH_MODE: str = "K35"
 K36_HASHED_MAGIC_EMISSION_BLOCKED: str = "K36"
 K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED: str = "K3H"
-#: PLAN-S5.0.4 §3.5 -- informational marker emitted when a privileged
-#: agent's stream contains a magic-shaped line. The line is still
-#: sanitized per Layer-2 emission ban; K3L triggers the operator-facing
-#: promotion chip on the contaminated cell.
+# Emitted when a privileged agent's stream contains a magic-shaped
+# line. The line is still sanitized; this marks the cell so the
+# operator can choose to promote it.
 K3L_PRIVILEGED_AGENT_STREAM_MAGIC: str = "K3L"
 
 AgentState = str  # starting | running | restarting | failed | terminated
 
 
 class _HandoffCycleError(Exception):
-    """Raised by ``_missed_turns`` when the DAG walker detects a cycle.
+    """Raised when the turn-DAG walker detects a cycle.
 
-    PLAN-S4 K26 ``cycle_detected``: the turn chain exceeded the max-depth
-    guard or a ``parent_id`` loop was detected.  The supervisor converts
-    this into a K26 RuntimeError surfaced as a ``report_problem`` span.
+    Signals that the turn chain exceeded the max-depth guard or that a
+    parent_id loop was found. The supervisor turns this into a runtime
+    error surfaced as a problem report.
     """
 
 
 @dataclass
 class AgentHandle:
-    """Per-spawn handle returned by :meth:`AgentSupervisor.spawn`.
+    """Per-spawn handle returned by spawn().
 
-    Carries the live :class:`subprocess.Popen`, both reader threads, the
-    watchdog, and a coarse :data:`AgentState`. Use :meth:`terminate`
-    for graceful shutdown.
+    Carries the live subprocess, both reader threads, the watchdog, and
+    a coarse state string. Use terminate() for graceful shutdown.
     """
 
     agent_id: str
@@ -108,38 +100,31 @@ class AgentHandle:
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _violation_times: Deque[float] = field(default_factory=lambda: deque(maxlen=64))
     _restart_attempts: int = 0
-    #: Sliding-window timestamps of restart attempts per RFC-002 §6.
-    #: Pruned to ``_RESTART_WINDOW_SEC``; >= ``_RESTART_WINDOW_MAX`` =>
-    #: refuse further restarts.
+    # Timestamps of recent restart attempts. Pruned to the restart
+    # window; once it reaches the max, further restarts are refused.
     _restart_history: Deque[float] = field(default_factory=deque)
-    #: Monotonic timestamp of the most recent stdout byte. Updated by
-    #: every reader-thread iteration that observes a non-empty line;
-    #: read by :meth:`AgentSupervisor._silence_watchdog`. Defaults to
-    #: spawn time so a freshly-spawned agent has the full silence
-    #: budget to produce its first byte.
+    # Timestamp of the most recent stdout byte. Updated whenever a
+    # reader thread sees a non-empty line, and read by the silence
+    # watchdog. Defaults to spawn time so a fresh agent gets the full
+    # silence budget for its first byte.
     _last_stdout_ts: float = 0.0
     #: Set whenever the silence watchdog has SIGTERMed the process so
     #: the regular watchdog (which observes the resulting non-zero
     #: exit) does not double-log; tag is plumbed into the restart
     #: bookkeeping.
     _hang_terminated: bool = False
-    #: Claude session id (UUID) per BSP-002 §5. Assigned at spawn time
-    #: via ``--session-id=<uuid>``. Survives across spawn/idle/respawn
-    #: of the same agent_id so a future ``--resume <claude_session_id>``
-    #: can thread the conversation back to where the prior process left
-    #: off. Empty string when unset (legacy callers, fixtures).
+    # Claude session id (a UUID). Assigned at spawn time and passed as
+    # --session-id. Survives across spawn/idle/respawn of the same
+    # agent so a later --resume can pick the conversation back up.
+    # Empty string when unset.
     claude_session_id: str = ""
-    #: PLAN-S4: the most recent turn-id this agent's claude session has
-    #: been fed.  ``None`` for fresh spawns (agent has seen no turns
-    #: yet).  After a successful ``send_user_turn`` this advances to
-    #: the notebook head turn-id so subsequent calls can compute the
-    #: missed-turn delta.  Mirrored into
-    #: ``metadata.rts.zone.agents.<id>.session.last_seen_turn_id`` via
-    #: the ``update_agent_session`` intent (BSP-002 §4.6 / agent.md).
+    # The most recent turn-id this agent has been fed. None for fresh
+    # spawns. After a successful send_user_turn it advances to the
+    # notebook head so later calls can compute which turns were missed.
     last_seen_turn_id: Optional[str] = None
 
     def poll(self) -> Optional[int]:
-        """Return the process exit code if it has exited, else ``None``."""
+        """Return the process exit code if it has exited, else None."""
         return self.popen.poll()
 
     def wait(self, timeout: Optional[float] = None) -> int:
@@ -147,7 +132,7 @@ class AgentHandle:
         return self.popen.wait(timeout=timeout)
 
     def terminate(self, grace_seconds: float = 10.0) -> None:
-        """SIGTERM, wait ``grace_seconds``, then SIGKILL (RFC-002 §6)."""
+        """SIGTERM, wait grace_seconds, then SIGKILL."""
         self._stop_event.set()
         if self.popen.poll() is not None:
             self.state = "terminated"
@@ -175,12 +160,11 @@ class AgentHandle:
 
 
 class AgentSupervisor:
-    """Spawn and supervise Claude Code agents per RFC-002 v1.0.0.
+    """Spawn and supervise Claude Code agents.
 
-    Wires the supervisor to the kernel's run-tracker (B2) and
-    custom-message dispatcher (B3). Spawned agents inherit
-    ``LLMKERNEL_RUN_TRACE_ID`` so their MCP-server tool runs share a
-    trace with the supervisor's synthetic runs. Thread-safe.
+    Wires the supervisor to the kernel's run-tracker and custom-message
+    dispatcher. Spawned agents inherit the run trace id so their MCP
+    tool runs share a trace with the supervisor's own runs. Thread-safe.
     """
 
     def __init__(
@@ -191,21 +175,18 @@ class AgentSupervisor:
         agent_silence_threshold_seconds: float = DEFAULT_AGENT_SILENCE_THRESHOLD_SEC,
         silence_watchdog_granularity_seconds: float = _SILENCE_WATCHDOG_GRANULARITY_SEC,
     ) -> None:
-        """Bind the supervisor to its B2/B3 collaborators.
+        """Bind the supervisor to its collaborators.
 
-        ``litellm_endpoint_url`` is ``ANTHROPIC_BASE_URL`` for spawned
+        litellm_endpoint_url is the ANTHROPIC_BASE_URL for spawned
         agents and the URL the pre-spawn health check probes.
-        ``kernel_python`` is the absolute path to the kernel's Python;
-        the per-spawn MCP config's ``command`` field uses this.
+        kernel_python is the absolute path to the kernel's Python, used
+        as the command in each agent's MCP config.
 
-        ``agent_silence_threshold_seconds`` (RFC-002 §"Failure modes"
-        Hang row): when the agent emits no stdout for this many
-        seconds, the silence watchdog SIGTERMs the process and the
-        regular crash-restart machinery picks up the resulting exit.
-        Default 120s; tests pass a smaller value via the ctor.
-        ``silence_watchdog_granularity_seconds`` controls how often
-        the watchdog wakes to check the silence timer (default 5s);
-        tests reduce it for fast iteration.
+        When an agent emits no stdout for agent_silence_threshold_seconds,
+        the silence watchdog kills the process and the crash-restart
+        machinery picks up the resulting exit.
+        silence_watchdog_granularity_seconds controls how often the
+        watchdog wakes to check that timer.
         """
         self._run_tracker = run_tracker
         self._dispatcher = dispatcher
@@ -213,53 +194,45 @@ class AgentSupervisor:
         self._kernel_python: str = kernel_python
         self._silence_threshold_sec: float = agent_silence_threshold_seconds
         self._silence_granularity_sec: float = silence_watchdog_granularity_seconds
-        # Per Engineering Guide §11.7: this lock is acquired on the
-        # data path (spawn / restart bookkeeping) AND we may log inside
-        # the critical section; downstream loggers route through
-        # OtlpDataPlaneHandler -> SocketWriter (now an RLock) so the
-        # supervisor's own lock must also be reentrant.
+        # Reentrant because it is held on the data path (spawn / restart
+        # bookkeeping) while code inside the critical section may log,
+        # and the logging path can re-enter this lock.
         self._lock: threading.RLock = threading.RLock()
         self._agents: Dict[str, AgentHandle] = {}
-        # PLAN-S5.0.1 §3.2 — contamination detector hook. The kernel
-        # wires its MetadataWriter in via ``set_metadata_writer`` so
-        # the supervisor can flag receiving cells when an agent emit
-        # carries a magic-shaped line. Optional: when None the
-        # detector still runs (logging via ``_diagnostics.mark``)
-        # so the audit trail is preserved without a wired writer.
+        # Contamination-detector hook. The kernel wires its metadata
+        # writer in via set_metadata_writer so the supervisor can flag
+        # receiving cells when an agent emit carries a magic-shaped
+        # line. When None the detector still runs and logs, so the
+        # audit trail is preserved without a wired writer.
         self._metadata_writer: Optional[Any] = None
-        # PLAN-S4.1: in-memory ``_turns`` cache REMOVED.  The turn graph
-        # is now read from ``metadata.rts.zone.agents.<id>.turns[]`` via
-        # the ``MetadataWriter``.  Tests and callers seed turns with
-        # ``submit_intent({intent_kind: "append_turn", ...})``.
+        # The turn graph is read from the metadata writer's snapshot,
+        # not cached in memory. Callers seed turns by submitting
+        # append_turn intents.
 
-        # PLAN-S5.5 Phase 1d — section status auto-flip ref counting.
-        # Tracks how many runs are currently active in each section so
-        # that ``in_progress → open`` transitions only fire when the
-        # last run terminates. Lock-protected because run start /
+        # Counts how many runs are currently active in each section so
+        # a section flips from in-progress back to open only when its
+        # last run terminates. Lock-protected because run start and
         # terminal hooks fire from arbitrary worker threads.
         self._in_progress_run_count: Dict[str, int] = {}
         self._auto_flip_lock: threading.Lock = threading.Lock()
 
-    # PLAN-S4.1: ``record_turn`` REMOVED.  Callers submit ``append_turn``
-    # intents to the writer; ``_missed_turns`` reads the persisted
-    # ``metadata.rts.zone.agents.<id>.turns[]`` arrays directly.
+    # Callers submit append_turn intents to the writer; the missed-turn
+    # walk reads the persisted turn arrays directly.
 
     def _read_persisted_turns(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-        """Return ``(turn_index, notebook_head_id)`` from the writer snapshot.
+        """Return (turn_index, notebook_head_id) from the writer snapshot.
 
-        ``turn_index`` is keyed on turn-id and carries each persisted
-        turn dict (with normalized ``content`` field aliasing ``body``
-        for back-compat with the prior in-memory shape).
+        turn_index is keyed on turn-id and carries each persisted turn
+        dict, with a content field mirrored from body.
 
-        ``notebook_head_id`` resolution (PLAN-S4.1 §3.C.3):
+        The notebook head is resolved as follows:
 
-        1. If any agent has a ``session.head_turn_id`` set (e.g., by
-           ``move_agent_head`` after revert), pick the max across
-           agents by (created_at, id) of the corresponding turn.
-        2. Otherwise, fall back to the most-recently-``created_at`` turn
-           across all agents (lex tiebreak on id).
+        1. If any agent has a session head turn set, pick the latest of
+           those by (created_at, id).
+        2. Otherwise fall back to the most recently created turn across
+           all agents (id breaks ties).
 
-        Returns ``({}, None)`` when no writer is wired or no turns exist.
+        Returns ({}, None) when no writer is wired or no turns exist.
         """
         if self._metadata_writer is None:
             return {}, None
@@ -284,10 +257,9 @@ class AgentSupervisor:
                 tid = t.get("id")
                 if not isinstance(tid, str):
                     continue
-                # Normalize: callers historically used ``content``; the
-                # persisted shape uses ``body``.  Mirror ``body`` ->
-                # ``content`` so the _missed_turns / synthesize path
-                # keeps working without per-call adaptation.
+                # Callers expect a content field; the persisted shape
+                # uses body. Mirror body -> content so the missed-turn
+                # and synthesize paths work without per-call adaptation.
                 norm = dict(t)
                 if "content" not in norm and "body" in norm:
                     norm["content"] = norm["body"]
@@ -298,15 +270,15 @@ class AgentSupervisor:
             return (str(t.get("created_at") or "") if t else "", tid)
 
         head_id: Optional[str] = None
-        # Prefer agent session heads when present (post-revert / post-fork).
+        # Prefer agent session heads when present.
         candidates = [h for h in session_heads if h in index]
         if candidates:
             head_id = max(candidates, key=_key_for)
         else:
-            # Fall back to "leaf" turns (no other turn references them as
-            # parent) — these are the chain tips.  Among leaves, pick the
-            # most-recent created_at (lex tiebreak on id).  Falls through
-            # to the global most-recent if no leaves found (cycle).
+            # Fall back to leaf turns (no other turn names them as
+            # parent) — the chain tips. Among leaves, pick the most
+            # recently created (id breaks ties). If there are no leaves
+            # (a cycle), use the global most-recent.
             referenced_parents: set = set()
             for t in index.values():
                 pid = t.get("parent_id")
@@ -323,11 +295,10 @@ class AgentSupervisor:
         return index, head_id
 
     def _notebook_head_turn_id(self) -> Optional[str]:
-        """Return the current notebook-head turn-id (PLAN-S4.1 §3.C).
+        """Return the current notebook-head turn-id.
 
-        Computed from ``metadata.rts.zone.agents.<*>.turns[]`` as the
-        most-recently-``created_at`` turn (lexicographic tiebreak on
-        ``id``).  Returns ``None`` when no turns are persisted.
+        Computed from the persisted turns as the most recently created
+        turn (id breaks ties). Returns None when no turns are persisted.
         """
         _, head_id = self._read_persisted_turns()
         return head_id
@@ -338,32 +309,26 @@ class AgentSupervisor:
         use_bare: bool = False, set_base_url: Optional[bool] = None,
         resume_claude_session_id: Optional[str] = None,
     ) -> AgentHandle:
-        """Spawn a Claude Code subprocess wired into paper-telephone topology.
+        """Spawn a Claude Code subprocess and wire it into the topology.
 
-        Implements RFC-002 §"Process lifecycle": pre-spawn validation,
-        artifact rendering (POSIX 0o600), env build, ``Popen``, two
-        reader threads, watchdog. Raises
-        :class:`PreSpawnValidationError` on validation failure (also
-        emits a synthetic ``report_problem``).
+        Runs pre-spawn validation, renders the spawn artifacts (mode
+        0o600), builds the env, starts the process, and launches two
+        reader threads and a watchdog. Raises PreSpawnValidationError on
+        validation failure (and emits a synthetic problem report).
 
-        BSP-002 §4.3 resume branch — when ``resume_claude_session_id`` is
-        set, the supervisor re-attaches to that existing claude session
-        instead of minting a new UUID. argv carries ``--resume <id>``
-        rather than ``--session-id <uuid>``; the resulting AgentHandle's
-        ``claude_session_id`` matches the resumed value so the operator-
-        visible identity is unchanged. Used by ``respawn_from_config``
-        when the snapshot's ``runtime_status`` is ``idle`` / ``exited``
-        / ``alive`` (per ``decisions/no-rebind-popen``: alive-in-snapshot
-        but process-gone is treated as idle).
+        When resume_claude_session_id is set, re-attach to that existing
+        claude session instead of minting a new UUID: argv carries
+        --resume <id> rather than --session-id <uuid>, and the handle's
+        claude_session_id matches the resumed value so the operator-
+        visible identity is unchanged. Used when respawning an agent
+        whose process has gone away.
         """
         from llm_kernel._internal import _diagnostics
         _diagnostics.mark("supervisor_spawn_entry", agent_id=agent_id, zone_id=zone_id)
 
-        # BSP-005 S5.0 K32 — reject agent_ids that collide with the
-        # cell-magic registry. PLAN-S5.0 §4 reserves the union of
-        # CELL_MAGICS + LINE_MAGICS keys (plus the ``llmnb_*`` future-
-        # reservation prefix) so an operator can't shadow a magic by
-        # spawning ``pin`` / ``agent`` / ``break`` / etc.
+        # Reject agent_ids that collide with a reserved magic name, so
+        # an operator can't shadow a cell or line magic (pin, agent,
+        # break, and the like) by spawning an agent with that name.
         from llm_kernel.text.magic_registry import is_reserved_name, K32_RESERVED_MAGIC_NAME
         if is_reserved_name(agent_id):
             _diagnostics.mark(
@@ -377,14 +342,10 @@ class AgentSupervisor:
                 log_signature="reserved_magic_name_as_agent_id",
             )
 
-        # BSP-002 Phase 1 idempotency: a /spawn for an agent_id whose
-        # process is still alive returns the existing handle instead of
-        # double-spawning. The conversation graph (BSP-002 §4.2) treats
-        # successive cells against the same agent_id as continuations,
-        # not fresh spawns; the wire layer doesn't yet distinguish, so
-        # the kernel takes responsibility for the dedup. A future
-        # AgentSupervisor.resume(agent_id, task) covers the dead-agent
-        # case via ``--resume <claude_session_id>`` per BSP-002 §4.3.
+        # Idempotency: a spawn for an agent whose process is still alive
+        # returns the existing handle instead of double-spawning.
+        # Successive cells against the same agent are continuations, not
+        # fresh spawns, so the kernel dedups here.
         with self._lock:
             existing = self._agents.get(agent_id)
         if existing is not None and existing.popen.poll() is None:
@@ -401,23 +362,18 @@ class AgentSupervisor:
 
         api_key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
         trace_id = self._run_tracker.trace_id
-        # BSP-002 §5: kernel-owned claude_session_id. Assigned at fresh
-        # spawn time and passed via --session-id so the runtime conversation
-        # is tagged with a stable id we control. Persists on AgentHandle
-        # for a future --resume path.
-        #
-        # Resume branch (BSP-002 §4.3 / decisions/no-rebind-popen): when
-        # ``resume_claude_session_id`` is provided, do NOT mint a new UUID
-        # — re-use the stored id and emit ``--resume`` instead of
-        # ``--session-id`` so claude re-attaches to the existing
-        # conversation cache.
+        # Kernel-owned claude_session_id. On a fresh spawn, mint a UUID
+        # and pass it via --session-id so the conversation is tagged
+        # with a stable id we control. On resume, reuse the stored id
+        # and emit --resume instead, so claude re-attaches to the
+        # existing conversation cache.
         if resume_claude_session_id:
             claude_session_id = resume_claude_session_id
         else:
             claude_session_id = str(uuid.uuid4())
-        # Resolve to absolute paths up-front. The child process is launched
-        # with ``cwd=work_dir``, so passing relative paths to Claude's CLI
-        # would double-prefix the work_dir (cwd + relative arg = doubled).
+        # Resolve to absolute paths up-front. The child runs with
+        # cwd=work_dir, so relative paths passed to Claude's CLI would
+        # be doubled (cwd + relative arg).
         work_dir = Path(work_dir).resolve()
         spawn_dir = (work_dir / ".run" / agent_id).resolve()
         spawn_dir.mkdir(parents=True, exist_ok=True)
@@ -426,7 +382,7 @@ class AgentSupervisor:
         system_prompt_path = spawn_dir / "system-prompt.txt"
 
         # Propagate PYTHONPATH explicitly into the MCP server's env so
-        # ``python -m llm_kernel.mcp.mcp_server`` resolves the package even
+        # python -m llm_kernel.mcp.mcp_server resolves the package even
         # when llm_kernel is not installed into the kernel's site-packages
         # (e.g. development runs via PYTHONPATH=vendor/LLMKernel).
         # CRITICAL: convert each entry to an absolute path before passing
@@ -449,8 +405,8 @@ class AgentSupervisor:
         mcp_config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         _diagnostics.mark("supervisor_spawn_mcp_config_written", agent_id=agent_id)
         rendered_prompt = render_system_prompt(task)
-        # RFC-002 §"Failure modes": refuse spawn on system-prompt
-        # template major-version mismatch; warn-and-proceed on minor.
+        # Refuse spawn on a system-prompt template major-version
+        # mismatch; warn and proceed on a minor mismatch.
         try:
             self._validate_template_version(rendered_prompt)
         except PreSpawnValidationError as exc:
@@ -487,12 +443,11 @@ class AgentSupervisor:
             raise
         _diagnostics.mark("supervisor_spawn_preflight_passed", agent_id=agent_id)
 
-        # Default: set ANTHROPIC_BASE_URL only under --bare, because the
+        # By default set ANTHROPIC_BASE_URL only under --bare: the
         # LiteLLM proxy only handles /v1/messages and breaks OAuth's
-        # model-resolution preflight. The transparent
-        # AnthropicPassthroughServer handles ALL of /v1/* so it CAN be
-        # used under OAuth — pass set_base_url=True explicitly when the
-        # supervisor's endpoint is a passthrough.
+        # model-resolution preflight. A transparent passthrough handles
+        # all of /v1/*, so pass set_base_url=True explicitly when the
+        # endpoint is a passthrough.
         effective_set_base_url = (
             set_base_url if set_base_url is not None else use_bare
         )
@@ -505,22 +460,19 @@ class AgentSupervisor:
             trace_id=trace_id,
             set_base_url=effective_set_base_url,
         )
-        # RFC-009 §4.2 — resolve claude binary through zone_control so
-        # the precedence rules (env > PATH > pixi-env probe) are applied
-        # consistently and the diagnostic ``zone_control.resolved`` marker
-        # tells the operator which source supplied the value. Returns
-        # None if no source resolves; we degrade to bare "claude" so
-        # downstream Popen errors carry a useful ENOENT instead of None.
+        # Resolve the claude binary through zone_control so the
+        # precedence rules (env > PATH > pixi-env probe) apply
+        # consistently. Returns None if nothing resolves; degrade to a
+        # bare "claude" so a failed launch gives a useful ENOENT.
         from llm_kernel.notebook import zone_control
         claude_bin = zone_control.locate_claude_bin() or "claude"
         _diagnostics.mark(
             "supervisor_spawn_claude_resolved",
             agent_id=agent_id, claude_bin=claude_bin,
         )
-        # Mutually-exclusive flags per `_provisioning.build_argv`:
-        # ``--session-id <uuid>`` for fresh spawns vs. ``--resume <id>``
-        # for re-attach. The supervisor decides at spawn-time which
-        # branch the entry belongs to.
+        # Mutually-exclusive flags: --session-id <uuid> for fresh
+        # spawns vs. --resume <id> for re-attach. Decide here which
+        # branch this spawn takes.
         if resume_claude_session_id:
             argv = build_argv(
                 system_prompt_path, mcp_config_path, task,
@@ -538,13 +490,10 @@ class AgentSupervisor:
             agent_id, zone_id, model, use_bare, claude_bin,
         )
         try:
-            # BSP-002 §4.1 / §4.2: stdin is a JSON-line channel so
-            # ``send_user_turn`` can write ``{"type":"user","message":...}``
-            # frames to continue an existing conversation. The agent
-            # process stays alive between turns; reader threads on
-            # stdout pick up the agent's response spans. Tests stub
-            # subprocess.Popen so the PIPE here is a MagicMock and the
-            # supervisor never actually writes to a real pipe.
+            # stdin is a JSON-line channel so send_user_turn can write
+            # user-message frames to continue an existing conversation.
+            # The agent process stays alive between turns; the stdout
+            # reader threads pick up its response spans.
             popen = subprocess.Popen(
                 argv, env=env, cwd=str(work_dir),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -570,25 +519,21 @@ class AgentSupervisor:
         return handle
 
     def get(self, agent_id: str) -> Optional[AgentHandle]:
-        """Return the live handle for ``agent_id``, or ``None`` if unknown."""
+        """Return the live handle for agent_id, or None if unknown."""
         with self._lock:
             return self._agents.get(agent_id)
 
-    # BSP-002 §4.2 / atoms/operations/continue-turn.md — multi-turn
-    # continuation. Writes one stream-json user turn to the live agent's
-    # stdin; if the agent has gone idle/exited the supervisor resumes via
-    # the S2 ``resume_claude_session_id`` path on ``spawn`` first.
+    # Multi-turn continuation. Writes one stream-json user turn to the
+    # live agent's stdin; if the agent has gone idle/exited, resume it
+    # first.
     #
-    # Returned status discriminator:
+    # Returned status:
     #   "sent"              -- alive agent; one stdin write only.
     #   "resumed_then_sent" -- idle/exited agent resumed via --resume,
     #                          then stdin write.
-    #   "spawned_fresh"     -- resume failed (K24 fallback ran inside
-    #                          ``_spawn_from_config_entry`` semantics);
-    #                          a fresh session was minted, the new
-    #                          handle is alive, the stdin write went
-    #                          through. The transcript replay BSP-002
-    #                          §4.4 Case-B is left to a higher slice.
+    #   "spawned_fresh"     -- resume failed; a fresh session was minted,
+    #                          the new handle is alive, and the stdin
+    #                          write went through.
     def send_user_turn(
         self,
         agent_id: str,
@@ -597,38 +542,24 @@ class AgentSupervisor:
     ) -> Dict[str, Any]:
         """Continue an existing agent's conversation with one user turn.
 
-        Per ``atoms/operations/continue-turn.md`` and
-        ``atoms/contracts/agent-supervisor.md``: write a stream-json
-        ``{"type":"user","message":{"role":"user","content":text}}``
-        line to the agent's stdin. The agent's response streams back via
-        the existing stdout reader thread (Family A spans).
+        Writes a stream-json user-message line to the agent's stdin. The
+        agent's response streams back through the existing stdout reader
+        thread.
 
-        Resume semantics (S2 path): if the agent's ``runtime_status`` is
-        idle/exited (i.e., the popen has reaped), the supervisor calls
-        :meth:`spawn` with ``resume_claude_session_id`` set to the
-        handle's preserved ``claude_session_id`` before writing stdin.
-        BSP-002 §4.6 cross-agent context handoff is NOT implemented in
-        this slice; that lands in S4.
+        If the agent has gone idle or exited (its process has reaped),
+        resume it first by respawning with its preserved
+        claude_session_id, then write stdin.
 
         Args:
-            agent_id: The agent to continue. Unknown ids raise
-                :class:`KeyError`; the dispatcher translates that to
-                **K23** (``agent_continue_unknown_agent``) per
-                BSP-002 §7. (Note: the atom's K20 ``cell_directive_unknown_agent``
-                covers the wire-side directive; the supervisor's
-                contract uses K23 because the runtime miss is the
-                supervisor's failure mode.)
-            text: The operator's message body. Empty / whitespace-only
-                input is rejected with :class:`ValueError`; the
-                dispatcher translates that to BSP-003 K42
-                (validator-rejected) per the intent envelope contract.
-            cell_id: Optional originating cell URI. Threaded through
-                for diagnostics and future cell→turn bookkeeping
-                (BSP-005 S6).
+            agent_id: The agent to continue. Unknown ids raise KeyError.
+            text: The operator's message body. Empty or whitespace-only
+                input is rejected with ValueError.
+            cell_id: Optional originating cell URI, threaded through for
+                diagnostics and cell-to-turn bookkeeping.
 
         Returns:
-            ``{"agent_id": ..., "status": "sent" | "resumed_then_sent"
-            | "spawned_fresh", "cell_id": ...}``
+            A dict with agent_id, status ("sent", "resumed_then_sent",
+            or "spawned_fresh"), and cell_id.
         """
         from llm_kernel._internal import _diagnostics
         if not isinstance(text, str) or not text.strip():
@@ -642,18 +573,16 @@ class AgentSupervisor:
             raise KeyError(agent_id)
 
         status: str = "sent"
-        # Resume-if-needed: poll() returning a non-None code means the
-        # claude process has reaped. The S2 plumbing on ``spawn``
-        # accepts ``resume_claude_session_id`` so claude re-attaches
-        # via ``--resume`` instead of minting a fresh session id.
+        # Resume if needed: a non-None poll() means the claude process
+        # has reaped. Respawn with resume_claude_session_id so claude
+        # re-attaches via --resume instead of minting a fresh session.
         if handle.popen.poll() is not None:
             prior_session_id = handle.claude_session_id
             zone_id = handle.zone_id
             work_dir = handle.work_dir
-            # Drop the dead handle BEFORE re-spawning so the live-agent
-            # idempotency short-circuit in ``spawn`` does not return
-            # the (now reaped) handle. The fresh-spawn fallback below
-            # mirrors the K24 path in ``_spawn_from_config_entry``.
+            # Drop the dead handle before respawning so the live-agent
+            # idempotency check in spawn does not return the now-reaped
+            # handle.
             with self._lock:
                 if self._agents.get(agent_id) is handle:
                     del self._agents[agent_id]
@@ -692,10 +621,10 @@ class AgentSupervisor:
                 )
                 status = "spawned_fresh"
 
-        # PLAN-S4: cross-agent context handoff — walk the turn DAG
-        # between handle.last_seen_turn_id and the current notebook head,
-        # synthesize prefix lines for missed sibling turns, and inject
-        # them before the operator's message.
+        # Cross-agent context handoff: walk the turn DAG between this
+        # agent's last-seen turn and the current notebook head,
+        # synthesize prefix lines for the missed sibling turns, and
+        # inject them before the operator's message.
         head_turn_id = self._notebook_head_turn_id()
         try:
             missed = self._missed_turns(agent_id, head_turn_id)
@@ -713,25 +642,19 @@ class AgentSupervisor:
                 f"{exc}"
             ) from exc
 
-        # BSP-008 §9 — ContextPacker + RunFrame wiring (K-CTXR slice).
-        # When the operator passes a ``cell_id``, pack the manifest, submit
-        # ``record_context_manifest``, and submit a start ``record_run_frame``
-        # (status=running). On synchronous send failure we submit a terminal
-        # frame with status=failed; on successful stdin write we submit
-        # a terminal frame with status=complete. A missing ``cell_id`` is
-        # the BSP-008 §12 graceful-degradation path: the run still works,
+        # ContextPacker + RunFrame wiring. When the operator passes a
+        # cell_id, pack the manifest, record it, and submit a start run
+        # frame (status=running). On stdin-write failure submit a
+        # terminal frame with status=failed; on success submit one with
+        # status=complete. Without a cell_id the run still works, it
         # just produces no Inspect-mode trail.
         #
-        # V1 timing limitation (BSP-008 §8 — documented; no longer FLAGGED):
-        # The terminal frame is emitted at stdin-write success — i.e., when
-        # the user turn is delivered to the agent process, NOT when the agent
-        # finishes its reply. The agent's response streams asynchronously
-        # through the stdout reader. As a result, V1 RunFrame durations
-        # (started_at → ended_at) read as ~0 ms. This is acceptable for V1;
-        # a future slice (BSP-008 §13 FLAGGED) with a per-turn completion
-        # detector (e.g. observing the agent's ``stop_reason`` envelope) can
-        # resubmit the terminal frame with accurate timing; the writer is
-        # idempotent-on-run_id for same-cell updates.
+        # The terminal frame is submitted when the user turn is
+        # delivered to the agent, not when the agent finishes replying
+        # (the reply streams in asynchronously), so run-frame durations
+        # read as roughly zero. The writer is idempotent on run_id, so a
+        # later per-turn completion detector could resubmit with
+        # accurate timing.
         run_id: Optional[str] = None
         manifest_id: Optional[str] = None
         if (
@@ -746,21 +669,16 @@ class AgentSupervisor:
                 turn_head_before=head_turn_id,
             )
 
-        # Write the stream-json user turn. BSP-002 §4.1: claude reads
-        # ``{"type":"user","message":{"role":"user","content":<text>}}``
-        # from stdin when the process was launched with
-        # ``--input-format=stream-json``. Drift flag: ``build_argv`` in
-        # _provisioning.py does not yet emit that flag (atom drift
-        # noted in S3 report); without it claude treats stdin as the
-        # initial prompt only. The wire-side write is correct per the
-        # atom; the argv-side completion is a separate amendment.
+        # Write the stream-json user turn. claude reads a user-message
+        # frame from stdin when launched with --input-format=stream-json;
+        # without that flag it treats stdin as the initial prompt only.
         operator_line = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": text},
         }) + "\n"
         if handle.popen.stdin is None:
-            # Defensive: spawn now opens stdin=PIPE; legacy fixtures
-            # that pre-build a handle without stdin land here.
+            # Defensive: spawn opens stdin=PIPE; a handle built without
+            # stdin lands here.
             raise RuntimeError(
                 f"send_user_turn: agent {agent_id!r} has no writable "
                 f"stdin (was the popen built with stdin=PIPE?)"
@@ -779,8 +697,8 @@ class AgentSupervisor:
                 k_class=K26_CROSS_AGENT_HANDOFF_FAILED if prefix_lines else None,
                 reason="stdin_write_failed" if prefix_lines else None,
             )
-            # BSP-008 §9 — emit terminal RunFrame with status=failed so
-            # Inspect mode records the synchronous failure.
+            # Emit a terminal run frame with status=failed so Inspect
+            # mode records the synchronous failure.
             if run_id is not None and cell_id is not None and manifest_id is not None:
                 self._submit_terminal_run_frame(
                     run_id=run_id,
@@ -792,8 +710,8 @@ class AgentSupervisor:
                     status="failed",
                 )
             raise
-        # PLAN-S4: advance last_seen_turn_id to the notebook head so the
-        # next call computes the correct missed-turn delta.
+        # Advance last_seen_turn_id to the notebook head so the next
+        # call computes the correct missed-turn delta.
         handle.last_seen_turn_id = head_turn_id
         # Persist via update_agent_session intent if a writer is wired.
         if self._metadata_writer is not None and head_turn_id is not None:
@@ -814,17 +732,15 @@ class AgentSupervisor:
                     "send_user_turn_update_session_intent_failed",
                     agent_id=agent_id,
                 )
-        # BSP-008 §9 — emit terminal RunFrame with status=complete on
-        # successful stdin dispatch. See FLAGGED note above the start
-        # frame for the V1 semantics: "complete" here reflects the
-        # supervisor's vantage (user-turn delivered to the agent), not
-        # the agent's reply lifecycle. The writer is idempotent on
-        # run_id for same-cell updates so a future per-turn completion
-        # detector can re-emit without K102.
+        # Emit a terminal run frame with status=complete on a successful
+        # stdin dispatch. "complete" here means the user turn was
+        # delivered to the agent, not that the agent finished replying.
+        # The writer is idempotent on run_id, so a later completion
+        # detector can re-emit.
         if run_id is not None and cell_id is not None and manifest_id is not None:
-            # Re-read the head turn id post-write — for V1 ContextPacker
-            # there's no atomic turn-commit yet, so head_turn_after may
-            # equal head_turn_before; the field is still recorded.
+            # Re-read the head turn id after the write. There's no
+            # atomic turn-commit yet, so head_turn_after may equal
+            # head_turn_before; the field is recorded either way.
             head_after = self._notebook_head_turn_id()
             self._submit_terminal_run_frame(
                 run_id=run_id,
@@ -851,15 +767,14 @@ class AgentSupervisor:
         }
 
     # ------------------------------------------------------------------
-    # BSP-008 §9 — ContextPacker + RunFrame integration helpers
+    # ContextPacker + RunFrame integration helpers
     # ------------------------------------------------------------------
 
     def _runframe_now_iso(self) -> str:
-        """Return the current UTC timestamp in ISO 8601 with millisecond precision.
+        """Return the current UTC timestamp in ISO 8601, millisecond precision.
 
-        Mirrors ``context_packer._utc_now_iso`` so the start/terminal
-        RunFrame timestamps are byte-aligned with the manifest's
-        ``generated_at`` stamp.
+        Matches the manifest's generated_at format so the start and
+        terminal run-frame timestamps line up with it.
         """
         return (
             datetime.now(timezone.utc)
@@ -868,20 +783,16 @@ class AgentSupervisor:
         )
 
     def _build_pack_snapshot(self) -> Dict[str, Any]:
-        """Build the minimal overlay snapshot ContextPacker.pack() needs.
+        """Build the minimal overlay snapshot that pack() needs.
 
-        Per BSP-008 §3 the V1 walker reads ``cells`` (with per-cell
-        ``pinned`` / ``section_id`` / ``sub_turns`` / ``scratch`` /
-        ``excluded`` / ``obsolete`` flags) and ``ordering`` (document
-        order). The K-MW writer carries the cells map at
-        ``self._metadata_writer._cells`` and the layout-derived ordering
-        is not yet wired through; for V1 we read what the writer's full
-        snapshot exposes (``cells`` field) and let ContextPacker fall
-        back to insertion order when ``ordering`` is absent.
+        The walker reads a cells map (with per-cell pinned / section_id
+        / sub_turns / scratch / excluded / obsolete flags) and an
+        ordering list (document order). Ordering may be absent, in which
+        case the packer falls back to insertion order.
 
-        Returns an empty dict when the writer has no cells map (the
-        V1 graceful-degradation path — pack() will raise K100 if
-        cell_id is genuinely orphan; the caller catches and skips).
+        Returns an empty dict when the writer has no cells map; pack()
+        then raises an orphan-cell error that the caller catches and
+        skips.
         """
         writer = self._metadata_writer
         if writer is None:
@@ -906,17 +817,16 @@ class AgentSupervisor:
         cell_id: str,
         turn_head_before: Optional[str],
     ) -> Tuple[Optional[str], Optional[str]]:
-        """Pack the manifest, persist it, and submit the start RunFrame.
+        """Pack the manifest, persist it, and submit the start run frame.
 
-        Per BSP-008 §9 the AgentSupervisor wraps the ContextPacker call
-        in a ``record_context_manifest`` intent and emits a start
-        ``record_run_frame`` (status=running, ended_at=null) before
+        Wraps the pack call in a record_context_manifest intent and
+        emits a start run frame (status=running, ended_at=null) before
         dispatching the user turn.
 
-        All failure modes are caught and logged so a packer / writer
+        All failure modes are caught and logged so a packer or writer
         error never blocks the operator's run; the operator just sees a
-        degraded Inspect-mode trail. Returns ``(run_id, manifest_id)``
-        on success, ``(None, None)`` on degradation.
+        degraded Inspect-mode trail. Returns (run_id, manifest_id) on
+        success, (None, None) on degradation.
         """
         from llm_kernel._internal import _diagnostics
         writer = self._metadata_writer
@@ -999,8 +909,8 @@ class AgentSupervisor:
             agent_id=agent_id, cell_id=cell_id, run_id=run_id,
             manifest_id=manifest_id,
         )
-        # PLAN-S5.5 Phase 1d — increment run count for the section
-        # containing this cell. May flip section to ``in_progress``.
+        # Increment the run count for the section containing this cell.
+        # May flip the section to in-progress.
         self._maybe_flip_section_on_run_start(cell_id)
         return run_id, manifest_id
 
@@ -1015,14 +925,13 @@ class AgentSupervisor:
         turn_head_after: Optional[str],
         status: str,
     ) -> None:
-        """Submit the terminal RunFrame intent (status=complete|failed|interrupted).
+        """Submit the terminal run-frame intent (complete, failed, or interrupted).
 
-        Per BSP-008 §8 the writer is idempotent on ``run_id`` for
-        same-``cell_id`` resubmissions, so this method may be called
-        more than once across the lifetime of a single run (e.g.,
-        synchronous failure path + future stdout-based completion
-        detector). All failure modes are best-effort: a writer outage
-        produces a ``_diagnostics.mark`` but never blocks the caller.
+        The writer is idempotent on run_id for same-cell resubmissions,
+        so this may be called more than once for a single run (e.g. the
+        synchronous failure path plus a later completion detector). All
+        failure modes are best-effort: a writer outage is logged but
+        never blocks the caller.
         """
         from llm_kernel._internal import _diagnostics
         writer = self._metadata_writer
@@ -1043,12 +952,9 @@ class AgentSupervisor:
                             "turn_head_after": turn_head_after,
                             "context_manifest_id": context_manifest_id,
                             "status": status,
-                            # ``started_at`` is required; we don't carry
-                            # it across the call so we re-stamp with the
-                            # terminal time. The persisted record's
-                            # ``started_at`` will reflect the terminal
-                            # submission's stamp — V2 may carry the start
-                            # time forward if precise duration matters.
+                            # started_at is required, but we don't carry
+                            # the start time across the call, so we
+                            # re-stamp with the terminal time here.
                             "started_at": ended_at,
                             "ended_at": ended_at,
                         },
@@ -1066,33 +972,31 @@ class AgentSupervisor:
             "send_user_turn_run_frame_terminal",
             run_id=run_id, cell_id=cell_id, status=status,
         )
-        # PLAN-S5.5 Phase 1d — decrement run count for the section
-        # containing this cell. May flip section back to ``open``.
+        # Decrement the run count for the section containing this cell.
+        # May flip the section back to open.
         self._maybe_flip_section_on_run_end(cell_id)
 
     # ------------------------------------------------------------------
-    # PLAN-S5.5 Phase 1d — section status auto-flip
+    # Section status auto-flip
     # ------------------------------------------------------------------
     #
     # When an agent run starts in a cell that belongs to a section, the
-    # section flips ``open → in_progress`` so the UI shows the section
-    # is actively being worked on and (via K95) so structural ops on
-    # member cells are blocked while the run is in flight. Reference-
-    # counted: only flip on 0→1 (first run) and 1→0 (last run) so
-    # multiple concurrent runs in the same section don't thrash the
-    # status. The flip is a best-effort ``set_section_status`` intent;
-    # if the section is currently ``frozen`` the writer returns K95
-    # and the run still proceeds (frozen sections stay frozen — auto-
-    # flip never overrides operator intent). Failures are logged via
-    # ``_diagnostics.mark`` and never propagate.
+    # section flips from open to in-progress so the UI shows it is being
+    # worked on and structural ops on its cells are blocked while the
+    # run is in flight. Reference-counted: only flip on the first run
+    # (0->1) and the last run (1->0) so concurrent runs in the same
+    # section don't thrash the status. The flip is a best-effort intent;
+    # if the section is frozen the writer declines it and the run still
+    # proceeds (auto-flip never overrides operator intent). Failures are
+    # logged and never propagate.
 
     def _maybe_flip_section_on_run_start(self, cell_id: str) -> None:
-        """Increment the section run count for ``cell_id``'s section;
-        flip ``open → in_progress`` if this is the first active run.
+        """Increment the run count for cell_id's section; flip it from
+        open to in-progress if this is the first active run.
 
-        No-op when the cell has no ``section_id`` or when the writer is
-        not wired. Safe to call repeatedly; the ref-count math handles
-        it. Thread-safe via :attr:`_auto_flip_lock`.
+        No-op when the cell has no section or when the writer is not
+        wired. Safe to call repeatedly; the ref-count math handles it.
+        Thread-safe.
         """
         from llm_kernel._internal import _diagnostics
         writer = self._metadata_writer
@@ -1118,12 +1022,10 @@ class AgentSupervisor:
         )
 
     def _maybe_flip_section_on_run_end(self, cell_id: str) -> None:
-        """Decrement the section run count for ``cell_id``'s section;
-        flip ``in_progress → open`` if this was the last active run.
+        """Decrement the run count for cell_id's section; flip it from
+        in-progress to open if this was the last active run.
 
-        Pairs with :meth:`_maybe_flip_section_on_run_start`. Idempotent
-        on ``cell_id`` (extra decrements clamp at zero); a section that
-        somehow accumulated more decrements than increments stays at
+        Pairs with the on-run-start method. Extra decrements clamp at
         zero rather than going negative.
         """
         from llm_kernel._internal import _diagnostics
@@ -1158,15 +1060,13 @@ class AgentSupervisor:
         cell_id: str,
         reason_marker: str,
     ) -> None:
-        """Submit one ``set_section_status`` overlay intent.
+        """Submit one set_section_status overlay intent.
 
-        Failures (transport, K90 unknown_section, K95 frozen) are
-        logged via ``_diagnostics.mark`` but never raised — the
-        supervisor's run path must not be blocked by a section
-        bookkeeping error. K95 specifically is expected when the
-        section is ``frozen``; we surface a distinct marker so the
-        audit trail distinguishes "frozen — auto-flip declined" from
-        "writer down — auto-flip lost".
+        Failures (transport error, unknown section, frozen section) are
+        logged but never raised — a section bookkeeping error must not
+        block the supervisor's run path. A frozen section is expected;
+        it gets a distinct marker so the audit trail tells "frozen,
+        auto-flip declined" apart from "writer down, auto-flip lost".
         """
         from llm_kernel._internal import _diagnostics
         writer = self._metadata_writer
@@ -1200,9 +1100,9 @@ class AgentSupervisor:
             )
             return
         if not result.get("applied", False):
-            # K90 unknown_section / K95 forbidden_section_transition /
-            # K95 frozen — all expected on degraded paths. Mark for
-            # the audit trail; the run continues unaffected.
+            # Unknown section, forbidden transition, or frozen section —
+            # all expected on degraded paths. Mark for the audit trail;
+            # the run continues unaffected.
             details = (result.get("response") or {}).get("details") or {}
             _diagnostics.mark(
                 f"{reason_marker}_declined",
@@ -1218,12 +1118,12 @@ class AgentSupervisor:
         )
 
     # ------------------------------------------------------------------
-    # PLAN-S4: cross-agent context handoff helpers
+    # Cross-agent context handoff helpers
     # ------------------------------------------------------------------
 
-    #: Maximum DAG depth the missed-turn walker will traverse before
-    #: raising K26 ``cycle_detected``.  A zone with more turns than this
-    #: limit in a single chain is pathological; 1 000 is generous.
+    # Maximum turn-chain depth the missed-turn walker traverses before
+    # treating the chain as a cycle. A single chain longer than this is
+    # pathological; 1000 is generous.
     _HANDOFF_MAX_DEPTH: int = 1_000
 
     def _missed_turns(
@@ -1231,15 +1131,15 @@ class AgentSupervisor:
         agent_id: str,
         head_turn_id: Optional[str],
     ) -> List[Dict[str, Any]]:
-        """Walk the turn DAG from ``head_turn_id`` back to ``agent.last_seen_turn_id``.
+        """Walk the turn DAG from head_turn_id back to the agent's
+        last-seen turn.
 
-        Returns the chain in chronological (root → head) order, filtered
-        to turns NOT authored by ``agent_id``.  Returns an empty list when
-        there are no turns, or when ``agent.last_seen_turn_id`` already
-        equals ``head_turn_id``.
+        Returns the chain in chronological (root to head) order,
+        filtered to turns not authored by agent_id. Returns an empty
+        list when there are no turns, or when the agent's last-seen turn
+        already equals head_turn_id.
 
-        Raises :class:`_HandoffCycleError` (K26 ``cycle_detected``) when
-        the chain exceeds :attr:`_HANDOFF_MAX_DEPTH` steps.
+        Raises _HandoffCycleError when the chain exceeds the max depth.
         """
         with self._lock:
             handle = self._agents.get(agent_id)
@@ -1272,7 +1172,7 @@ class AgentSupervisor:
             visited.add(current_id)
             turn = turns_snapshot.get(current_id)
             if turn is None:
-                # Turn referenced but not in store; stop here (partial DAG).
+                # Turn referenced but not stored; stop here.
                 break
             chain.append(turn)
             current_id = turn.get("parent_id")
@@ -1287,18 +1187,15 @@ class AgentSupervisor:
         self,
         turns: List[Dict[str, Any]],
     ) -> List[str]:
-        """Build stream-json prefix lines for ``turns``.
+        """Build stream-json prefix lines for the given turns.
 
-        One line per turn in the format::
-
-            {"type":"user","message":{"role":"user","content":"<role> <agent_id> said: <body>"}}
-
-        Body content passes through ``magic_hash.strip_hashes_from_text``
-        before the JSON wrap so agents never observe ``@@<hash>:<name>``
+        One user-message line per turn, whose content reads
+        "<role> <agent_id> said: <body>". The body is stripped of magic
+        hashes before wrapping so agents never observe hashed magic
         patterns.
 
-        Returns a list of JSON strings (WITHOUT trailing newlines; the
-        caller appends ``"\\n"`` when writing to stdin).
+        Returns a list of JSON strings without trailing newlines; the
+        caller appends the newline when writing to stdin.
         """
         from llm_kernel.text.magic_hash import strip_hashes_from_text
         from llm_kernel.text.magic_registry import CELL_MAGICS, LINE_MAGICS
@@ -1318,24 +1215,19 @@ class AgentSupervisor:
             result.append(line)
         return result
 
-    # BSP-005 S9 — interrupt method paired with the X-EXT cell-toolbar
-    # interrupt button (commit 5de3401 sends ``{action_type:
-    # "agent_interrupt", agent_id}``). The dispatcher in mcp_server.py
-    # routes that envelope here.
+    # Interrupt method paired with the cell-toolbar interrupt button:
+    # the extension sends an agent_interrupt action, which the
+    # dispatcher routes here.
     def interrupt(self, agent_id: str) -> Dict[str, Any]:
-        """Send SIGINT to ``agent_id``'s live process.
+        """Send SIGINT to agent_id's live process.
 
-        Pairs with the X-EXT cell-toolbar interrupt button (commit
-        5de3401): the extension ships an ``operator.action`` envelope
-        with ``action_type: "agent_interrupt"`` whose dispatcher routes
-        through here. The semantic distinction vs ``/stop`` (per
-        ``atoms/operations/stop-agent.md``):
+        How this differs from stop:
 
-        * ``/stop`` is a clean shutdown -- SIGTERM, ``runtime_status:
-          idle``, conversation resumable on the next turn.
-        * ``interrupt`` is an in-flight cancellation -- SIGINT to the
-          live process so claude aborts its current generation but the
-          process stays alive for the next turn. No resume cycle.
+        * stop is a clean shutdown -- SIGTERM, status goes idle, and the
+          conversation is resumable on the next turn.
+        * interrupt is an in-flight cancellation -- SIGINT so claude
+          aborts its current generation while the process stays alive
+          for the next turn. No resume cycle.
 
         Returns:
             ``{"agent_id": ..., "status": "interrupted" | "not_running"
@@ -1400,44 +1292,36 @@ class AgentSupervisor:
         return {"agent_id": agent_id, "status": "interrupted"}
 
     # ------------------------------------------------------------------
-    # PLAN-S5b: revert operation
+    # Revert operation
     # ------------------------------------------------------------------
 
-    #: K-class for revert target not in agent ancestry (BSP-002 §7).
+    # Error code for a revert target not in the agent's ancestry.
     K22_INVALID_REVERT_TARGET: str = "K22"
 
     def revert(self, agent_id: str, target_turn_id: str) -> None:
-        """Move ``agent_id``'s HEAD backward to ``target_turn_id``.
+        """Move agent_id's head backward to target_turn_id.
 
-        PLAN-S5b / `revert-agent.md`:
+        Steps:
 
-        1. Validate agent exists (K20 if not).
-        2. Validate ``target_turn_id`` is in the agent's ancestry by
-           walking ``parent_id`` from the current head through
-           ``self._turns`` (K22 if not found).
-        3. SIGTERM the live process if ``runtime_status == "alive"``
-           (i.e. the process has not yet exited).  Watchdog handles
-           cleanup; exit code 0 treated as expected.
-        4. Submit ``move_agent_head`` intent to writer:
-           ``agent.head_turn_id = target_turn_id``,
-           ``agent.last_seen_turn_id = target_turn_id``.
-           ``move_agent_head`` is in ``_PENDING_SLICE``; the writer
-           raises ``ValueError`` for it, so we log a no-op diagnostic
-           (same pattern as S4's ``update_agent_session`` best-effort
-           path) — the in-memory state is still updated.
-        5. Submit ``record_event`` intent with ``kind: "agent_ref_move"``,
-           ``reason: "operator_revert"``.
-        6. Mint a fresh ``claude_session_id`` for next continue; the old
-           one stays attached to historical turns.
+        1. Validate the agent exists.
+        2. Validate target_turn_id is in the agent's ancestry by walking
+           parent_id from the current head.
+        3. SIGTERM the live process if it has not yet exited. The
+           watchdog handles cleanup; exit code 0 is expected.
+        4. Submit a move_agent_head intent to the writer, setting the
+           head and last-seen turns to target_turn_id.
+        5. Submit a record_event intent for the head move.
+        6. Mint a fresh claude_session_id for the next continue; the old
+           one stays attached to the historical turns.
 
         Args:
-            agent_id: The agent whose HEAD to move.
-            target_turn_id: The turn to revert to; MUST be in the
-                agent's ancestry (reachable via ``parent_id`` walk).
+            agent_id: The agent whose head to move.
+            target_turn_id: The turn to revert to; must be in the
+                agent's ancestry.
 
         Raises:
-            RuntimeError: K20 if the agent is unknown; K22 if
-                ``target_turn_id`` is not in the agent's ancestry.
+            RuntimeError: if the agent is unknown, or if target_turn_id
+                is not in the agent's ancestry.
         """
         from llm_kernel._internal import _diagnostics
 
@@ -1449,11 +1333,10 @@ class AgentSupervisor:
                     "Spawn or respawn the agent before calling revert."
                 )
 
-            # --- ancestry walk (PLAN-S4.1) -----------------------------
-            # Read the persisted turn graph from
-            # ``metadata.rts.zone.agents.<*>.turns[]`` and walk parent_id
-            # from the notebook head (most-recent turn) back through the
-            # union of all agents' chains looking for ``target_turn_id``.
+            # --- ancestry walk -----------------------------------------
+            # Read the persisted turn graph and walk parent_id from the
+            # notebook head back through the union of all agents' chains
+            # looking for target_turn_id.
             turn_index, current_head = self._read_persisted_turns()
             found = False
             visited: set = set()
@@ -1495,19 +1378,17 @@ class AgentSupervisor:
 
             # --- in-memory head update ---------------------------------
             handle.last_seen_turn_id = target_turn_id
-            # PLAN-S4.1: notebook head is computed from
-            # ``metadata.rts.zone.agents.<*>.turns[]`` on demand; the
-            # ``move_agent_head`` writer intent submitted below records
+            # The notebook head is computed from the persisted turns on
+            # demand; the move_agent_head intent submitted below records
             # the new head as the canonical post-revert position.
 
             # --- mint fresh claude_session_id for next continue --------
             handle.claude_session_id = str(uuid.uuid4())
 
-        # --- writer intents (outside lock; PLAN-S4.1 active) -----------
+        # --- writer intents (outside lock) -----------------------------
         if self._metadata_writer is not None:
-            # ``move_agent_head`` is now active per PLAN-S4.1 §3.A.  The
-            # writer mutates ``zone.agents.<id>.session.{head_turn_id,
-            # last_seen_turn_id}`` and bumps snapshot_version.
+            # move_agent_head mutates the agent's session head and
+            # last-seen turns and bumps the snapshot version.
             self._metadata_writer.submit_intent({
                 "payload": {
                     "action_type": "zone_mutate",
@@ -1521,9 +1402,9 @@ class AgentSupervisor:
                 },
             })
 
-            # agent_ref_move event log — PLAN-S4.1 §3.B.  Submitted as
-            # ``record_event`` with ``parameters.kind = 'agent_ref_move'``
-            # (NOT ``intent_kind: 'agent_ref_move'`` — that K40s).
+            # Log the head move as a record_event with
+            # parameters.kind = 'agent_ref_move' (not as an intent_kind
+            # of that name, which would be rejected).
             self._metadata_writer.submit_intent({
                 "payload": {
                     "action_type": "zone_mutate",
@@ -1546,36 +1427,34 @@ class AgentSupervisor:
         )
 
     # ------------------------------------------------------------------
-    # PLAN-S5c: stop operation
+    # Stop operation
     # ------------------------------------------------------------------
 
     def stop(self, agent_id: str) -> None:
-        """Clean SIGTERM of ``agent_id``'s runtime process.
+        """Cleanly SIGTERM agent_id's runtime process.
 
-        PLAN-S5c / `stop-agent.md`:
+        Steps:
 
-        1. Validate agent exists (K20 if not).
-        2. If ``runtime_status != "alive"`` (i.e. the process has already
-           exited), log a diagnostic and return — the operation is
-           idempotent; the operator may stop an already-idle agent.
-        3. SIGTERM the live process.  Watchdog observes exit; exit code 0
-           is treated as expected.
-        4. Set ``handle.runtime_status = "idle"``, ``handle.pid = None``.
-        5. Submit ``update_agent_session`` intent with the new
-           ``runtime_status`` (best-effort per S4 pattern; the writer
-           handler is active for ``update_agent_session``).
+        1. Validate the agent exists.
+        2. If the process has already exited, log a diagnostic and
+           return — stop is idempotent, so an already-idle agent is fine.
+        3. SIGTERM the live process. The watchdog observes the exit;
+           exit code 0 is expected.
+        4. Mark the agent idle.
+        5. Submit an update_agent_session intent with the new status
+           (best-effort).
 
-        NOT done by stop (contrast with revert):
-        - Do NOT mint a new ``claude_session_id`` — stop preserves the
-          session so the next continue can ``--resume``.
-        - Do NOT touch ``head_turn_id`` or ``last_seen_turn_id`` — stop
-          does not move HEAD; revert does.
+        What stop does NOT do (unlike revert):
+        - It does not mint a new claude_session_id — stop preserves the
+          session so the next continue can --resume.
+        - It does not touch the head or last-seen turns — stop does not
+          move the head; revert does.
 
         Args:
             agent_id: The agent to stop.
 
         Raises:
-            RuntimeError: K20 if the agent is unknown.
+            RuntimeError: if the agent is unknown.
         """
         from llm_kernel._internal import _diagnostics
 
@@ -1589,9 +1468,8 @@ class AgentSupervisor:
 
             # --- idempotency guard: already idle / exited ---------------
             if handle.popen.poll() is not None:
-                # Process has already exited; runtime_status is already
-                # idle or exited — nothing to do.  Log as diagnostic so
-                # the operator sees the no-op.
+                # Process has already exited; nothing to do. Log the
+                # no-op so the operator sees it.
                 _diagnostics.mark(
                     "stop_noop_already_idle",
                     agent_id=agent_id,
@@ -1609,10 +1487,9 @@ class AgentSupervisor:
             )
 
             # --- in-memory status update --------------------------------
-            # pid is represented on handle.popen, not a separate field, but
-            # the agent schema exposes pid: null on idle.  We set the
-            # canonical runtime_status flag on the handle so callers can
-            # inspect it; the writer intent carries the authoritative state.
+            # pid lives on handle.popen, not a separate field; the agent
+            # schema exposes pid: null when idle. The writer intent below
+            # carries the authoritative state.
 
         # --- writer intent (outside lock; best-effort) ------------------
         if self._metadata_writer is not None:
@@ -1641,10 +1518,10 @@ class AgentSupervisor:
         )
 
     # ------------------------------------------------------------------
-    # PLAN-S5a: branch / fork operation
+    # Branch / fork operation
     # ------------------------------------------------------------------
 
-    #: K-class for invalid branch target (new_agent_id already exists).
+    # Error code for an invalid branch target (new_agent_id already exists).
     K21_INVALID_BRANCH_TARGET: str = "K21"
 
     def fork(
@@ -1653,50 +1530,44 @@ class AgentSupervisor:
         at_turn_id: Optional[str],
         new_agent_id: str,
     ) -> "AgentHandle":
-        """Create a new agent ref branching from ``source_agent_id``.
+        """Create a new agent branching from source_agent_id.
 
-        PLAN-S5a / `branch-agent.md`:
+        Steps:
 
-        1. Validate ``source_agent_id`` exists (K20 if not).
-        2. Validate ``new_agent_id`` does NOT already exist (K21 if it does).
-        3. **Case A** (``at_turn_id`` is ``None`` OR equals
-           ``source.head_turn_id``):
-           - New agent's ``head_turn_id = source.head_turn_id``.
-           - New agent's ``last_seen_turn_id = source.head_turn_id``.
-           - Fresh ``claude_session_id`` minted (source session NOT shared).
-           - ``runtime_status = "idle"`` — no live process; spawn on first
-             continue-turn via existing resume + replay mechanics.
-        4. **Case B** (``at_turn_id`` is an ancestor):
-           - Validate ``at_turn_id`` is in ``source.head_turn_id``'s ancestry
-             by walking ``parent_id`` (K22 if not found).
-           - New agent's ``head_turn_id = at_turn_id``.
-           - New agent's ``last_seen_turn_id = at_turn_id``.
-           - Fresh ``claude_session_id``; ``runtime_status = "idle"``.
-           - Transcript replay (synthesizing a claude session at ``at_turn_id``)
-             is NOT this slice's job — it happens lazily on first continue-turn
-             via existing resume + replay mechanics.
-        5. Insert the new AgentHandle into ``self._agents``.
-        6. Submit ``fork_agent`` intent to writer (best-effort; logs diagnostic
-           if the handler is ``_PENDING_SLICE``).
-        7. Submit ``record_event`` intent with ``kind: "agent_ref_move"``,
-           ``reason: "operator_branch"``.
-        8. Return the new AgentHandle.
+        1. Validate source_agent_id exists.
+        2. Validate new_agent_id does not already exist.
+        3. Case A (at_turn_id is None or equals the source's head):
+           - The new agent's head and last-seen turns are the source's
+             head.
+           - A fresh claude_session_id is minted (the source session is
+             not shared).
+           - The new agent starts idle, with no live process; it spawns
+             on the first continue-turn.
+        4. Case B (at_turn_id is an ancestor):
+           - Validate at_turn_id is in the source head's ancestry by
+             walking parent_id.
+           - The new agent's head and last-seen turns are at_turn_id.
+           - A fresh claude_session_id; the agent starts idle.
+           - Replaying the transcript up to at_turn_id happens lazily on
+             the first continue-turn, not here.
+        5. Insert the new handle into the agent map.
+        6. Submit a fork_agent intent to the writer (best-effort).
+        7. Submit a record_event intent for the branch.
+        8. Return the new handle.
 
         Args:
             source_agent_id: The agent to branch from.
-            at_turn_id: The turn to branch at.  ``None`` or equal to
-                ``source.head_turn_id`` triggers Case A (branch at head).
-                Any ancestor turn triggers Case B.
-            new_agent_id: The ID for the new agent.  MUST be unique.
+            at_turn_id: The turn to branch at. None or the source's head
+                triggers Case A; any ancestor turn triggers Case B.
+            new_agent_id: The id for the new agent; must be unique.
 
         Returns:
-            The newly-created :class:`AgentHandle` (``runtime_status``
-            is ``"idle"``; no live process yet).
+            The new AgentHandle (idle; no live process yet).
 
         Raises:
-            RuntimeError: K20 if ``source_agent_id`` is unknown; K21 if
-                ``new_agent_id`` already exists; K22 if ``at_turn_id``
-                is not in the source agent's ancestry.
+            RuntimeError: if source_agent_id is unknown, if new_agent_id
+                already exists, or if at_turn_id is not in the source
+                agent's ancestry.
         """
         from llm_kernel._internal import _diagnostics
 
@@ -1717,7 +1588,7 @@ class AgentSupervisor:
                     "supervisor.  Choose a different new_agent_id."
                 )
 
-            # --- resolve effective branch point (PLAN-S4.1) ------------
+            # --- resolve effective branch point ------------------------
             turn_index, source_head = self._read_persisted_turns()
 
             # Determine Case A vs Case B.
@@ -1758,9 +1629,9 @@ class AgentSupervisor:
             new_session_id = str(uuid.uuid4())
 
             # --- build the new AgentHandle (metadata-only; no process) -
-            # We construct a minimal handle using a sentinel Popen-like
-            # object: the handle's popen.poll() returns non-None (already
-            # "exited") so runtime_status is treated as idle by callers.
+            # Use a sentinel Popen-like object whose poll() returns a
+            # non-None code, so callers treat the agent as already
+            # exited (idle).
             import types
             idle_popen: Any = types.SimpleNamespace(
                 poll=lambda: 0,
@@ -1789,10 +1660,9 @@ class AgentSupervisor:
 
             self._agents[new_agent_id] = new_handle
 
-        # --- writer intents (outside lock; PLAN-S4.1 active) -----------
+        # --- writer intents (outside lock) -----------------------------
         if self._metadata_writer is not None:
-            # fork_agent intent: persists the new agent ref into
-            # ``zone.agents.<new_id>`` per PLAN-S4.1 §3.A.
+            # fork_agent persists the new agent into the zone's agent map.
             self._metadata_writer.submit_intent({
                 "payload": {
                     "action_type": "zone_mutate",
@@ -1808,7 +1678,7 @@ class AgentSupervisor:
                 },
             })
 
-            # agent_ref_move event — PLAN-S4.1 §3.B.
+            # Log the branch as an agent_ref_move event.
             self._metadata_writer.submit_intent({
                 "payload": {
                     "action_type": "zone_mutate",
@@ -1834,7 +1704,7 @@ class AgentSupervisor:
         return new_handle
 
     def terminate_all(self, grace_seconds: float = 10.0) -> None:
-        """Graceful shutdown of every active agent (RFC-002 §6)."""
+        """Graceful shutdown of every active agent."""
         with self._lock:
             handles = list(self._agents.values())
         for handle in handles:
@@ -1850,11 +1720,11 @@ class AgentSupervisor:
         work_dir: Path, task: str,
         *, claude_session_id: str = "",
     ) -> AgentHandle:
-        """Allocate the handle + start reader/watchdog threads.
+        """Allocate the handle and start the reader/watchdog threads.
 
-        ``claude_session_id`` is the BSP-002 §5 kernel-owned UUID passed
-        to claude via ``--session-id``; persists on the handle so a future
-        ``--resume`` can thread continuation across spawn cycles.
+        claude_session_id is the kernel-owned UUID passed to claude via
+        --session-id; it persists on the handle so a future --resume can
+        continue across spawn cycles.
         """
         spawn_dir = work_dir / ".run" / agent_id
         stderr_log = spawn_dir / f"kernel.stderr.{agent_id}.log"
@@ -1893,16 +1763,15 @@ class AgentSupervisor:
     def _read_stdout(self, handle: AgentHandle) -> None:
         """Parse each stdout line as stream-json or MCP JSON-RPC.
 
-        Lines that fail both parsers are DR-0010 violations; logged via
-        a synthetic ``notify`` and counted toward the flood threshold.
-        Lines that parse as MCP JSON-RPC ``tools/call`` frames are
-        recorded as a courtesy run.
+        Lines that fail both parsers are prose violations; each is logged
+        via a synthetic notify and counted toward the flood threshold.
+        Lines that parse as MCP tools/call frames are recorded as a
+        courtesy run.
 
-        When ``LLMKERNEL_DEBUG_STDOUT=1`` is set in the supervisor's env,
-        every raw stdout line is also appended to
-        ``<spawn_dir>/agent.stdout.<id>.log`` for post-mortem inspection,
-        and a pretty-printed copy of each parseable JSON event is
-        appended to ``<spawn_dir>/agent.stdout.<id>.pretty.log``.
+        When LLMKERNEL_DEBUG_STDOUT=1 is set, every raw stdout line is
+        also appended to a per-agent log for post-mortem inspection, and
+        a pretty-printed copy of each parseable JSON event is appended to
+        a companion .pretty.log.
         """
         assert handle.popen.stdout is not None
         debug = os.environ.get("LLMKERNEL_DEBUG_STDOUT") == "1"
@@ -1916,10 +1785,9 @@ class AgentSupervisor:
         for raw in handle.popen.stdout:
             if handle._stop_event.is_set():
                 break
-            # RFC-002 §"Failure modes" hang detection: every byte
-            # observed on stdout (even an empty line) resets the
-            # silence timer so the watchdog only fires on TRUE
-            # silence, not parser-rejection silence.
+            # Hang detection: every byte on stdout (even an empty line)
+            # resets the silence timer, so the watchdog only fires on
+            # true silence, not on parser-rejection silence.
             handle._last_stdout_ts = time.monotonic()
             line = raw.rstrip("\r\n")
             if debug_path is not None:
@@ -1931,10 +1799,9 @@ class AgentSupervisor:
             if pretty_path is not None and parsed is not None:
                 _append_pretty(pretty_path, parsed)
             if parsed is None:
-                # RFC-002 §"Process lifecycle" 3: lines that fail both
-                # parsers become ``agent_emit`` spans of kind
-                # ``malformed_json`` with ``llmnb.parser_diagnostic``
-                # carrying the short error string.
+                # Lines that fail both parsers become agent_emit spans
+                # of kind malformed_json, carrying the short parser
+                # error string.
                 self._emit_agent_emit(
                     handle, emit_kind="malformed_json",
                     emit_content=line, parser_diagnostic=parse_error,
@@ -1950,15 +1817,12 @@ class AgentSupervisor:
             self._handle_violation(handle, line)
 
     def _read_stderr(self, handle: AgentHandle, log_path: Path) -> None:
-        """Append stderr to a per-agent log AND emit ``agent_emit`` spans per line.
+        """Append stderr to a per-agent log and emit an agent_emit span per line.
 
-        Per RFC-002 §"Process lifecycle" 4: stderr is captured line by
-        line and emitted as ``agent_emit`` spans with
-        ``llmnb.emit_kind: "stderr"``; the kernel additionally writes
-        the raw stream to a per-agent log file (indexed by agent_id)
-        for debugging.  Renderers MAY collapse stderr by default but
-        the data MUST reach the operator surface -- silent drops are
-        forbidden.
+        stderr is captured line by line and emitted as agent_emit spans
+        of kind "stderr"; the raw stream is also written to a per-agent
+        log file for debugging. Renderers may collapse stderr by default,
+        but the data must reach the operator surface — no silent drops.
         """
         assert handle.popen.stderr is not None
         try:
@@ -1978,12 +1842,11 @@ class AgentSupervisor:
             logger.exception("agent %s stderr log write failed", handle.agent_id)
 
     def _watchdog(self, handle: AgentHandle, task: str) -> None:
-        """Monitor process exit; restart per RFC-002 §"Process lifecycle" 5.
+        """Monitor process exit and restart the agent.
 
         Up to three restarts in a 5-minute sliding window per agent;
-        after exhaustion emits a synthetic ``report_problem`` and
-        leaves ``state=failed``. Per-agent (not zone-wide) — see RFC
-        ambiguity note in the implementation report.
+        after exhaustion emits a synthetic problem report and leaves the
+        agent in the failed state. Per-agent, not zone-wide.
         """
         exit_code = handle.popen.wait()
         if handle._stop_event.is_set() or (
@@ -1992,9 +1855,9 @@ class AgentSupervisor:
             handle.state = "terminated"
             return
         if handle._hang_terminated:
-            # The silence watchdog has already logged + recorded the
-            # hang event and SIGTERMed the process. Reset the flag so
-            # the next iteration of crash-restart can run cleanly.
+            # The silence watchdog has already logged the hang event and
+            # SIGTERMed the process. Reset the flag so the next
+            # crash-restart iteration can run cleanly.
             handle._hang_terminated = False
             logger.warning(
                 "agent %s SIGTERMed by silence watchdog; restart attempt %d",
@@ -2006,8 +1869,8 @@ class AgentSupervisor:
                 handle.agent_id, exit_code,
                 len(handle._restart_history) + 1,
             )
-        # RFC-002 §6 sliding-window check: prune entries older than
-        # _RESTART_WINDOW_SEC; if >= _RESTART_WINDOW_MAX, refuse.
+        # Sliding-window check: prune entries older than the restart
+        # window; if we're at or past the max, refuse another restart.
         now = time.monotonic()
         cutoff = now - _RESTART_WINDOW_SEC
         with self._lock:
@@ -2040,7 +1903,7 @@ class AgentSupervisor:
         self._watchdog(handle, task)
 
     def _respawn_in_place(self, handle: AgentHandle, task: str) -> None:
-        """Spawn a new ``claude`` process replacing the dead one in ``handle``."""
+        """Spawn a new claude process replacing the dead one in the handle."""
         spawn_dir = handle.work_dir / ".run" / handle.agent_id
         mcp_config_path = spawn_dir / "mcp-config.json"
         system_prompt_path = spawn_dir / "system-prompt.txt"
@@ -2085,17 +1948,15 @@ class AgentSupervisor:
     def _silence_watchdog(self, handle: AgentHandle) -> None:
         """Hang detection: SIGTERM if stdout is silent past the threshold.
 
-        RFC-002 §"Failure modes" Hang row: when the agent emits no
-        stdout for >threshold seconds AND the process is still running,
-        the supervisor SIGTERMs and lets the regular crash-restart
-        machinery in :meth:`_watchdog` pick up the resulting non-zero
-        exit (with ``handle._hang_terminated`` set so the log line
+        When the agent emits no stdout for longer than the threshold and
+        the process is still running, SIGTERM it and let the crash-
+        restart machinery in the watchdog pick up the resulting non-zero
+        exit (with the hang-terminated flag set so the log line
         attributes the cause correctly).
 
-        Loops at ``self._silence_granularity_sec`` granularity and
-        exits when the popen has reaped (returncode is not None) or
-        the stop-event is set. Daemon thread: never prevents process
-        teardown.
+        Loops at the configured granularity and exits when the process
+        has reaped or the stop event is set. A daemon thread, so it
+        never prevents process teardown.
         """
         threshold = self._silence_threshold_sec
         granularity = self._silence_granularity_sec
@@ -2110,9 +1971,9 @@ class AgentSupervisor:
             silence = time.monotonic() - handle._last_stdout_ts
             if silence <= threshold:
                 continue
-            # Mark first so the regular watchdog sees the flag even if
-            # SIGTERM races. RFC-002 mandates one ERROR-level log
-            # event with the silence_seconds attribute.
+            # Mark first so the watchdog sees the flag even if the
+            # SIGTERM races. Emit one error-level log event carrying the
+            # silence duration.
             handle._hang_terminated = True
             logger.error(
                 "agent.hang_detected agent_id=%s silence_seconds=%.1f",
@@ -2130,14 +1991,12 @@ class AgentSupervisor:
             return
 
     def _validate_template_version(self, rendered_prompt: str) -> None:
-        """Refuse spawn on system-prompt-template major-version mismatch.
+        """Refuse spawn on a system-prompt-template major-version mismatch.
 
-        RFC-002 §"Failure modes" Template-version-mismatch row.
-        Major mismatch -> :class:`PreSpawnValidationError` with
-        ``provisioning.template.version_mismatch`` log signature.
-        Minor mismatch -> log a warning and proceed. Patch differs
-        silently. Missing marker -> warn (we just rendered the
-        canonical template, so it is a developer bug not an attack).
+        Major mismatch -> raise PreSpawnValidationError. Minor mismatch
+        -> log a warning and proceed. Patch differences are silent. A
+        missing version marker -> warn (we just rendered the canonical
+        template, so it's a developer bug, not an attack).
         """
         seen = extract_template_version(rendered_prompt)
         expected = EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION
@@ -2170,30 +2029,26 @@ class AgentSupervisor:
                 expected, seen,
             )
 
-    # -- Config-driven respawn (consumed by K-CM hydrate handler) ----
+    # -- Config-driven respawn (consumed by the hydrate handler) -----
 
     def respawn_from_config(
         self, config_recoverable_agents: List[Dict[str, Any]],
     ) -> Dict[str, str]:
-        """Spawn (or rebind) every agent in ``config.recoverable.agents[]``.
+        """Spawn (or rebind) every agent in a recoverable-agents list.
 
-        Round-1 G1 contract: K-CM's ``notebook.metadata mode:hydrate``
-        handler calls this with the recoverable agent list (each entry
-        carries ``agent_id``, ``zone_id``, ``tools_allowed`` and
-        optionally ``volatile`` keys ``model``,
-        ``system_prompt_template_id``, ``system_prompt_hash``, plus a
-        ``task`` string). Returns ``{agent_id: status}`` where status
-        is ``"spawned"`` | ``"failed"`` | ``"skipped"``.
+        The hydrate handler calls this with the recoverable agent list;
+        each entry carries agent_id, zone_id, tools_allowed, and
+        optionally model, system_prompt_template_id, system_prompt_hash,
+        and a task string. Returns {agent_id: status} where status is
+        "spawned", "failed", or "skipped".
 
-        Idempotency: agents with an ``agent_id`` already running are
-        skipped (no respawn). One bad entry MUST NOT block the rest;
-        each spawn is wrapped in its own try-block.
+        Idempotency: agents already running are skipped. One bad entry
+        must not block the rest; each spawn is wrapped in its own
+        try-block.
 
-        The recoverable schema (RFC-005 §"`metadata.rts.config.recoverable.agents`")
-        does NOT carry the task string. V1 callers pass the task as a
-        synthetic key inside each entry (``"task"``) until RFC-005 v2
-        decides whether ``task`` is recoverable; missing ``task`` is
-        an error for that entry only.
+        The recoverable schema does not carry the task string; callers
+        pass it as a synthetic "task" key inside each entry. A missing
+        task fails that entry only.
         """
         results: Dict[str, str] = {}
         for entry in config_recoverable_agents:
@@ -2213,51 +2068,40 @@ class AgentSupervisor:
                     continue
                 self._spawn_from_config_entry(entry)
                 results[agent_id] = "spawned"
-            except Exception:  # noqa: BLE001 — RFC-002 mandates per-agent
+            except Exception:  # noqa: BLE001 — isolate per-agent failures
                 logger.exception(
                     "respawn_from_config: spawn failed for %s", agent_id,
                 )
                 results[agent_id] = "failed"
         return results
 
-    #: Statuses that signal a resumable claude session per
-    #: ``decisions/no-rebind-popen``. ``alive`` is included because a
-    #: snapshot taken before clean shutdown may carry the prior
-    #: ``runtime_status`` even though the process has since gone away —
-    #: per the decision atom that case is treated as ``idle``.
+    # Statuses that signal a resumable claude session. "alive" is
+    # included because a snapshot taken before clean shutdown may still
+    # carry that status even though the process has since gone away;
+    # that case is treated as idle.
     _RESUMABLE_RUNTIME_STATUSES: frozenset[str] = frozenset(
         {"alive", "idle", "exited"}
     )
-    #: How long the supervisor waits for a resume-spawn's popen to
-    #: confirm liveness before declaring the resume failed (K24). Short
-    #: by design — claude exits quickly when the session id is unknown
-    #: or the cache has expired. Tests pass a smaller value via
-    #: ``_resume_verify_timeout_sec``.
+    # How long to wait for a resume-spawn's process to confirm liveness
+    # before declaring the resume failed. Short by design: claude exits
+    # quickly when the session id is unknown or its cache has expired.
     _RESUME_VERIFY_TIMEOUT_SEC: float = 0.5
 
     def _spawn_from_config_entry(self, entry: Dict[str, Any]) -> AgentHandle:
-        """Resolve a recoverable+volatile config entry to a spawn(...) call.
+        """Resolve a recoverable config entry to a spawn() call.
 
-        Required keys: ``agent_id``, ``zone_id``, ``task``,
-        ``work_dir``. Optional volatile keys (per RFC-005
-        ``config.volatile.agents[]``): ``model``,
-        ``claude_session_id``, ``runtime_status``. Raises ValueError on
-        missing required key; the caller in
-        :meth:`respawn_from_config` translates that to ``'failed'``.
+        Required keys: agent_id, zone_id, task, work_dir. Optional keys:
+        model, claude_session_id, runtime_status. Raises ValueError on a
+        missing required key; the caller translates that to "failed".
 
-        Resume branch (BSP-002 §4.3 / decisions/no-rebind-popen): when
-        the entry carries ``claude_session_id`` AND ``runtime_status``
-        is in :data:`_RESUMABLE_RUNTIME_STATUSES`, the supervisor calls
-        :meth:`spawn` with ``resume_claude_session_id=...`` so claude
-        re-attaches via ``--resume <id>`` instead of minting a new UUID.
+        Resume branch: when the entry carries a claude_session_id and a
+        resumable runtime_status, spawn with resume_claude_session_id so
+        claude re-attaches via --resume instead of minting a new UUID.
 
-        K24 fallback (BSP-002 §7): if the resume-spawn's claude process
-        exits non-zero before the verify timeout elapses, the
-        supervisor emits a K24 ``report_problem``, drops the failed
-        handle, and retries as a FRESH spawn (new UUID). The agent's
-        task will then replay via the BSP-002 §4.4 Case-B mechanism on
-        the next continuation; for V1 the K24 marker + fresh spawn is
-        the documented fallback path.
+        Fallback: if the resume-spawn's process exits non-zero before
+        the verify timeout, emit a problem report, drop the failed
+        handle, and retry as a fresh spawn. The agent's task then
+        replays on the next continuation.
         """
         agent_id = entry["agent_id"]
         zone_id = entry["zone_id"]
@@ -2285,8 +2129,8 @@ class AgentSupervisor:
             and isinstance(runtime_status, str)
             and runtime_status in self._RESUMABLE_RUNTIME_STATUSES
         )
-        # PLAN-S4: restore last_seen_turn_id from the config entry so the
-        # handoff walker knows where to start after a notebook reopen.
+        # Restore last_seen_turn_id from the config entry so the handoff
+        # walker knows where to start after a notebook reopen.
         last_seen_turn_id: Optional[str] = entry.get("last_seen_turn_id")
 
         if not is_resume:
@@ -2312,7 +2156,7 @@ class AgentSupervisor:
                 exit_code=handle.popen.poll(),
             )
             # Drop the failed handle so the fresh spawn does not hit
-            # the live-agent idempotency short-circuit in :meth:`spawn`.
+            # the live-agent idempotency check in spawn.
             with self._lock:
                 if self._agents.get(agent_id) is handle:
                     del self._agents[agent_id]
@@ -2326,13 +2170,13 @@ class AgentSupervisor:
         return handle
 
     def _resume_failed(self, handle: AgentHandle) -> bool:
-        """Return True if the just-spawned resume process has already exited
-        with a non-zero status.
+        """Return True if the just-spawned resume process has already
+        exited with a non-zero status.
 
-        Polls ``popen.poll()`` for at most ``_RESUME_VERIFY_TIMEOUT_SEC``
-        at a fine granularity. A still-alive popen (``poll() is None``)
-        and a clean exit (``poll() == 0``) both count as success — the
-        K24 path triggers only on observable non-zero termination.
+        Polls the process for at most the verify timeout at a fine
+        granularity. A still-alive process (poll() is None) and a clean
+        exit (poll() == 0) both count as success — the fallback path
+        triggers only on an observable non-zero termination.
         """
         deadline = time.monotonic() + self._RESUME_VERIFY_TIMEOUT_SEC
         granularity = 0.05
@@ -2352,14 +2196,12 @@ class AgentSupervisor:
         attempted_session_id: str,
         exit_code: Optional[int],
     ) -> None:
-        """Emit the K24 fallback marker + synthetic ``report_problem``.
+        """Emit the resume-failed marker and a synthetic problem report.
 
-        Per BSP-002 §7 K24: ``--resume <session_id>`` failed (the local
-        claude cache likely expired the session per
-        ``concepts/agent.md`` ``runtime_status: "exited"`` semantics).
-        The kernel then mints a new session and retries as a fresh
-        spawn; the operator surface sees a K24 problem run flagging
-        the lossy transition.
+        --resume <session_id> failed, most likely because the local
+        claude cache expired the session. The kernel then mints a new
+        session and retries as a fresh spawn; the operator surface sees
+        a problem run flagging the lossy transition.
         """
         from llm_kernel._internal import _diagnostics
         _diagnostics.mark(
@@ -2380,15 +2222,12 @@ class AgentSupervisor:
     # -- Synthetic-run helpers ---------------------------------------
 
     def _handle_violation(self, handle: AgentHandle, line: str) -> None:
-        """DR-0010 prose violation: ``agent_emit`` (prose) + flood-check.
+        """Record a prose violation as an agent_emit span and flood-check.
 
-        Per RFC-002 §"Process lifecycle" 3 / RFC-005 §"`agent_emit`
-        runs", free-form prose despite the suppression prompt becomes
-        an ``agent_emit`` span with ``llmnb.emit_kind: "prose"``
-        rather than a synthetic ``notify`` (which conflated agent
-        output with kernel-issued tool calls).  On flood (>5/min),
-        the supervisor additionally emits a synthetic ``escalate``
-        run for operator attention.
+        Free-form prose emitted despite the suppression prompt becomes
+        an agent_emit span of kind "prose". On a flood (more than five a
+        minute) the supervisor also emits a synthetic escalate run for
+        operator attention.
         """
         self._emit_agent_emit(
             handle, emit_kind="prose", emit_content=line,
@@ -2420,26 +2259,22 @@ class AgentSupervisor:
         self._run_tracker.complete_run(rid, outputs={"acknowledged": True})
 
     def _record_stream_json(self, handle: AgentHandle, parsed: Dict[str, Any]) -> None:
-        """Dispatch a Claude stream-json record per RFC-002 §"Process lifecycle" 3.
+        """Dispatch a Claude stream-json record.
 
-        Stream-json record types and their handling:
+        Record types and their handling:
 
-        * ``assistant`` -- iterate the content array.  ``tool_use``
-          blocks become tool spans (existing behavior).  ``text``
-          blocks become ``agent_emit`` spans with
-          ``llmnb.emit_kind: "reasoning"`` (text preceding a tool
-          call) or ``llmnb.emit_kind: "prose"`` (text in an
-          assistant message with no companion tool_use).
-        * ``system`` -- ``agent_emit`` with kind ``system_message``.
-        * ``result`` -- ``agent_emit`` with kind ``result``.
-        * ``error`` -- ``agent_emit`` with kind ``error``.
+        * assistant -- iterate the content array. tool_use blocks become
+          tool spans. text blocks become agent_emit spans of kind
+          "reasoning" (text preceding a tool call) or "prose" (text in
+          an assistant message with no companion tool_use).
+        * system -- agent_emit of kind system_message.
+        * result -- agent_emit of kind result.
+        * error -- agent_emit of kind error.
 
-        The MCP-namespaced prefix ``mcp__llmkernel-operator-bridge__``
-        (Claude Code's convention for MCP tools) is stripped from
-        tool names so the operator surface sees them by their RFC-001
-        names.  The supervisor cannot observe the MCP server's
-        completion of the tool run -- V1 records the ATTEMPT here,
-        not the result; RFC-002 v1.0.1 amendment captures this.
+        The MCP tool-name prefix that Claude Code adds is stripped so the
+        operator surface sees tools by their plain names. The supervisor
+        cannot observe the MCP server completing the tool run, so it
+        records the attempt here, not the result.
         """
         record_type = parsed.get("type")
         if record_type == "system":
@@ -2483,8 +2318,8 @@ class AgentSupervisor:
                     continue
                 # Reasoning if this assistant message also contains a
                 # tool_use block (the text precedes the tool call);
-                # prose otherwise (text-only assistant message in spite
-                # of the suppression prompt -- DR-0010 violation).
+                # prose otherwise (a text-only assistant message, in
+                # spite of the suppression prompt).
                 emit_kind = "reasoning" if has_tool_use else "prose"
                 self._emit_agent_emit(
                     handle, emit_kind=emit_kind, emit_content=text_value,
@@ -2512,7 +2347,7 @@ class AgentSupervisor:
     def _record_synthetic_problem(
         self, agent_id: str, zone_id: str, description: str, log_signature: str,
     ) -> None:
-        """Open + close a synthetic ``report_problem`` run."""
+        """Open and close a synthetic report_problem run."""
         rid = self._run_tracker.start_run(
             name="report_problem", run_type="tool",
             inputs={"severity": "error", "description": description},
@@ -2528,7 +2363,7 @@ class AgentSupervisor:
     def _record_synthetic_escalate(
         self, agent_id: str, zone_id: str, reason: str, severity: str,
     ) -> None:
-        """Open + close a synthetic ``escalate`` run (DR-0010 flood)."""
+        """Open and close a synthetic escalate run (prose flood)."""
         rid = self._run_tracker.start_run(
             name="escalate", run_type="tool",
             inputs={"reason": reason, "severity": severity},
@@ -2541,7 +2376,7 @@ class AgentSupervisor:
 
     @staticmethod
     def _try_parse_json(line: str) -> Optional[Dict[str, Any]]:
-        """Return the parsed JSON object or ``None`` for non-JSON lines."""
+        """Return the parsed JSON object or None for non-JSON lines."""
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
@@ -2552,13 +2387,11 @@ class AgentSupervisor:
     def _try_parse_json_with_error(
         line: str,
     ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Like :meth:`_try_parse_json` but also surfaces the decode error.
+        """Like _try_parse_json but also surfaces the decode error.
 
-        Returns ``(parsed_obj_or_None, short_error_string_or_None)``.
-        The short error string is suitable for
-        ``llmnb.parser_diagnostic`` per RFC-005 §"`agent_emit` runs"
-        on a malformed-json span; it captures the decoder's message
-        plus position so the operator can locate the failing byte.
+        Returns (parsed_obj_or_None, short_error_string_or_None). The
+        short error string captures the decoder's message plus position
+        so the operator can locate the failing byte.
         """
         try:
             obj = json.loads(line)
@@ -2581,9 +2414,8 @@ class AgentSupervisor:
         """
         if not isinstance(content, str) or not content:
             return content
-        # Fast path: avoid splitlines work when content is not even
-        # multiline AND has no leading ``@`` anywhere — covers the
-        # majority of agent stream-json system_message / result spans.
+        # Fast path: skip the splitlines work when there's no @ anywhere
+        # in the content — covers most system_message / result spans.
         if "@" not in content:
             return content
         from llm_kernel.text.magic_hash import escape_leading_at
@@ -2608,13 +2440,11 @@ class AgentSupervisor:
     def set_metadata_writer(self, writer: Any) -> None:
         """Wire a metadata writer for contamination flagging.
 
-        PLAN-S5.0.1 §3.2 — the always-on contamination detector flags
-        ``cells[<id>].contaminated = True`` on any cell whose
-        ``bound_agent_id`` matches the agent that just emitted a
-        magic-shaped line. The writer is supplied post-construction
-        (mirroring the dispatcher's ``set_metadata_writer`` plumbing).
-        Wiring is optional: when ``None``, the detector still runs
-        and emits a ``_diagnostics.mark`` so the audit trail survives.
+        The always-on contamination detector marks any cell as
+        contaminated when its bound agent emits a magic-shaped line. The
+        writer is supplied after construction. Wiring is optional: when
+        None, the detector still runs and logs, so the audit trail
+        survives.
         """
         self._metadata_writer = writer
 
@@ -2623,30 +2453,27 @@ class AgentSupervisor:
     ) -> Optional[str]:
         """Scan one agent-emitted line for cell-magic injection patterns.
 
-        PLAN-S5.0.1 §3.2 — two layers:
+        Two layers:
 
-        * **Always-on plain detection**: ``^@@?<known_name>(\\s|:|$)``.
-          Sets ``contaminated`` on any cell bound to ``handle.agent_id``;
-          appends to ``contamination_log`` with ``layer="plain"``.
-        * **Hash-mode emission ban**: when
-          ``magic_hash_enabled`` is True AND the line matches the
-          canonical hashed-magic shape, flag the cell, append a
-          ``layer="hashed_emission_ban"`` log entry, AND signal the
-          caller that the line MUST be escaped before write
-          (``return "ESCAPE_REQUIRED"``).
+        * Always-on plain detection: a leading @ or @@ followed by a
+          known magic name. Flags any cell bound to this agent as
+          contaminated and logs it with layer "plain".
+        * Hash-mode emission ban: when hash mode is enabled and the line
+          matches the hashed-magic shape, flag the cell, log it with
+          layer "hashed_emission_ban", and signal the caller that the
+          line must be escaped before write (returns "ESCAPE_REQUIRED").
 
-        Hash-mode is read from the writer's
-        ``metadata.rts.config.magic_hash_enabled`` setting. The schema
-        addition lands in slice 5.0.1b; until then the lookup returns
-        None and the hash-mode branch is dormant by design.
+        Hash mode is read from the writer's config; when the writer is
+        unwired or the setting is absent, the hash-mode branch is
+        dormant.
 
         Returns:
-            ``"ESCAPE_REQUIRED"`` when the line matches the hashed-
-            magic shape under hash mode (caller must escape leading
-            ``@`` before push to outputs); ``None`` otherwise.
+            "ESCAPE_REQUIRED" when the line matches the hashed-magic
+            shape under hash mode (the caller must escape the leading @
+            before pushing to outputs); None otherwise.
         """
         # Lazy import: this module otherwise has no dependency on the
-        # registry (preserves the pre-S5.0.1 import topology).
+        # magic registry.
         from llm_kernel.text.magic_hash import (
             HASHED_MAGIC_LINE,
             PLAIN_MAGIC_LINE,
@@ -2658,11 +2485,9 @@ class AgentSupervisor:
         if not isinstance(line, str) or not line:
             return None
 
-        # PLAN-S5.0.2 §7 — extract the magic name regardless of shape
-        # so we can upgrade the contamination tag to K3H when the agent
-        # emitted a generator-magic call. Generator names are a strict
-        # subset of RESERVED_NAMES so we only do this when a layer-1
-        # match happens.
+        # Extract the magic name regardless of shape so we can tag
+        # generator-magic emissions specifically. Generator names are a
+        # strict subset of the reserved names.
         emitted_name: Optional[str] = None
         plain_match = PLAIN_MAGIC_LINE.match(line) if line else None
         hashed_match = HASHED_MAGIC_LINE.match(line) if line else None
@@ -2680,11 +2505,11 @@ class AgentSupervisor:
                 handle.agent_id, line=line, source=source, layer="plain",
             )
             if emitted_is_generator:
-                # PLAN-S5.0.2 §7 — log K3H specifically for generator
-                # names so analytics can split generator-class injection
-                # attempts from generic plain-magic ones. K3H is log-
-                # level (the contamination flag + Layer-2 escape are
-                # the actual defenses).
+                # Log generator names specifically so analytics can
+                # split generator-class injection attempts from generic
+                # plain-magic ones. This marker is log-level only; the
+                # contamination flag and Layer-2 escape are the actual
+                # defenses.
                 self._emit_drift_marker(
                     handle.agent_id,
                     code=K3H_AGENT_EMITTED_GENERATOR_MAGIC_BLOCKED,
@@ -2694,11 +2519,10 @@ class AgentSupervisor:
                     ),
                     line=line,
                 )
-            # PLAN-S5.0.4 §3.5 — when the source agent holds an active
-            # magic-emit privilege grant covering the detected name,
-            # emit K3L (informational marker). The line is still
-            # sanitized per Layer-2; K3L triggers the operator-facing
-            # promotion chip without widening the threat model.
+            # When the source agent holds an active magic-emit privilege
+            # for the detected name, emit an informational marker. The
+            # line is still sanitized; this just offers the operator a
+            # promotion chip.
             if self._privileged_for_magic(
                 handle, emitted_name,
             ):
@@ -2718,8 +2542,8 @@ class AgentSupervisor:
                 handle.agent_id, line=line, source=source,
                 layer="hashed_emission_ban",
             )
-            # When the recovered name is a generator we tag K3H *in
-            # addition to* K36 — analytics consumers index on both.
+            # When the recovered name is a generator, tag it in addition
+            # to the emission-ban marker — analytics index on both.
             if emitted_is_generator:
                 self._emit_drift_marker(
                     handle.agent_id,
@@ -2742,12 +2566,11 @@ class AgentSupervisor:
     def _privileged_for_magic(
         self, handle: "AgentHandle", magic_name: Optional[str],
     ) -> bool:
-        """Return True iff ``handle``'s agent holds an active grant for ``magic_name``.
+        """Return True if the agent holds an active grant for magic_name.
 
-        PLAN-S5.0.4 §3.5 — helper for the Layer-1 scan. Consults
-        ``MetadataWriter.has_magic_emit_privilege`` if available;
-        returns False when the writer isn't wired or the API is
-        absent (back-compat: no grant table -> no K3L).
+        Consults the writer's has_magic_emit_privilege if available;
+        returns False when the writer isn't wired or the method is
+        absent.
         """
         if not isinstance(magic_name, str) or not magic_name:
             return False
@@ -2767,11 +2590,10 @@ class AgentSupervisor:
             return False
 
     def _magic_hash_enabled(self) -> bool:
-        """Best-effort lookup of ``metadata.rts.config.magic_hash_enabled``.
+        """Best-effort lookup of the magic_hash_enabled config setting.
 
-        Defaults to ``False`` when the writer is unwired or the
-        config field is absent. The schema field itself lands in
-        slice 5.0.1b; this slice's reader is forward-compatible.
+        Defaults to False when the writer is unwired or the config field
+        is absent.
         """
         writer = self._metadata_writer
         if writer is None:
@@ -2781,7 +2603,7 @@ class AgentSupervisor:
             if callable(getter):
                 value = getter("magic_hash_enabled")
                 return bool(value)
-            # Fallback: probe a public ``_config`` dict if exposed.
+            # Fallback: probe a _config dict if the writer exposes one.
             config = getattr(writer, "_config", None)
             if isinstance(config, dict):
                 return bool(config.get("magic_hash_enabled", False))
@@ -2797,13 +2619,11 @@ class AgentSupervisor:
         source: str,
         layer: str,
     ) -> None:
-        """Mark every cell bound to ``agent_id`` as contaminated.
+        """Mark every cell bound to agent_id as contaminated.
 
-        PLAN-S5.0.1 §3.6 schema — ``cells[<id>].contaminated`` and an
-        append-only ``contamination_log`` of ``{detected_at, line,
-        reason, layer}`` records. The line is truncated to a sane
-        bound (256 chars) before storage so a flooded contamination
-        path can't unbounded-grow the notebook.
+        Sets a contaminated flag and appends a record to an append-only
+        contamination log. The line is truncated to 256 chars before
+        storage so a flood can't grow the notebook without bound.
         """
         from llm_kernel._internal import _diagnostics
 
@@ -2816,10 +2636,8 @@ class AgentSupervisor:
         writer = self._metadata_writer
         if writer is None:
             return
-        # The writer-side flag method is added in slice 5.0.1c; for
-        # this foundation slice we duck-type the call. When the
-        # method is missing the diagnostics-mark above is the audit
-        # trail.
+        # Duck-type the writer's flag method; when it's missing the
+        # diagnostic mark above is the audit trail.
         flagger = getattr(writer, "flag_cells_contaminated_by_agent", None)
         if not callable(flagger):
             return
@@ -2837,12 +2655,9 @@ class AgentSupervisor:
     def _emit_drift_marker(
         self, agent_id: str, *, code: str, reason: str, line: str,
     ) -> None:
-        """Emit a K3x drift-log marker via ``_diagnostics.mark``.
+        """Emit a drift-log marker.
 
-        Slice 5.0.1a wires K35/K36 only (the others — K3C..K3G —
-        belong to the precondition-gates / acceptance-flag slices).
-        The drift-detector path is fed by ``_diagnostics.mark``;
-        downstream consumers index on the ``code`` field.
+        Downstream consumers index on the code field.
         """
         from llm_kernel._internal import _diagnostics
 
@@ -2861,29 +2676,23 @@ class AgentSupervisor:
         parser_diagnostic: Optional[str] = None,
         parent_span_id: Optional[str] = None,
     ) -> str:
-        """Emit one ``agent_emit`` span per RFC-005 §"`agent_emit` runs".
+        """Emit one agent_emit span.
 
-        Records ``llmnb.run_type: "agent_emit"``, ``llmnb.agent_id``,
-        ``llmnb.emit_kind`` (the categorical attribute the renderer
-        dispatches on), and ``llmnb.emit_content`` (the verbatim
-        agent output).  Wire emission is verbatim per the RFC's
-        guidance -- contents above the blob threshold are blob-
-        extracted by ``metadata_writer.py`` on persistence; the wire
-        carries the full content for in-cell rendering.
+        Records the run type, agent id, emit kind (the category the
+        renderer dispatches on), and the verbatim agent output. Content
+        above the blob threshold is blob-extracted on persistence; the
+        wire carries the full content for in-cell rendering.
 
-        PLAN-S5.0.1 §3.2 — every emitted line is scanned for
-        cell-magic injection patterns. Plain ``@@<known>`` lines flag
-        bound cells as contaminated; hashed-magic-shaped lines (when
-        hash mode is on) trigger the emission-ban escape so the
-        offending leading ``@`` is replaced with ``\\@`` before the
-        span lands in cell outputs.
+        Every emitted line is scanned for cell-magic injection patterns.
+        Plain magic lines flag bound cells as contaminated; hashed-magic
+        lines (when hash mode is on) trigger the emission-ban escape so
+        the leading @ is escaped before the span lands in cell outputs.
         """
-        # PLAN-S5.0.1 §3.2 contamination scan + emission-ban escape.
-        # The scan operates per-LINE on the emit_content (which may
-        # be a multi-line string for stream-json result/error
-        # records); we walk lines, flag on detection, and rebuild
-        # the content with escaped leading ``@`` characters where
-        # the hash-mode emission ban triggered.
+        # Contamination scan + emission-ban escape.
+        # The scan operates per line on emit_content (which may be a
+        # multi-line string for stream-json result/error records); we
+        # walk lines, flag on detection, and rebuild the content with
+        # escaped leading @ characters where the emission ban triggered.
         scanned_content = self._scan_and_rewrite_emit_content(
             handle, emit_content, source=f"agent_emit:{emit_kind}",
         )
@@ -2902,18 +2711,17 @@ class AgentSupervisor:
                   f"agent_emit:{emit_kind}"],
             metadata=metadata,
         )
-        # Open + immediately close: agent_emit captures point-in-time
-        # output, not a duration.  The renderer keys on the closed
-        # span; receivers that need the open/closed lifecycle still
-        # see ``run.start`` then ``run.complete`` for I1 compliance.
+        # Open and immediately close: an agent_emit captures point-in-
+        # time output, not a duration. The renderer keys on the closed
+        # span; receivers still see a run.start then a run.complete.
         self._run_tracker.complete_run(rid, outputs={})
         return rid
 
     def _track_prose_flood(self, handle: AgentHandle) -> None:
-        """Track DR-0010 prose-flood threshold (>5 / 60s -> escalate).
+        """Track the prose-flood threshold (more than 5 in 60s escalates).
 
-        Used by the assistant-content text path so flood detection
-        also covers stream-json prose, not just unparseable lines.
+        Used by the assistant-content text path so flood detection also
+        covers stream-json prose, not just unparseable lines.
         """
         now = time.monotonic()
         handle._violation_times.append(now)
@@ -2934,18 +2742,17 @@ class AgentSupervisor:
 
     @staticmethod
     def _is_stream_json(obj: Dict[str, Any]) -> bool:
-        """Return True for a Claude stream-json record (``type``/``event``)."""
+        """Return True for a Claude stream-json record (has type or event)."""
         return "type" in obj or "event" in obj
 
 
 def _stringify_payload(parsed: Dict[str, Any]) -> str:
     """Serialize a stream-json record as a single-line JSON string.
 
-    Used as the ``llmnb.emit_content`` value for ``agent_emit`` spans
-    of kind ``system_message`` / ``result`` / ``error``.  The full
-    record is preserved verbatim so the operator surface can show
-    the raw stream-json content; the metadata writer applies the
-    blob-extraction pass on persistence if it exceeds the threshold.
+    Used as the content of agent_emit spans of kind system_message,
+    result, or error. The full record is preserved verbatim so the
+    operator surface can show the raw stream-json; the metadata writer
+    blob-extracts it on persistence if it exceeds the threshold.
     """
     try:
         return json.dumps(parsed, default=str, ensure_ascii=False)
@@ -2956,11 +2763,11 @@ def _stringify_payload(parsed: Dict[str, Any]) -> str:
 def _append_pretty(path: Path, parsed: Dict[str, Any]) -> None:
     """Append a pretty-printed JSON event with a one-line header.
 
-    The header summarizes the event's ``type`` / ``subtype`` and the
-    most informative inner field (model name for assistant messages,
-    error code for results, mcp_servers status for system init). The
-    payload follows as 2-space-indented JSON. Used only when
-    ``LLMKERNEL_DEBUG_STDOUT=1``.
+    The header summarizes the event's type and subtype plus the most
+    informative inner field (model name for assistant messages, error
+    code for results, mcp_servers status for system init). The payload
+    follows as 2-space-indented JSON. Used only when
+    LLMKERNEL_DEBUG_STDOUT=1.
     """
     kind = str(parsed.get("type") or parsed.get("event") or "?")
     subtype = parsed.get("subtype")
