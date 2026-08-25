@@ -540,11 +540,75 @@ class AgentSupervisor:
     #   "spawned_fresh"     -- resume failed; a fresh session was minted,
     #                          the new handle is alive, and the stdin
     #                          write went through.
+    def _resume_if_needed(
+        self, handle: "AgentHandle", agent_id: str, fresh_task_text: str,
+    ) -> Tuple["AgentHandle", str]:
+        """Resume/respawn the agent if its process has reaped.
+
+        Returns ``(live_handle, status)`` where status is ``"sent"`` (the
+        handle was already alive), ``"resumed_then_sent"`` (re-attached to
+        the preserved claude session), or ``"spawned_fresh"`` (no session
+        to resume, or the resume attempt itself reaped).
+
+        Extracted from send_user_turn (SE-04) so any writer path -- the
+        external MCP transport, PBX, a library caller -- reuses the exact
+        resume ladder instead of copy-pasting it. Idempotent when the
+        handle is already live (returns it unchanged as ``"sent"``).
+        """
+        if handle.popen.poll() is None:
+            return handle, "sent"
+        from llm_kernel._internal import _diagnostics
+        prior_session_id = handle.claude_session_id
+        zone_id = handle.zone_id
+        work_dir = handle.work_dir
+        # Drop the dead handle before respawning so the live-agent
+        # idempotency check in spawn does not return the now-reaped handle.
+        with self._lock:
+            if self._agents.get(agent_id) is handle:
+                del self._agents[agent_id]
+        _diagnostics.mark(
+            "send_user_turn_resume_attempt",
+            agent_id=agent_id, prior_session_id=prior_session_id,
+        )
+        if not prior_session_id:
+            # No prior session id -> fresh spawn straight away.
+            return (
+                self.spawn(
+                    zone_id=zone_id, agent_id=agent_id,
+                    task=fresh_task_text, work_dir=work_dir,
+                ),
+                "spawned_fresh",
+            )
+        resumed = self.spawn(
+            zone_id=zone_id, agent_id=agent_id,
+            task=fresh_task_text, work_dir=work_dir,
+            resume_claude_session_id=prior_session_id,
+        )
+        if not self._resume_failed(resumed):
+            return resumed, "resumed_then_sent"
+        self._record_resume_failure_k24(
+            agent_id=agent_id, zone_id=zone_id,
+            attempted_session_id=prior_session_id,
+            exit_code=resumed.popen.poll(),
+        )
+        with self._lock:
+            if self._agents.get(agent_id) is resumed:
+                del self._agents[agent_id]
+        return (
+            self.spawn(
+                zone_id=zone_id, agent_id=agent_id,
+                task=fresh_task_text, work_dir=work_dir,
+            ),
+            "spawned_fresh",
+        )
+
     def send_user_turn(
         self,
         agent_id: str,
         text: str,
         cell_id: Optional[str] = None,
+        *,
+        inject_notebook_prefix: bool = True,
     ) -> Dict[str, Any]:
         """Continue an existing agent's conversation with one user turn.
 
@@ -578,75 +642,37 @@ class AgentSupervisor:
         if handle is None:
             raise KeyError(agent_id)
 
-        status: str = "sent"
-        # Resume if needed: a non-None poll() means the claude process
-        # has reaped. Respawn with resume_claude_session_id so claude
-        # re-attaches via --resume instead of minting a fresh session.
-        if handle.popen.poll() is not None:
-            prior_session_id = handle.claude_session_id
-            zone_id = handle.zone_id
-            work_dir = handle.work_dir
-            # Drop the dead handle before respawning so the live-agent
-            # idempotency check in spawn does not return the now-reaped
-            # handle.
-            with self._lock:
-                if self._agents.get(agent_id) is handle:
-                    del self._agents[agent_id]
-            _diagnostics.mark(
-                "send_user_turn_resume_attempt",
-                agent_id=agent_id, prior_session_id=prior_session_id,
-            )
-            if prior_session_id:
-                resumed = self.spawn(
-                    zone_id=zone_id, agent_id=agent_id,
-                    task=text, work_dir=work_dir,
-                    resume_claude_session_id=prior_session_id,
-                )
-                if self._resume_failed(resumed):
-                    self._record_resume_failure_k24(
-                        agent_id=agent_id, zone_id=zone_id,
-                        attempted_session_id=prior_session_id,
-                        exit_code=resumed.popen.poll(),
-                    )
-                    with self._lock:
-                        if self._agents.get(agent_id) is resumed:
-                            del self._agents[agent_id]
-                    handle = self.spawn(
-                        zone_id=zone_id, agent_id=agent_id,
-                        task=text, work_dir=work_dir,
-                    )
-                    status = "spawned_fresh"
-                else:
-                    handle = resumed
-                    status = "resumed_then_sent"
-            else:
-                # No prior session id -> fresh spawn straight away.
-                handle = self.spawn(
-                    zone_id=zone_id, agent_id=agent_id,
-                    task=text, work_dir=work_dir,
-                )
-                status = "spawned_fresh"
+        # Resume if needed: a reaped process is respawned/resumed here.
+        # SE-04 extracted the ladder to _resume_if_needed so other writer
+        # paths reuse it; it returns the live handle plus a status string.
+        handle, status = self._resume_if_needed(handle, agent_id, text)
 
         # Cross-agent context handoff: walk the turn DAG between this
         # agent's last-seen turn and the current notebook head,
         # synthesize prefix lines for the missed sibling turns, and
         # inject them before the operator's message.
+        # SE-03: a non-notebook caller (external MCP / PBX / library-
+        # embedded use) passes inject_notebook_prefix=False to skip the
+        # missed-turn walk entirely and leave the notebook cursor
+        # untouched. Default True preserves the operator path.
         head_turn_id = self._notebook_head_turn_id()
-        try:
-            missed = self._missed_turns(agent_id, head_turn_id)
-            prefix_lines = self._synthesize_handoff_prefix(missed)
-        except _HandoffCycleError as exc:
-            from llm_kernel.wire.tools import K26_CROSS_AGENT_HANDOFF_FAILED
-            _diagnostics.mark(
-                "send_user_turn_handoff_cycle_detected",
-                agent_id=agent_id, k_class=K26_CROSS_AGENT_HANDOFF_FAILED,
-                reason="cycle_detected",
-            )
-            raise RuntimeError(
-                f"{K26_CROSS_AGENT_HANDOFF_FAILED}: cross-agent handoff "
-                f"failed (reason: cycle_detected) for agent {agent_id!r}: "
-                f"{exc}"
-            ) from exc
+        prefix_lines: List[str] = []
+        if inject_notebook_prefix:
+            try:
+                missed = self._missed_turns(agent_id, head_turn_id)
+                prefix_lines = self._synthesize_handoff_prefix(missed)
+            except _HandoffCycleError as exc:
+                from llm_kernel.wire.tools import K26_CROSS_AGENT_HANDOFF_FAILED
+                _diagnostics.mark(
+                    "send_user_turn_handoff_cycle_detected",
+                    agent_id=agent_id, k_class=K26_CROSS_AGENT_HANDOFF_FAILED,
+                    reason="cycle_detected",
+                )
+                raise RuntimeError(
+                    f"{K26_CROSS_AGENT_HANDOFF_FAILED}: cross-agent handoff "
+                    f"failed (reason: cycle_detected) for agent {agent_id!r}: "
+                    f"{exc}"
+                ) from exc
 
         # ContextPacker + RunFrame wiring. When the operator passes a
         # cell_id, pack the manifest, record it, and submit a start run
@@ -720,28 +746,31 @@ class AgentSupervisor:
                     status="failed",
                 )
             raise
-        # Advance last_seen_turn_id to the notebook head so the next
-        # call computes the correct missed-turn delta.
-        handle.last_seen_turn_id = head_turn_id
-        # Persist via update_agent_session intent if a writer is wired.
-        if self._metadata_writer is not None and head_turn_id is not None:
-            try:
-                self._metadata_writer.submit_intent({
-                    "payload": {
-                        "action_type": "zone_mutate",
-                        "intent_kind": "update_agent_session",
-                        "parameters": {
-                            "agent_id": agent_id,
-                            "last_seen_turn_id": head_turn_id,
+        # Advance last_seen_turn_id to the notebook head so the next call
+        # computes the correct missed-turn delta. SE-03: only when this
+        # turn participated in the notebook handoff -- a non-notebook
+        # caller must not move the agent's notebook cursor.
+        if inject_notebook_prefix:
+            handle.last_seen_turn_id = head_turn_id
+            # Persist via update_agent_session intent if a writer is wired.
+            if self._metadata_writer is not None and head_turn_id is not None:
+                try:
+                    self._metadata_writer.submit_intent({
+                        "payload": {
+                            "action_type": "zone_mutate",
+                            "intent_kind": "update_agent_session",
+                            "parameters": {
+                                "agent_id": agent_id,
+                                "last_seen_turn_id": head_turn_id,
+                            },
+                            "intent_id": f"sut-uas-{agent_id}-{uuid.uuid4().hex[:8]}",
                         },
-                        "intent_id": f"sut-uas-{agent_id}-{uuid.uuid4().hex[:8]}",
-                    },
-                })
-            except Exception:  # pragma: no cover — writer errors are best-effort
-                _diagnostics.mark(
-                    "send_user_turn_update_session_intent_failed",
-                    agent_id=agent_id,
-                )
+                    })
+                except Exception:  # pragma: no cover — writer errors are best-effort
+                    _diagnostics.mark(
+                        "send_user_turn_update_session_intent_failed",
+                        agent_id=agent_id,
+                    )
         # Emit a terminal run frame with status=complete on a successful
         # stdin dispatch. "complete" here means the user turn was
         # delivered to the agent, not that the agent finished replying.

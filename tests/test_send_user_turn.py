@@ -306,6 +306,48 @@ def test_send_user_turn_concurrent_no_interleave() -> None:
     assert split.flushed == 2
 
 
+def test_send_user_turn_no_notebook_prefix_skips_handoff_walk(
+    tmp_path: Path,
+) -> None:
+    """SE-03: inject_notebook_prefix=False skips the missed-turn walk and
+    leaves the agent's notebook cursor (last_seen_turn_id) untouched, while
+    the operator turn still reaches stdin."""
+    sup = _make_supervisor()
+    handle = _stub_handle("alpha", returncode=None, work_dir=tmp_path)
+    handle.last_seen_turn_id = "T0"
+    sup._agents["alpha"] = handle
+
+    with patch.object(sup, "_missed_turns") as missed, \
+            patch.object(sup, "_synthesize_handoff_prefix") as synth:
+        result = sup.send_user_turn(
+            agent_id="alpha", text="external caller turn",
+            cell_id=None, inject_notebook_prefix=False,
+        )
+
+    missed.assert_not_called()
+    synth.assert_not_called()
+    assert result["status"] == "sent"
+    assert result["handoff_prefix_count"] == 0
+    # The notebook cursor must not move for a non-notebook caller.
+    assert handle.last_seen_turn_id == "T0"
+    # The operator message still reached stdin as a single JSON line.
+    assert len(handle.popen.stdin.writes) == 1
+    parsed = json.loads(handle.popen.stdin.writes[0])
+    assert parsed["message"]["content"] == "external caller turn"
+
+
+def test_resume_if_needed_idempotent_for_live_handle() -> None:
+    """SE-04: _resume_if_needed returns a live handle unchanged as "sent"
+    and never respawns."""
+    sup = _make_supervisor()
+    handle = _stub_handle("alpha", returncode=None)  # alive
+    with patch.object(sup, "spawn") as spawn:
+        out_handle, status = sup._resume_if_needed(handle, "alpha", "text")
+    assert out_handle is handle
+    assert status == "sent"
+    spawn.assert_not_called()
+
+
 def test_send_user_turn_unknown_agent_raises_keyerror() -> None:
     """An unknown agent_id MUST raise :class:`KeyError`."""
     sup = _make_supervisor()
