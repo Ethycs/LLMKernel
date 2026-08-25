@@ -98,6 +98,12 @@ class AgentHandle:
     silence_watchdog_thread: Optional[threading.Thread] = None
     state: AgentState = "starting"
     _stop_event: threading.Event = field(default_factory=threading.Event)
+    # Serializes the multi-line stdin write+flush in send_user_turn so
+    # concurrent callers (external MCP, PBX, library-embedded use) cannot
+    # interleave the lines of two user turns on the same pipe. Per-handle,
+    # not the supervisor lock, so a slow write to one agent never blocks
+    # dispatch to another. SE-01.
+    _stdin_lock: threading.Lock = field(default_factory=threading.Lock)
     _violation_times: Deque[float] = field(default_factory=lambda: deque(maxlen=64))
     _restart_attempts: int = 0
     # Timestamps of recent restart attempts. Pruned to the restart
@@ -684,11 +690,15 @@ class AgentSupervisor:
                 f"stdin (was the popen built with stdin=PIPE?)"
             )
         try:
-            # Write prefix lines (handoff context) before operator message.
-            for prefix_line in prefix_lines:
-                handle.popen.stdin.write(prefix_line + "\n")
-            handle.popen.stdin.write(operator_line)
-            handle.popen.stdin.flush()
+            # Serialize the whole prefix+operator write+flush per handle so
+            # a concurrent caller cannot interleave its lines between ours
+            # (SE-01). Single-writer paths are unaffected.
+            with handle._stdin_lock:
+                # Write prefix lines (handoff context) before operator message.
+                for prefix_line in prefix_lines:
+                    handle.popen.stdin.write(prefix_line + "\n")
+                handle.popen.stdin.write(operator_line)
+                handle.popen.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             from llm_kernel.wire.tools import K26_CROSS_AGENT_HANDOFF_FAILED
             _diagnostics.mark(

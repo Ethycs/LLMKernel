@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -235,6 +236,74 @@ def test_send_user_turn_resumes_idle_agent_then_sends(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # 3. Unknown agent_id raises KeyError (dispatcher -> K23).
 # ---------------------------------------------------------------------------
+
+
+def test_send_user_turn_concurrent_no_interleave() -> None:
+    """SE-01: two threads continuing the SAME agent must not interleave
+    the lines of their user turns on the shared stdin pipe.
+
+    Each ``write`` is recorded as two fragments with a gap between them,
+    widening the window for a second, unsynchronized writer to splice its
+    bytes in. The per-handle stdin lock in ``send_user_turn`` must keep
+    each turn's write+flush atomic, so the buffer splits into exactly two
+    clean, individually-parseable JSON lines.
+    """
+
+    class _SplittingStdin:
+        def __init__(self) -> None:
+            self.events: List[str] = []
+            self.flushed: int = 0
+
+        def write(self, data: str) -> int:
+            mid = max(1, len(data) // 2)
+            self.events.append(data[:mid])
+            time.sleep(0.01)  # widen the interleave window
+            self.events.append(data[mid:])
+            return len(data)
+
+        def flush(self) -> None:
+            self.flushed += 1
+
+        def close(self) -> None:  # pragma: no cover - teardown only
+            pass
+
+    sup = _make_supervisor()
+    split = _SplittingStdin()
+    popen = MagicMock()
+    popen.returncode = None
+    popen.poll = MagicMock(return_value=None)  # alive
+    popen.stdin = split
+    sup._agents["alpha"] = AgentHandle(
+        agent_id="alpha", zone_id="z1", popen=popen,
+        started_at=0.0, work_dir=Path("/tmp/x"),
+        stdout_thread=threading.Thread(),
+        stderr_thread=threading.Thread(),
+    )
+
+    body_a = "AAAA-first-turn"
+    body_b = "BBBB-second-turn"
+    errors: List[BaseException] = []
+
+    def send(text: str) -> None:
+        try:
+            sup.send_user_turn(agent_id="alpha", text=text, cell_id=None)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    t1 = threading.Thread(target=send, args=(body_a,))
+    t2 = threading.Thread(target=send, args=(body_b,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors, errors
+    full = "".join(split.events)
+    lines = [ln for ln in full.split("\n") if ln]
+    assert len(lines) == 2, f"interleaved stdin write: {full!r}"
+    contents = sorted(json.loads(ln)["message"]["content"] for ln in lines)
+    assert contents == sorted([body_a, body_b])
+    assert split.flushed == 2
 
 
 def test_send_user_turn_unknown_agent_raises_keyerror() -> None:
