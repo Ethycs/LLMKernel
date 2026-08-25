@@ -378,6 +378,30 @@ class MetadataWriter:
                 },
             )
 
+    def event_log_queue_depth(self) -> int:
+        """Return the current ``record_run`` queue backlog (SE-05).
+
+        The number of OTLP spans buffered in ``_extra_runs`` awaiting the
+        next flush / overflow checkpoint. A cheap, lock-guarded snapshot
+        the Family-G heartbeat surfaces so operators can watch queue
+        pressure at runtime instead of only learning of it from the
+        overflow log after the fact.
+        """
+        with self._lock:
+            return len(self._extra_runs)
+
+    def overflow_checkpoint_count(self) -> int:
+        """Return how many times the ``record_run`` queue has overflowed
+        and checkpointed to disk this session (SE-05).
+
+        On overflow the queue is snapshotted to the RFC-005 §F13 sidecar
+        marker/snapshot and drained -- nothing is dropped -- so this is a
+        backpressure-events counter, not a lost-envelope count. Surfaced
+        on the heartbeat as the durable pressure signal.
+        """
+        with self._lock:
+            return self._overflow_checkpoint_count
+
     def _write_overflow_fallback(
         self, marker: Dict[str, Any], snapshot: Dict[str, Any],
     ) -> None:

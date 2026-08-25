@@ -132,6 +132,97 @@ def test_heartbeat_payload_carries_kernel_state_uptime_and_last_run() -> None:
         dispatcher.stop()
 
 
+def test_heartbeat_includes_queue_depth_and_overflow_count() -> None:
+    """SE-05: when a metadata writer is wired, every heartbeat surfaces
+    the event-log queue depth and overflow-checkpoint count.
+
+    Nothing is dropped on overflow (the queue checkpoints to disk and
+    drains), so the second field is a backpressure-events counter, not a
+    lost-envelope count.
+    """
+    kernel = _StubKernel()
+    dispatcher = CustomMessageDispatcher(kernel, heartbeat_interval_sec=0.05)
+
+    class _StubWriter:
+        def event_log_queue_depth(self) -> int:
+            return 7
+
+        def overflow_checkpoint_count(self) -> int:
+            return 3
+
+    dispatcher.set_metadata_writer(_StubWriter())
+
+    sent: List[Dict[str, Any]] = []
+    sent_lock = threading.Lock()
+    comm = MagicMock(name="comm")
+
+    def _capture(thin: Dict[str, Any]) -> None:
+        with sent_lock:
+            sent.append(thin)
+    comm.send.side_effect = _capture
+
+    dispatcher.start()
+    try:
+        kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
+            comm, {"content": {}}
+        )
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            with sent_lock:
+                if any(s.get("type") == "heartbeat.kernel" for s in sent):
+                    break
+            time.sleep(0.02)
+        with sent_lock:
+            heartbeat = next(
+                (s for s in sent if s.get("type") == "heartbeat.kernel"),
+                None,
+            )
+        assert heartbeat is not None, "no heartbeat envelope captured"
+        payload = heartbeat["payload"]
+        assert payload["event_log_queue_depth"] == 7
+        assert payload["event_log_overflow_checkpoints"] == 3
+    finally:
+        dispatcher.stop()
+
+
+def test_heartbeat_omits_queue_fields_without_writer() -> None:
+    """SE-05: with no writer wired the heartbeat degrades gracefully --
+    the queue fields are simply absent, never a broken heartbeat."""
+    kernel = _StubKernel()
+    dispatcher = CustomMessageDispatcher(kernel, heartbeat_interval_sec=0.05)
+    sent: List[Dict[str, Any]] = []
+    sent_lock = threading.Lock()
+    comm = MagicMock(name="comm")
+
+    def _capture(thin: Dict[str, Any]) -> None:
+        with sent_lock:
+            sent.append(thin)
+    comm.send.side_effect = _capture
+
+    dispatcher.start()
+    try:
+        kernel.shell.comm_manager.targets[DEFAULT_COMM_TARGET](
+            comm, {"content": {}}
+        )
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            with sent_lock:
+                if any(s.get("type") == "heartbeat.kernel" for s in sent):
+                    break
+            time.sleep(0.02)
+        with sent_lock:
+            heartbeat = next(
+                (s for s in sent if s.get("type") == "heartbeat.kernel"),
+                None,
+            )
+        assert heartbeat is not None
+        payload = heartbeat["payload"]
+        assert "event_log_queue_depth" not in payload
+        assert "event_log_overflow_checkpoints" not in payload
+    finally:
+        dispatcher.stop()
+
+
 def test_heartbeat_thread_exits_on_stop() -> None:
     """``stop()`` MUST join the heartbeat thread."""
     kernel = _StubKernel()

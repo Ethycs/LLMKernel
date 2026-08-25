@@ -644,6 +644,21 @@ class CustomMessageDispatcher:
                     "uptime_seconds": time.monotonic() - self._start_time,
                     "last_run_timestamp": self._last_run_complete_iso,
                 }
+                # SE-05: surface event-log queue pressure so operators can
+                # watch the record_run backlog and overflow-checkpoint
+                # events live. Defensive: the writer may be unwired or
+                # predate these accessors -- omit the fields rather than
+                # ever break the heartbeat.
+                writer = self._resolve_metadata_writer()
+                if writer is not None:
+                    depth_fn = getattr(writer, "event_log_queue_depth", None)
+                    overflow_fn = getattr(
+                        writer, "overflow_checkpoint_count", None,
+                    )
+                    if callable(depth_fn):
+                        payload["event_log_queue_depth"] = depth_fn()
+                    if callable(overflow_fn):
+                        payload["event_log_overflow_checkpoints"] = overflow_fn()
                 envelope = make_envelope(
                     "heartbeat.kernel", payload,
                     correlation_id=str(uuid.uuid4()),
