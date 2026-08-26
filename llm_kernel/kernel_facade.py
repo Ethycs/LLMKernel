@@ -267,6 +267,7 @@ class Kernel:
         self._run_tracker: Optional[RunTracker] = None
         self._metadata_writer: Optional[MetadataWriter] = None
         self._supervisor: Optional[AgentSupervisor] = None
+        self._transports: List[Any] = []
         self._trace_id: Optional[str] = None
         self._started: bool = False
         self._lifecycle_lock = threading.Lock()
@@ -339,24 +340,42 @@ class Kernel:
             self._started = True
 
     async def shutdown(self) -> None:
-        """Reverse construction: terminate agents → snapshot + stop the
-        metadata writer → stop the dispatcher. Idempotent."""
+        """Reverse construction: drain transports → terminate agents →
+        snapshot + stop the metadata writer → stop the dispatcher → close
+        the sink. Idempotent.
+        """
+        # Flip state + capture references under the lock (no await inside,
+        # so we never block the loop holding a threading lock). A concurrent
+        # shutdown then sees ``_started`` False and is a no-op, and the sync
+        # delegators start refusing immediately.
         with self._lifecycle_lock:
             if not self._started:
                 return
-            self._teardown_locked(
-                dispatcher=self._dispatcher,
-                metadata_writer=self._metadata_writer,
-                supervisor=self._supervisor,
-            )
-            self._sink.close()  # end any live event subscribers
+            self._started = False
+            transports = list(self._transports)
+            self._transports = []
+            dispatcher = self._dispatcher
+            metadata_writer = self._metadata_writer
+            supervisor = self._supervisor
             self._embedded_kernel = None
             self._dispatcher = None
             self._run_tracker = None
             self._metadata_writer = None
             self._supervisor = None
             self._trace_id = None
-            self._started = False
+        # Outside the lock: drain transports first (their stop() is async),
+        # then the sync subsystem teardown, then close the sink.
+        for transport in transports:
+            try:
+                await transport.stop()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Kernel.shutdown: transport stop raised")
+        self._teardown_locked(
+            dispatcher=dispatcher,
+            metadata_writer=metadata_writer,
+            supervisor=supervisor,
+        )
+        self._sink.close()  # end any live event subscribers
 
     def _teardown_locked(
         self, *,
@@ -514,6 +533,32 @@ class Kernel:
                     yield frame
                     idx += 1
                 return
+
+    # -- transport binding + run loop (facade commit 5) -----------------
+
+    async def bind_transport(self, transport: Any) -> None:
+        """Bind a transport to the running kernel.
+
+        Thin hook, not the formal Transport protocol (that is a later
+        follow-up): ``transport`` need only expose async ``bind(kernel)``
+        and ``stop()``. ``bind`` is awaited now; ``stop`` is awaited first
+        during :meth:`shutdown`. Bound transports are drained before agents
+        are terminated so the wire is quiet before the subsystems go down.
+        """
+        self._require_started()
+        await transport.bind(self)
+        self._transports.append(transport)
+
+    async def run_forever(self) -> None:
+        """Block until cancelled — convenience for a subprocess wrapper.
+
+        ``async with Kernel(...) as k: await k.run_forever()`` keeps the
+        process alive until the surrounding task is cancelled (e.g. a
+        SIGTERM handler the wrapper installs). Embedded/library callers
+        typically drive the kernel directly and never call this.
+        """
+        self._require_started()
+        await asyncio.Event().wait()  # until the task is cancelled
 
 
 __all__ = ["Kernel", "KernelStartError"]

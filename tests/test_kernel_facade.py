@@ -305,6 +305,63 @@ def test_subscribe_events_yields_then_stops_on_shutdown(tmp_path: Path) -> None:
     asyncio.run(main())
 
 
+# ---------------------------------------------------------------------------
+# Facade commit 5 — bind_transport + run_forever.
+# ---------------------------------------------------------------------------
+
+
+class _StubTransport:
+    def __init__(self) -> None:
+        self.bound: object = None
+        self.stopped: bool = False
+
+    async def bind(self, kernel: object) -> None:
+        self.bound = kernel
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+def test_bind_transport_binds_and_stops_on_shutdown(tmp_path: Path) -> None:
+    """bind_transport awaits bind(kernel); shutdown awaits stop()."""
+    async def main() -> None:
+        t = _StubTransport()
+        k = Kernel(workdir=tmp_path)
+        await k.start()
+        await k.bind_transport(t)
+        assert t.bound is k
+        assert t in k._transports
+        await k.shutdown()
+        assert t.stopped is True
+        assert k._transports == []
+
+    asyncio.run(main())
+
+
+def test_bind_transport_requires_started(tmp_path: Path) -> None:
+    """bind_transport raises before start()."""
+    async def main() -> None:
+        k = Kernel(workdir=tmp_path)
+        with pytest.raises(RuntimeError):
+            await k.bind_transport(_StubTransport())
+
+    asyncio.run(main())
+
+
+def test_run_forever_blocks_until_cancelled(tmp_path: Path) -> None:
+    """run_forever blocks until its task is cancelled."""
+    async def main() -> None:
+        async with Kernel(workdir=tmp_path) as k:
+            task = asyncio.create_task(k.run_forever())
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(main())
+
+
 if __name__ == "__main__":  # pragma: no cover - library-embedding smoke
     async def _smoke() -> None:
         import tempfile
