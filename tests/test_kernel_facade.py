@@ -12,7 +12,9 @@ threads leak across tests.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -119,6 +121,109 @@ def test_kernel_start_failure_raises_kernel_start_error(
         with pytest.raises(KernelStartError):
             await k.start()
         assert not k._started
+
+    asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# Facade commit 3 — public delegators.
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_delegators_require_started(tmp_path: Path) -> None:
+    """Delegators raise RuntimeError before start()."""
+    k = Kernel(workdir=tmp_path)
+    with pytest.raises(RuntimeError):
+        k.list_agents()
+    with pytest.raises(RuntimeError):
+        k.spawn_agent(zone_id="z", agent_id="a", task="t", work_dir=tmp_path)
+
+
+def test_kernel_delegators_call_supervisor(tmp_path: Path) -> None:
+    """Each delegator calls through to the supervisor with matching args."""
+    async def main() -> None:
+        async with Kernel(workdir=tmp_path) as k:
+            sup = MagicMock()
+            sup.spawn.return_value = MagicMock(agent_id="alpha")
+            sup.send_user_turn.return_value = {"agent_id": "alpha", "status": "sent"}
+            sup.list_agents.return_value = [
+                {"agent_id": "alpha", "zone_id": "z1"},
+                {"agent_id": "beta", "zone_id": "z1"},
+                {"agent_id": "gamma", "zone_id": "z2"},
+            ]
+            k._supervisor = sup  # swap in a spy after start
+
+            assert k.spawn_agent(
+                zone_id="z1", agent_id="alpha", task="t", work_dir=tmp_path,
+                model="haiku",
+            ) == "alpha"
+            sup.spawn.assert_called_once_with(
+                zone_id="z1", agent_id="alpha", task="t",
+                work_dir=tmp_path, model="haiku",
+            )
+
+            k.send_user_turn("alpha", "hi", cell_id="c1")
+            sup.send_user_turn.assert_called_once_with(
+                "alpha", "hi", cell_id="c1", inject_notebook_prefix=True,
+            )
+
+            k.revert("alpha", "T5")
+            sup.revert.assert_called_once_with("alpha", "T5")
+
+            k.stop("alpha")
+            sup.stop.assert_called_once_with("alpha")
+
+            assert len(k.list_agents()) == 3
+            zones = k.list_zones()
+            by_id = {z["zone_id"]: z for z in zones}
+            assert set(by_id) == {"z1", "z2"}
+            assert by_id["z1"]["agent_ids"] == ["alpha", "beta"]
+            assert by_id["z2"]["agent_ids"] == ["gamma"]
+
+    asyncio.run(main())
+
+
+def test_kernel_list_agents_empty_on_fresh_kernel(tmp_path: Path) -> None:
+    """A started kernel with no spawns lists no agents or zones."""
+    async def main() -> None:
+        async with Kernel(workdir=tmp_path) as k:
+            assert k.list_agents() == []
+            assert k.list_zones() == []
+
+    asyncio.run(main())
+
+
+def test_supervisor_list_agents_summary(tmp_path: Path) -> None:
+    """AgentSupervisor.list_agents summarizes live handles; the facade's
+    list_zones groups them."""
+    from llm_kernel.supervision.agent_supervisor import AgentHandle
+
+    async def main() -> None:
+        async with Kernel(workdir=tmp_path) as k:
+            popen = MagicMock()
+            popen.poll = MagicMock(return_value=None)  # alive
+            handle = AgentHandle(
+                agent_id="alpha", zone_id="z1", popen=popen,
+                started_at=1.0, work_dir=tmp_path,
+                stdout_thread=threading.Thread(),
+                stderr_thread=threading.Thread(),
+                claude_session_id="sess-1",
+            )
+            k._supervisor._agents["alpha"] = handle
+            try:
+                agents = k.list_agents()
+                assert len(agents) == 1
+                a = agents[0]
+                assert a["agent_id"] == "alpha"
+                assert a["zone_id"] == "z1"
+                assert a["claude_session_id"] == "sess-1"
+                assert a["alive"] is True
+                assert k.list_zones() == [
+                    {"zone_id": "z1", "agent_ids": ["alpha"]}
+                ]
+            finally:
+                # Drop the stub so shutdown's terminate_all has nothing live.
+                k._supervisor._agents.clear()
 
     asyncio.run(main())
 

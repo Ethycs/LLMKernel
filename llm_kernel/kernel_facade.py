@@ -366,5 +366,74 @@ class Kernel:
     async def __aexit__(self, *_exc: Any) -> None:
         await self.shutdown()
 
+    # -- public delegators (facade commit 3) ----------------------------
+
+    def _require_started(self) -> AgentSupervisor:
+        if not self._started or self._supervisor is None:
+            raise RuntimeError(
+                "Kernel is not started; call `await start()` (or use "
+                "`async with Kernel(...)`) before driving agents"
+            )
+        return self._supervisor
+
+    def spawn_agent(
+        self, *, zone_id: str, agent_id: str, task: str, work_dir: Path,
+        **kwargs: Any,
+    ) -> str:
+        """Spawn an agent and return its ``agent_id``.
+
+        Thin wrapper over :meth:`AgentSupervisor.spawn`; extra keyword
+        args (``api_key``, ``model``, ``use_bare``, ``set_base_url``,
+        ``resume_claude_session_id``) pass straight through.
+        """
+        handle = self._require_started().spawn(
+            zone_id=zone_id, agent_id=agent_id, task=task,
+            work_dir=work_dir, **kwargs,
+        )
+        return handle.agent_id
+
+    def send_user_turn(
+        self, agent_id: str, text: str, *,
+        cell_id: Optional[str] = None,
+        inject_notebook_prefix: bool = True,
+    ) -> Dict[str, Any]:
+        """Continue an agent with one operator turn.
+
+        See :meth:`AgentSupervisor.send_user_turn`; ``inject_notebook_prefix
+        =False`` (SE-03) is the non-notebook-caller path.
+        """
+        return self._require_started().send_user_turn(
+            agent_id, text, cell_id=cell_id,
+            inject_notebook_prefix=inject_notebook_prefix,
+        )
+
+    def revert(self, agent_id: str, target_turn_id: str) -> None:
+        """Revert an agent's conversation to ``target_turn_id``."""
+        self._require_started().revert(agent_id, target_turn_id)
+
+    def stop(self, agent_id: str) -> None:
+        """Stop an agent's current run."""
+        self._require_started().stop(agent_id)
+
+    def list_agents(self) -> List[Dict[str, Any]]:
+        """Return a summary of every live (spawned) agent."""
+        return self._require_started().list_agents()
+
+    def list_zones(self) -> List[Dict[str, Any]]:
+        """Return the zones that currently have live agents.
+
+        Derived from :meth:`list_agents` — one dict per distinct
+        ``zone_id`` with its live ``agent_ids``. This is the *live* view;
+        the full persisted zone set lives in the notebook metadata and is
+        a separate (deferred) read, not a supervisor concern.
+        """
+        zones: Dict[str, Dict[str, Any]] = {}
+        for a in self._require_started().list_agents():
+            z = zones.setdefault(
+                a["zone_id"], {"zone_id": a["zone_id"], "agent_ids": []},
+            )
+            z["agent_ids"].append(a["agent_id"])
+        return list(zones.values())
+
 
 __all__ = ["Kernel", "KernelStartError"]

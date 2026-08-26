@@ -529,6 +529,32 @@ class AgentSupervisor:
         with self._lock:
             return self._agents.get(agent_id)
 
+    def list_agents(self) -> List[Dict[str, Any]]:
+        """Return a read-only summary of every live (spawned) agent.
+
+        One dict per handle currently tracked, with agent_id, zone_id,
+        coarse state, spawn time, claude session id, last-seen turn, and
+        whether the process is still alive (``poll()`` is None). The
+        handle dict is snapshotted under the lock; ``poll()`` is called
+        outside it so a slow reap never blocks other callers. Complements
+        :meth:`get` (single lookup) with an enumeration the facade and
+        other consumers can use.
+        """
+        with self._lock:
+            handles = list(self._agents.values())
+        return [
+            {
+                "agent_id": h.agent_id,
+                "zone_id": h.zone_id,
+                "state": h.state,
+                "started_at": h.started_at,
+                "claude_session_id": h.claude_session_id,
+                "last_seen_turn_id": h.last_seen_turn_id,
+                "alive": h.poll() is None,
+            }
+            for h in handles
+        ]
+
     # Multi-turn continuation. Writes one stream-json user turn to the
     # live agent's stdin; if the agent has gone idle/exited, resume it
     # first.
