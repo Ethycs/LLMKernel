@@ -36,7 +36,7 @@ import logging
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from llm_kernel._kernel_hooks import _DEFAULT_LITELLM_ENDPOINT
 from llm_kernel.capture.custom_messages import CustomMessageDispatcher
@@ -92,16 +92,44 @@ class _EmbeddedSink:
 
     def __init__(self) -> None:
         self._frames: List[Dict[str, Any]] = []
-        self._lock = threading.Lock()
+        self._cond = threading.Condition(threading.Lock())
+        self._closed = False
 
     def write_frame(self, frame: Dict[str, Any]) -> None:
-        with self._lock:
+        # Called from subsystem threads (dispatcher emit). Appends and
+        # wakes any async subscriber blocked in wait_for_after.
+        with self._cond:
+            if self._closed:
+                return
             self._frames.append(frame)
+            self._cond.notify_all()
 
     def snapshot(self) -> List[Dict[str, Any]]:
-        """Return a shallow copy of the frames captured so far."""
-        with self._lock:
+        """Return a shallow copy of every frame captured so far."""
+        with self._cond:
             return list(self._frames)
+
+    def get_since(self, index: int) -> List[Dict[str, Any]]:
+        """Return frames at ``index`` onward (empty if none newer)."""
+        with self._cond:
+            return list(self._frames[index:])
+
+    def close(self) -> None:
+        """Mark the sink closed and wake all waiters (subscribers end)."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def wait_for_after(self, index: int, timeout: float) -> bool:
+        """Block until a frame past ``index`` exists, the sink closes, or
+        ``timeout`` elapses. Returns ``closed``. Runs in an executor
+        thread so the async subscriber can await it. This is the thread→
+        loop bridge: subsystem threads notify; the event loop waits here.
+        """
+        with self._cond:
+            if len(self._frames) <= index and not self._closed:
+                self._cond.wait(timeout=timeout)
+            return self._closed
 
 
 class _EmbeddedKernelSession:
@@ -259,6 +287,10 @@ class Kernel:
             if self._loop is None:
                 self._loop = asyncio.get_running_loop()
             try:
+                # Fresh sink per start so a restart-after-shutdown collects
+                # into a live (non-closed) buffer, and any subscribers of a
+                # prior run have already ended on that run's sink.close().
+                self._sink = _EmbeddedSink()
                 kernel = _EmbeddedKernel(self._sink)
                 dispatcher = CustomMessageDispatcher(kernel)
                 dispatcher.start()
@@ -317,6 +349,7 @@ class Kernel:
                 metadata_writer=self._metadata_writer,
                 supervisor=self._supervisor,
             )
+            self._sink.close()  # end any live event subscribers
             self._embedded_kernel = None
             self._dispatcher = None
             self._run_tracker = None
@@ -434,6 +467,53 @@ class Kernel:
             )
             z["agent_ids"].append(a["agent_id"])
         return list(zones.values())
+
+    # -- event log access (facade commit 4) -----------------------------
+
+    def read_event_log(
+        self, *, since: int = 0, until: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return captured envelopes in emission order, sliced ``[since:until]``.
+
+        Native, in-memory read of the event stream the kernel emitted —
+        Family-A run spans plus Family-B..G control envelopes, exactly as a
+        wire consumer would have seen them. ``since`` / ``until`` are
+        indices into that stream. Works after shutdown too (returns what
+        was captured before teardown).
+        """
+        frames = self._sink.snapshot()
+        return frames[max(0, since):until]
+
+    async def subscribe_events(
+        self, *, since: int = 0,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Yield captured envelopes from ``since`` onward, then live ones as
+        they arrive, until the kernel shuts down.
+
+        Async-only. Frames are appended by subsystem threads; this bridges
+        them to the caller's loop by awaiting the sink's blocking wait in an
+        executor. Ends cleanly when :meth:`shutdown` closes the sink.
+        """
+        if not self._started:
+            raise RuntimeError(
+                "Kernel is not started; call `await start()` before "
+                "subscribing to events"
+            )
+        loop = self._loop or asyncio.get_running_loop()
+        sink = self._sink  # follow this run's sink across a later restart
+        idx = max(0, since)
+        while True:
+            for frame in sink.get_since(idx):
+                yield frame
+                idx += 1
+            closed = await loop.run_in_executor(
+                None, sink.wait_for_after, idx, 1.0,
+            )
+            if closed:
+                for frame in sink.get_since(idx):
+                    yield frame
+                    idx += 1
+                return
 
 
 __all__ = ["Kernel", "KernelStartError"]

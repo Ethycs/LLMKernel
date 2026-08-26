@@ -228,6 +228,83 @@ def test_supervisor_list_agents_summary(tmp_path: Path) -> None:
     asyncio.run(main())
 
 
+# ---------------------------------------------------------------------------
+# Facade commit 4 — event-log accessors.
+# ---------------------------------------------------------------------------
+
+
+def test_read_event_log_since_until(tmp_path: Path) -> None:
+    """read_event_log returns captured frames sliced by since/until."""
+    async def main() -> None:
+        async with Kernel(workdir=tmp_path) as k:
+            base = len(k._sink.snapshot())  # ignore any boot frames
+            for i in range(5):
+                k._sink.write_frame({"type": f"e{i}", "payload": {"i": i}})
+            allf = k.read_event_log(since=base)
+            assert [f["type"] for f in allf] == ["e0", "e1", "e2", "e3", "e4"]
+            window = k.read_event_log(since=base + 1, until=base + 3)
+            assert [f["type"] for f in window] == ["e1", "e2"]
+
+    asyncio.run(main())
+
+
+def test_read_event_log_survives_shutdown(tmp_path: Path) -> None:
+    """The captured log is still readable after shutdown."""
+    async def main() -> None:
+        k = Kernel(workdir=tmp_path)
+        await k.start()
+        base = len(k._sink.snapshot())
+        k._sink.write_frame({"type": "kept"})
+        await k.shutdown()
+        types = [f["type"] for f in k.read_event_log(since=base)]
+        assert types[0] == "kept"
+        # The shutdown snapshot is itself a captured event.
+        assert "notebook.metadata" in types
+
+    asyncio.run(main())
+
+
+def test_subscribe_events_requires_started(tmp_path: Path) -> None:
+    """subscribe_events raises on first iteration before start()."""
+    async def main() -> None:
+        k = Kernel(workdir=tmp_path)
+        gen = k.subscribe_events()
+        with pytest.raises(RuntimeError):
+            await gen.__anext__()
+
+    asyncio.run(main())
+
+
+def test_subscribe_events_yields_then_stops_on_shutdown(tmp_path: Path) -> None:
+    """subscribe_events yields live frames and terminates when the kernel
+    shuts down (sink closes)."""
+    async def main() -> None:
+        k = Kernel(workdir=tmp_path)
+        await k.start()
+        base = len(k._sink.snapshot())
+        received: list[dict] = []
+
+        async def consume() -> None:
+            async for ev in k.subscribe_events(since=base):
+                received.append(ev)
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)  # let the subscriber reach its wait
+        k._sink.write_frame({"type": "a"})
+        k._sink.write_frame({"type": "b"})
+        await asyncio.sleep(0.05)
+        await k.shutdown()  # close() wakes the subscriber -> generator ends
+        await asyncio.wait_for(task, timeout=3.0)
+
+        types = [e["type"] for e in received]
+        assert types[:2] == ["a", "b"]
+        # The shutdown snapshot (notebook.metadata) is delivered as a real
+        # event before the stream ends.
+        assert "notebook.metadata" in types[2:]
+
+    asyncio.run(main())
+
+
 if __name__ == "__main__":  # pragma: no cover - library-embedding smoke
     async def _smoke() -> None:
         import tempfile
