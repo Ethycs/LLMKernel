@@ -362,6 +362,52 @@ def test_run_forever_blocks_until_cancelled(tmp_path: Path) -> None:
     asyncio.run(main())
 
 
+def test_kernel_shell_pluggable_egress(tmp_path: Path) -> None:
+    """A supplied kernel_shell routes dispatcher output to that shell, so
+    the facade's own embedded sink (read_event_log) stays empty.
+
+    This is the seam the PTY transport uses: it supplies a socket-routing
+    shell so the dispatcher emits to the wire instead of the in-memory
+    sink. Here we supply a second embedded shell with its own sink and
+    prove the facade wired to it.
+    """
+    from llm_kernel.kernel_facade import _EmbeddedKernel, _EmbeddedSink
+
+    async def main() -> None:
+        external_sink = _EmbeddedSink()
+        shell = _EmbeddedKernel(external_sink)
+        k = Kernel(workdir=tmp_path, kernel_shell=shell)
+        await k.start()
+        try:
+            # The facade wired its dispatcher to the supplied shell...
+            assert k._embedded_kernel is shell
+            # ...so the facade's own event log stays empty; anything the
+            # subsystems emitted went to the external ("wire") sink.
+            assert k.read_event_log() == []
+        finally:
+            await k.shutdown()
+
+    asyncio.run(main())
+
+
+def test_litellm_endpoint_falls_back_to_env(tmp_path: Path, monkeypatch) -> None:
+    """start() resolves the LiteLLM URL as config -> env -> default, matching
+    attach_agent_supervisor (so the PTY proxy's published URL is honored)."""
+    monkeypatch.setenv(
+        "LLMKERNEL_LITELLM_ENDPOINT_URL", "http://127.0.0.1:9999/v1",
+    )
+
+    async def main() -> None:
+        k = Kernel(workdir=tmp_path)
+        await k.start()
+        try:
+            assert k._supervisor._litellm_endpoint_url == "http://127.0.0.1:9999/v1"
+        finally:
+            await k.shutdown()
+
+    asyncio.run(main())
+
+
 if __name__ == "__main__":  # pragma: no cover - library-embedding smoke
     async def _smoke() -> None:
         import tempfile

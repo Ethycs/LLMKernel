@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import uuid
 from pathlib import Path
@@ -252,11 +253,19 @@ class Kernel:
         config: Optional[Dict[str, Any]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         shutdown_grace_seconds: float = 10.0,
+        kernel_shell: Optional[Any] = None,
     ) -> None:
         self._workdir: Path = Path(workdir)
         self._config: Dict[str, Any] = dict(config or {})
         self._loop: Optional[asyncio.AbstractEventLoop] = loop
         self._shutdown_grace: float = shutdown_grace_seconds
+        # Pluggable egress. When None (the default), start() builds the
+        # in-process _EmbeddedKernel and the dispatcher emits into the
+        # in-memory sink that read_event_log/subscribe_events read. A
+        # transport can instead supply a kernel-shaped shell that routes
+        # the dispatcher's output to a wire (e.g. the PTY SocketWriter);
+        # in that mode the embedded sink stays empty by design.
+        self._kernel_shell: Optional[Any] = kernel_shell
 
         # Subsystem references — private; never exposed as public attributes
         # (Con 1 in the plan: reaching inside is a signal to extend the
@@ -288,11 +297,17 @@ class Kernel:
             if self._loop is None:
                 self._loop = asyncio.get_running_loop()
             try:
-                # Fresh sink per start so a restart-after-shutdown collects
-                # into a live (non-closed) buffer, and any subscribers of a
-                # prior run have already ended on that run's sink.close().
-                self._sink = _EmbeddedSink()
-                kernel = _EmbeddedKernel(self._sink)
+                if self._kernel_shell is not None:
+                    # Transport-supplied egress: the dispatcher emits to
+                    # the wire, not the embedded sink. read_event_log and
+                    # subscribe_events see nothing in this mode.
+                    kernel = self._kernel_shell
+                else:
+                    # Fresh sink per start so a restart-after-shutdown collects
+                    # into a live (non-closed) buffer, and any subscribers of a
+                    # prior run have already ended on that run's sink.close().
+                    self._sink = _EmbeddedSink()
+                    kernel = _EmbeddedKernel(self._sink)
                 dispatcher = CustomMessageDispatcher(kernel)
                 dispatcher.start()
 
@@ -309,6 +324,7 @@ class Kernel:
 
                 url = (
                     self._config.get("litellm_endpoint_url")
+                    or os.environ.get("LLMKERNEL_LITELLM_ENDPOINT_URL")
                     or _DEFAULT_LITELLM_ENDPOINT
                 )
                 supervisor = AgentSupervisor(
