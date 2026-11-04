@@ -39,14 +39,22 @@ from mcp.shared.exceptions import McpError
 
 from llm_kernel._internal._rfc_schemas import TOOL_CATALOG, validate_tool_input
 from llm_kernel.capture.run_tracker import RunTracker
+from llm_kernel.wire import versions as _versions
 
 if TYPE_CHECKING:  # pragma: no cover
     from llm_kernel.capture.custom_messages import CustomMessageDispatcher
 
 logger: logging.Logger = logging.getLogger("llm_kernel.mcp")
 
-#: RFC-001 version this server speaks. Mirrored into every tool result.
-RFC_001_VERSION: str = "1.0.0"
+#: RFC-001 version this server speaks.  Mirrored into every tool result;
+#: forwarded from the single source ``llm_kernel.wire.versions`` via
+#: ``__getattr__`` below (call sites read ``_versions.rfc_version(1)``).
+
+
+def __getattr__(name: str) -> Any:
+    if name == "RFC_001_VERSION":
+        return _versions.rfc_version(1)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 #: RFC-002 stable server identifier. Renaming this is a BREAKING change.
 SERVER_NAME: str = "llmkernel-operator-bridge"
@@ -323,7 +331,7 @@ class OperatorBridgeServer:
                     raise
                 finally:
                     _active_run_id.reset(token)
-                result.setdefault("_rfc_version", RFC_001_VERSION)
+                result.setdefault("_rfc_version", _versions.rfc_version(1))
                 result.setdefault("run_id", run_id)
                 if _is_proxied:
                     try:
@@ -350,7 +358,7 @@ class OperatorBridgeServer:
                     result = await handler(arguments)
                 finally:
                     _active_run_id.reset(token)
-                result.setdefault("_rfc_version", RFC_001_VERSION)
+                result.setdefault("_rfc_version", _versions.rfc_version(1))
                 result.setdefault("run_id", run_id)
                 self._log_run("run.complete", tool_name, run_id, status="success")
             return types.ServerResult(
@@ -1668,7 +1676,7 @@ class OperatorBridgeServer:
                 "valid": False,
                 "violations": ["$.tool_name: required non-empty string"],
                 "tool_name": "",
-                "_rfc_version": RFC_001_VERSION,
+                "_rfc_version": _versions.rfc_version(1),
             }
         if tool_name not in TOOL_CATALOG:
             return {
@@ -1677,7 +1685,7 @@ class OperatorBridgeServer:
                     f"$.tool_name: {tool_name!r} not in RFC-001 catalog"
                 ],
                 "tool_name": tool_name,
-                "_rfc_version": RFC_001_VERSION,
+                "_rfc_version": _versions.rfc_version(1),
             }
         if not isinstance(inner_args, dict):
             return {
@@ -1687,7 +1695,7 @@ class OperatorBridgeServer:
                     f"{type(inner_args).__name__}"
                 ],
                 "tool_name": tool_name,
-                "_rfc_version": RFC_001_VERSION,
+                "_rfc_version": _versions.rfc_version(1),
             }
         error = validate_tool_input(tool_name, inner_args)
         if error is None:
@@ -1695,13 +1703,13 @@ class OperatorBridgeServer:
                 "valid": True,
                 "violations": [],
                 "tool_name": tool_name,
-                "_rfc_version": RFC_001_VERSION,
+                "_rfc_version": _versions.rfc_version(1),
             }
         return {
             "valid": False,
             "violations": [error],
             "tool_name": tool_name,
-            "_rfc_version": RFC_001_VERSION,
+            "_rfc_version": _versions.rfc_version(1),
         }
 
     async def run_stdio(self) -> None:
@@ -1713,7 +1721,7 @@ class OperatorBridgeServer:
                 "agent_id": self.agent_id,
                 "zone_id": self.zone_id,
                 "traceId": self.trace_id,
-                "rfc_001_version": RFC_001_VERSION,
+                "rfc_001_version": _versions.rfc_version(1),
             },
         )
         async with stdio_server() as (read_stream, write_stream):

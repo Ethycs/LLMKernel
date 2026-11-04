@@ -41,6 +41,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from llm_kernel._kernel_hooks import _DEFAULT_LITELLM_ENDPOINT
 from llm_kernel.capture.custom_messages import CustomMessageDispatcher
+from llm_kernel.wire import versions as _versions
 from llm_kernel.capture.drift_detector import DriftDetector
 from llm_kernel.capture.metadata_writer import MetadataWriter
 from llm_kernel.capture.run_tracker import RunTracker
@@ -337,6 +338,7 @@ class Kernel:
                 dispatcher.set_metadata_writer(metadata_writer)
                 dispatcher.set_agent_supervisor(supervisor)
                 dispatcher.set_drift_detector(DriftDetector())
+                dispatcher.set_current_volatile_provider(_versions.current_volatile)
             except Exception as exc:
                 # Best-effort partial teardown so a failed start leaves no
                 # autosave / heartbeat threads running.

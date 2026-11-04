@@ -19,7 +19,7 @@ under a real PTY) ``LLMKERNEL_PTY_MODE=1``. We:
    :class:`StreamHandler`.
 7. Emit the ready handshake LogRecord (RFC-008 §4 "Ready handshake")
    with the required ``llmnb.kernel.*`` attributes.
-8. Write the boot banner ``LLMKernel pty-mode v1.0.0; socket=<address>``
+8. Write the boot banner ``LLMKernel pty-mode v<KERNEL_VERSION>; socket=<address>``
    to PTY stderr (RFC-008 §3).
 9. Wire :class:`MetadataWriter` snapshots to flow through the socket
    writer (the in-process IOPub path doesn't apply here -- there's no
@@ -54,27 +54,32 @@ from typing import Any, Callable, Dict, List, Optional
 
 from llm_kernel.capture._otlp_log_handler import OtlpDataPlaneHandler
 from llm_kernel.capture.socket_writer import SocketWriter
+from llm_kernel.wire import versions as _versions
 
 logger: logging.Logger = logging.getLogger("llm_kernel.transports.pty_mode")
 
-#: Kernel package version emitted in the ready handshake. RFC-008 §4
-#: requires this; we hardcode for V1 since reading ``pyproject.toml`` at
-#: runtime adds a tomllib dependency for no benefit.
-KERNEL_VERSION: str = "1.0.0"
+#: ``KERNEL_VERSION`` (RFC-008 §4 ``llmnb.kernel.version``) and
+#: ``RFC_VERSIONS`` (the ``llmnb.kernel.rfc_NNN_version`` attributes) are
+#: forwarded from the single source :mod:`llm_kernel.wire.versions` via
+#: ``__getattr__`` below.  ``pty_mode.KERNEL_VERSION`` /
+#: ``pty_mode.RFC_VERSIONS`` stay importable from here and always reflect
+#: the live source; call sites in this module read ``_versions.*`` at
+#: call time so a runtime override propagates to the ready frame, the
+#: boot banner and the drift provider alike.
+_FORWARDED_VERSION_NAMES = ("KERNEL_VERSION", "RFC_VERSIONS")
 
-#: RFC implementation versions emitted in the ready handshake's
-#: ``llmnb.kernel.rfc_NNN_version`` attributes (RFC-008 §4 + §"Drift on
-#: connect"). Track these alongside the RFC documents.
-RFC_VERSIONS: Dict[str, str] = {
-    "rfc_001_version": "1.0.0",
-    "rfc_002_version": "1.0.0",
-    "rfc_003_version": "1.0.0",
-    "rfc_004_version": "1.0.0",
-    "rfc_005_version": "1.0.0",
-    "rfc_006_version": "2.0.0",
-    "rfc_007_version": "1.0.0",
-    "rfc_008_version": "1.0.0",
-}
+
+def __getattr__(name: str) -> Any:
+    if name in _FORWARDED_VERSION_NAMES:
+        return getattr(_versions, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+#: Current-environment volatile config for ``DriftDetector.compare``.
+#: This is the source module's own function (not a copy) so pty-mode,
+#: serve, the app, the facade and the legacy kernel all register the
+#: same provider object.
+_current_volatile = _versions.current_volatile
 
 #: Env vars read ONLY in this module per RFC-008 §3 boundary discipline.
 ENV_IPC_SOCKET: str = "LLMKERNEL_IPC_SOCKET"
@@ -324,7 +329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # PTY stderr (RFC-008 §3 "Boot output"). Once the handler is up,
     # nothing else writes to stderr unless the OTLP pipeline crashes.
     sys.stderr.write(
-        f"LLMKernel pty-mode v{KERNEL_VERSION}; socket={address}\n"
+        f"LLMKernel pty-mode v{_versions.KERNEL_VERSION}; socket={address}\n"
     )
     sys.stderr.flush()
 
@@ -403,20 +408,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     _diagnostics.mark("pty_mode_dispatcher_started")
 
     if hasattr(dispatcher, "set_current_volatile_provider"):
-        # Provide a callable that returns the kernel's current volatile
-        # state for DriftDetector.compare(persisted_volatile, current).
-        def _current_volatile() -> Dict[str, Any]:
-            return {
-                "kernel": {
-                    "rfc_001_version": "1.0.0",
-                    "rfc_002_version": "1.0.1",
-                    "rfc_003_version": "2.0.2",  # RFC-006 actually
-                    "rfc_005_version": "1.0.0",
-                    "rfc_006_version": "2.0.2",
-                    "rfc_008_version": "1.0.0",
-                    "kernel_version": KERNEL_VERSION,
-                },
-            }
+        # Current volatile state for DriftDetector.compare(persisted,
+        # current), read live from llm_kernel.wire.versions.
         dispatcher.set_current_volatile_provider(_current_volatile)
 
     def _on_sigint(_signum: int, _frame: Any) -> None:
@@ -637,11 +630,12 @@ def _emit_ready_handshake(writer: SocketWriter, session_id: str) -> None:
     )
     attrs: Dict[str, Any] = {
         "event.name": "kernel.ready",
-        "llmnb.kernel.version": KERNEL_VERSION,
+        "llmnb.kernel.version": _versions.KERNEL_VERSION,
         "llmnb.kernel.session_id": session_id,
         "llmnb.kernel.python_version": py_version,
     }
-    for key, value in RFC_VERSIONS.items():
+    # One ``llmnb.kernel.rfc_NNN_version`` per RFC the single source defines.
+    for key, value in _versions.RFC_VERSIONS.items():
         attrs[f"llmnb.kernel.{key}"] = value
     now_ns = int(_utc_epoch_ns())
     record: Dict[str, Any] = {
@@ -780,7 +774,7 @@ def boot_kernel() -> Any:
     _diagnostics.mark("pty_mode_socket_connected")
 
     sys.stderr.write(
-        f"LLMKernel pty-mode v{KERNEL_VERSION}; socket={address}\n"
+        f"LLMKernel pty-mode v{_versions.KERNEL_VERSION}; socket={address}\n"
     )
     sys.stderr.flush()
 
@@ -827,18 +821,7 @@ def boot_kernel() -> Any:
     _diagnostics.mark("pty_mode_dispatcher_started")
 
     if hasattr(dispatcher, "set_current_volatile_provider"):
-        def _current_volatile() -> Dict[str, Any]:
-            return {
-                "kernel": {
-                    "rfc_001_version": "1.0.0",
-                    "rfc_002_version": "1.0.1",
-                    "rfc_003_version": "2.0.2",
-                    "rfc_005_version": "1.0.0",
-                    "rfc_006_version": "2.0.2",
-                    "rfc_008_version": "1.0.0",
-                    "kernel_version": KERNEL_VERSION,
-                },
-            }
+        # Same module-level provider as the pty-mode bootstrap above.
         dispatcher.set_current_volatile_provider(_current_volatile)
 
     # Signal handlers — only if on the main thread (uvicorn calls lifespan
@@ -1013,7 +996,7 @@ def _dispatch_inbound_line(line: bytes, kernel: _PtyKernel) -> None:
         return
     # The dispatcher's Comm target is RFC-006 §2's ``llmnb.rts.v2``.
     msg = {"content": {"data": frame}}
-    kernel.shell.comm_manager.deliver("llmnb.rts.v2", msg)
+    kernel.shell.comm_manager.deliver(_versions.COMM_TARGET, msg)
 
 
 __all__ = [

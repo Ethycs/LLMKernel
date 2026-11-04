@@ -41,6 +41,16 @@ periodic-timer trigger runs in a daemon thread and respects
 
 from llm_kernel.capture.metadata_writer._serialize import *  # noqa: F401,F403
 from llm_kernel.capture.metadata_writer._writer import *  # noqa: F401,F403
+from llm_kernel.wire import versions as _versions
+
+
+def __getattr__(name: str):
+    # ``SCHEMA_VERSION`` is forwarded (never copied) from the single
+    # source so a runtime override of ``llm_kernel.wire.versions`` is
+    # visible as ``metadata_writer.SCHEMA_VERSION``.
+    if name == "SCHEMA_VERSION":
+        return _versions.SCHEMA_VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "DEFAULT_AUTOSAVE_INTERVAL_SEC",

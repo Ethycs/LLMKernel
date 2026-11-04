@@ -19,6 +19,7 @@ from fastapi import FastAPI
 
 from llm_kernel._internal import _diagnostics
 from llm_kernel.transports import pty_mode
+from llm_kernel.wire import versions as _versions
 
 #: Module-level holder for the kernel state so /health and future routes
 #: can read it without pulling app.state typing gymnastics. Set on
@@ -74,7 +75,7 @@ async def lifespan(app: FastAPI):
         _diagnostics.mark("app_lifespan_shutdown_done")
 
 
-app = FastAPI(lifespan=lifespan, title="LLMKernel", version="1.0.0")
+app = FastAPI(lifespan=lifespan, title="LLMKernel", version=_versions.KERNEL_VERSION)
 
 
 @app.get("/health")
@@ -86,5 +87,5 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "kernel_session_id": _state.get("session_id"),
-        "kernel_version": getattr(pty_mode, "KERNEL_VERSION", "unknown"),
+        "kernel_version": _versions.KERNEL_VERSION,
     }

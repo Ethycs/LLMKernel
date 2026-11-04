@@ -16,6 +16,8 @@ from typing import Dict, List, Any, Optional
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+from llm_kernel.wire import versions as _versions
+
 from ipykernel.kernelbase import Kernel
 from ipykernel.ipkernel import IPythonKernel
 from IPython.core.magic import Magics, line_magic, cell_magic, magics_class
@@ -72,7 +74,7 @@ class LLMKernel(IPythonKernel):
     """
     
     implementation = 'llm_kernel'
-    implementation_version = '0.1.0'
+    implementation_version = _versions.PACKAGE_VERSION
     language = 'python'
     language_version = '3.8'
     language_info = {

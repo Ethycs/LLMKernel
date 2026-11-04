@@ -46,18 +46,31 @@ import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-from llm_kernel.wire import WIRE_MAJOR, WIRE_VERSION
+from llm_kernel.wire import versions as _versions
 
 logger: logging.Logger = logging.getLogger("llm_kernel.transports.serve_mode")
 
 
-#: Kernel package version emitted in handshake responses.
-KERNEL_VERSION: str = "1.0.0"
+#: ``KERNEL_VERSION``, ``KERNEL_CAPABILITIES``, ``WIRE_VERSION`` and
+#: ``WIRE_MAJOR`` are forwarded from the single source
+#: :mod:`llm_kernel.wire.versions` via ``__getattr__`` below, so they
+#: stay importable from here and always reflect the live source.  The
+#: handshake builders and the validator read ``_versions.*`` at call
+#: time; this module holds no copy of any version value.
+_FORWARDED_VERSION_NAMES: Dict[str, Callable[[], Any]] = {
+    "KERNEL_VERSION": lambda: _versions.KERNEL_VERSION,
+    "KERNEL_CAPABILITIES": lambda: _versions.KERNEL_CAPABILITIES,
+    "WIRE_VERSION": lambda: _versions.WIRE_VERSION,
+    "WIRE_MAJOR": lambda: _versions.semver_major(_versions.WIRE_VERSION),
+}
 
-#: Capabilities the V1 kernel advertises in handshake responses.
-KERNEL_CAPABILITIES: List[str] = [
-    "family_a", "family_b", "family_c", "family_f", "family_g",
-]
+
+def __getattr__(name: str) -> Any:
+    try:
+        getter = _FORWARDED_VERSION_NAMES[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    return getter()
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +196,8 @@ def _handshake_error(
 ) -> None:
     """Send a handshake response carrying an error code and close the socket."""
     payload: Dict[str, Any] = {
-        "wire_version": WIRE_VERSION,
-        "kernel_version": KERNEL_VERSION,
+        "wire_version": _versions.WIRE_VERSION,
+        "kernel_version": _versions.KERNEL_VERSION,
         "error": error_code,
     }
     if extra:
@@ -197,10 +210,10 @@ def _handshake_response(
 ) -> Dict[str, Any]:
     """Build a successful handshake response envelope."""
     payload: Dict[str, Any] = {
-        "kernel_version": KERNEL_VERSION,
-        "wire_version": WIRE_VERSION,
+        "kernel_version": _versions.KERNEL_VERSION,
+        "wire_version": _versions.WIRE_VERSION,
         "session_id": session_id,
-        "accepted_capabilities": list(KERNEL_CAPABILITIES),
+        "accepted_capabilities": _versions.kernel_capabilities(),
     }
     if warnings:
         payload["warnings"] = warnings
@@ -231,10 +244,10 @@ def _validate_handshake(
         client_major = int(client_wire.split(".", 1)[0])
     except (ValueError, IndexError):
         return ("wire-failure", [])
-    if client_major != WIRE_MAJOR:
+    if client_major != _versions.semver_major(_versions.WIRE_VERSION):
         return ("version_mismatch_major", [])
     warnings: List[str] = []
-    if client_wire != WIRE_VERSION:
+    if client_wire != _versions.WIRE_VERSION:
         warnings.append("minor_version_skew")
 
     # Auth check (TCP only -- this serve mode is TCP-exclusive).
@@ -298,6 +311,34 @@ def _boot_kernel_for_serve(proxy_mode: str) -> Dict[str, Any]:
         agent_id="serve", zone_id="serve",
     )
 
+    # The hydrate handler (RFC-006 §8/§9) refuses to run without a
+    # metadata writer and an agent supervisor, and drift needs the
+    # detector plus the current-volatile provider. serve used to boot
+    # none of these, so a notebook opened over TCP was never
+    # drift-checked. Same wiring as pty-mode / the Kernel facade.
+    from llm_kernel.capture.drift_detector import DriftDetector
+    from llm_kernel.capture.metadata_writer import MetadataWriter
+    from llm_kernel.supervision.agent_supervisor import AgentSupervisor
+    from llm_kernel.wire import versions as _versions
+
+    metadata_writer = MetadataWriter(dispatcher=dispatcher, run_tracker=tracker)
+    metadata_writer.start()
+    supervisor = AgentSupervisor(
+        run_tracker=tracker, dispatcher=dispatcher,
+        litellm_endpoint_url=(
+            os.environ.get("LLMKERNEL_LITELLM_ENDPOINT_URL")
+            or "http://127.0.0.1:4000/v1"
+        ),
+    )
+    dispatcher.set_metadata_writer(metadata_writer)
+    dispatcher.set_agent_supervisor(supervisor)
+    dispatcher.set_drift_detector(DriftDetector())
+    dispatcher.set_current_volatile_provider(_versions.current_volatile)
+    # Inbound handlers (notebook.metadata among them) are registered by
+    # start(); serve routed envelopes to a dispatcher that had never been
+    # started, so RFC-006 W4 fail-closed dropped every hydrate.
+    dispatcher.start()
+
     # Optional proxy lifecycle. Most external-driver use cases supply
     # their own proxy out-of-band; default 'none' keeps the serve
     # surface minimal.
@@ -320,6 +361,8 @@ def _boot_kernel_for_serve(proxy_mode: str) -> Dict[str, Any]:
         "kernel": kernel,
         "dispatcher": dispatcher,
         "tracker": tracker,
+        "metadata_writer": metadata_writer,
+        "supervisor": supervisor,
         "server": server,
         "session_id": session_id,
     }
@@ -327,6 +370,24 @@ def _boot_kernel_for_serve(proxy_mode: str) -> Dict[str, Any]:
 
 def _teardown_serve_kernel(state: Dict[str, Any]) -> None:
     """Stop subsystems started by :func:`_boot_kernel_for_serve`."""
+    writer = state.get("metadata_writer")
+    if writer is not None:
+        try:
+            writer.stop(emit_final=False)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("serve: metadata writer stop raised")
+    supervisor = state.get("supervisor")
+    if supervisor is not None:
+        try:
+            supervisor.terminate_all(grace_seconds=2.0)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("serve: supervisor terminate_all raised")
+    dispatcher = state.get("dispatcher")
+    if dispatcher is not None:
+        try:
+            dispatcher.stop()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("serve: dispatcher stop raised")
     server = state.get("server")
     if server is not None:
         try:
@@ -579,9 +640,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     actual_host, actual_port = listener.getsockname()[:2]
     sys.stderr.write(
-        f"llm_kernel serve v{KERNEL_VERSION}; "
+        f"llm_kernel serve v{_versions.KERNEL_VERSION}; "
         f"listening on {actual_host}:{actual_port}; "
-        f"wire_version={WIRE_VERSION}\n"
+        f"wire_version={_versions.WIRE_VERSION}\n"
     )
     sys.stderr.flush()
 
