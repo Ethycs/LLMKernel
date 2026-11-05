@@ -17,7 +17,7 @@ Public surface (locked at PLAN-S6.0 §4):
     resulting ``metadata.rts``.
 
 Schema-version branching: each envelope carries ``rfc_version``
-(``run_envelope.RFC003_VERSION = "1.0.0"``).  On load:
+(``run_envelope.RFC003_VERSION``, from ``llm_kernel.wire.versions``).  On load:
 
 * Major mismatch with the kernel's :data:`llm_kernel.wire.WIRE_VERSION`
   raises :class:`EventLogVersionMismatchError`.
@@ -40,7 +40,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterator, List, Optional
 
-from llm_kernel.wire.version import WIRE_MAJOR, WIRE_MINOR
+# Read ``WIRE_MAJOR`` / ``WIRE_MINOR`` through the module at call time so
+# they track the single source (``llm_kernel.wire.versions``).
+from llm_kernel.wire import version as _wire_version
 
 logger: logging.Logger = logging.getLogger("llm_kernel.capture.event_log")
 
@@ -107,16 +109,16 @@ def _check_envelope_version(envelope: Dict[str, Any]) -> None:
     if parsed is None:
         return
     major, minor = parsed
-    if major != WIRE_MAJOR:
+    if major != _wire_version.WIRE_MAJOR:
         raise EventLogVersionMismatchError(
             f"event-log envelope rfc_version={raw!r} major differs from "
-            f"kernel WIRE_MAJOR={WIRE_MAJOR}; replay refused (PLAN-S6.0 §3.G)"
+            f"kernel WIRE_MAJOR={_wire_version.WIRE_MAJOR}; replay refused (PLAN-S6.0 §3.G)"
         )
-    if minor != WIRE_MINOR:
+    if minor != _wire_version.WIRE_MINOR:
         logger.warning(
             "event-log envelope rfc_version=%r minor differs from "
             "kernel WIRE_MINOR=%d; proceeding (PLAN-S6.0 §3.G)",
-            raw, WIRE_MINOR,
+            raw, _wire_version.WIRE_MINOR,
         )
 
 

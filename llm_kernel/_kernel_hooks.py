@@ -19,6 +19,8 @@ from llm_kernel.capture.custom_messages import CustomMessageDispatcher
 from llm_kernel.mcp.mcp_server import OperatorBridgeServer
 from llm_kernel.capture.metadata_writer import MetadataWriter
 from llm_kernel.capture.run_tracker import RunTracker
+from llm_kernel.capture.drift_detector import DriftDetector
+from llm_kernel.wire import versions as _versions
 
 if TYPE_CHECKING:  # pragma: no cover
     from ipykernel.ipkernel import IPythonKernel
@@ -158,6 +160,14 @@ def attach_kernel_subsystems(
         setattr(kernel, ATTR_OPERATOR_BRIDGE, bridge)
     supervisor = attach_agent_supervisor(kernel, tracker, dispatcher)
     metadata_writer = attach_metadata_writer(kernel, dispatcher, tracker)
+    # Drift detection in the legacy kernel: the hydrate handler needs a
+    # detector and the current-volatile provider, exactly as pty-mode
+    # wires them; without these a notebook opened in a Jupyter kernel
+    # was never drift-checked.
+    if hasattr(dispatcher, "set_drift_detector"):
+        dispatcher.set_drift_detector(DriftDetector())
+    if hasattr(dispatcher, "set_current_volatile_provider"):
+        dispatcher.set_current_volatile_provider(_versions.current_volatile)
     # Wire the bridge's collaborator slots so its agent_spawn /
     # drift_acknowledged routes resolve without falling through to the
     # kernel-attribute probe fallback (which the synthetic _PtyKernel

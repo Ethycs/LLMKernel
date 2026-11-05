@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from llm_kernel.text.cell_text import split_at_breaks, parse_cell
+from llm_kernel.wire import versions as _versions
 
 
 __all__ = [
@@ -258,7 +259,7 @@ def magic_to_llmnb(
         rts: dict[str, Any] = json.loads(json.dumps(base_metadata))  # deep copy
     else:
         rts = {
-            "schema_version": "1.0.0",
+            "schema_version": _versions.SCHEMA_VERSION,
             "schema_uri": "https://llmnb.dev/schemas/rts/v1",
             "session_id": "00000000-0000-0000-0000-000000000000",
             "created_at": "1970-01-01T00:00:00Z",

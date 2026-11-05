@@ -35,9 +35,12 @@ What this module provides:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from llm_kernel.wire import versions as _versions
 
 logger: logging.Logger = logging.getLogger("llm_kernel.capture.drift_detector")
 
@@ -54,6 +57,27 @@ _STATUS_ERROR: str = "STATUS_CODE_ERROR"
 #: RunFrame status values per docs/atoms/concepts/run-frame.md §Schema.
 _RUNFRAME_STATUS_RUNNING: str = "running"
 _RUNFRAME_STATUS_INTERRUPTED: str = "interrupted"
+
+#: Shape of an RFC implementation-version key in ``config.volatile.kernel``.
+_RFC_KEY_RE: "re.Pattern[str]" = re.compile(r"^rfc_\d{3}_version$")
+
+
+def _rfc_version_keys(
+    prev_kernel: Dict[str, Any], current: Dict[str, Any],
+) -> List[str]:
+    """RFC version keys to drift-check.
+
+    Every key the single source (:data:`llm_kernel.wire.versions.RFC_VERSIONS`)
+    defines, in definition order, followed by any further
+    ``rfc_NNN_version`` key present on *both* sides (so a persisted RFC the
+    source has since dropped, or a runtime-added one, is still compared).
+    """
+    keys: List[str] = list(_versions.RFC_VERSIONS)
+    seen = set(keys)
+    for key in sorted(set(prev_kernel) & set(current)):
+        if key not in seen and _RFC_KEY_RE.match(key):
+            keys.append(key)
+    return keys
 
 
 def _utc_now_iso() -> str:
@@ -271,6 +295,11 @@ class DriftDetector:
         """Compare ``config.volatile.kernel.*`` field by field."""
         if current is None:
             return []
+        # The pty-mode provider returns the ``config.volatile`` shape
+        # (``{"kernel": {...}}``); other callers pass the flat
+        # ``config.volatile.kernel`` dict.  Accept both.
+        if isinstance(current.get("kernel"), dict):
+            current = current["kernel"]
         prev_kernel = (
             persisted.get("config", {})
             .get("volatile", {})
@@ -286,8 +315,9 @@ class DriftDetector:
                     field_path=f"config.volatile.kernel.{key}",
                     previous=prev, current=curr, severity=SEVERITY_WARN,
                 ))
-        # Semver fields where major mismatch escalates to error.
-        for key in ("rfc_001_version", "rfc_002_version", "rfc_003_version"):
+        # Semver fields where major mismatch escalates to error: every
+        # RFC key the single source defines, not a hand-kept subset.
+        for key in _rfc_version_keys(prev_kernel, current):
             prev = prev_kernel.get(key)
             curr = current.get(key)
             if prev is None or curr is None:
