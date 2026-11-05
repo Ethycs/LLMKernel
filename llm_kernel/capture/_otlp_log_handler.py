@@ -27,6 +27,7 @@ a bad LogRecord never crashes the kernel main loop.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -64,16 +65,33 @@ class OtlpDataPlaneHandler(logging.Handler):
         super().__init__(level=level)
         self._writer = socket_writer
         self._extra_attributes: Dict[str, Any] = dict(extra_attributes or {})
+        # Per-thread re-entrancy guard: a record logged from inside
+        # ``write_frame`` (its own failure path) must not come back
+        # through this handler into the same writer.
+        self._tls = threading.local()
 
     # The handler's own emit MUST NOT call back into the logging
     # subsystem on failure (the kernel logger configuration would
     # recurse). Use :meth:`logging.Handler.handleError` semantics.
     def emit(self, record: logging.LogRecord) -> None:
+        # No wire to put the record on (writer closed, or its peer is
+        # gone): drop it. Writing would only re-enter the writer's own
+        # failure path.
+        is_connected = getattr(self._writer, "is_connected", None)
+        if is_connected is not None and not is_connected():
+            return
+        state = self._tls
+        if getattr(state, "emitting", False):
+            # Re-entered on this thread from inside ``write_frame``.
+            return
+        state.emitting = True
         try:
             otlp = self._build_record(record)
             self._writer.write_frame(otlp)
         except Exception:  # pragma: no cover - defensive
             self.handleError(record)
+        finally:
+            state.emitting = False
 
     # Public for tests; the `pty_mode` smoke validates the wire shape.
     def _build_record(self, record: logging.LogRecord) -> Dict[str, Any]:

@@ -88,6 +88,9 @@ class SocketWriter:
         self._lock: threading.RLock = threading.RLock()
         self._sock: Optional[socket.socket] = None
         self._closed: bool = False
+        #: Set once ``sendall`` fails: the peer is gone and every later
+        #: frame is dropped without touching the socket (or the logger).
+        self._broken: bool = False
         self._address: Optional[str] = None
         # PLAN-S5.0.1 §3.3 — defense-in-depth output sanitizer. When
         # hash mode is on, every outbound frame's text fields are
@@ -144,6 +147,7 @@ class SocketWriter:
             self._sock = sock
             self._address = address
             self._closed = False
+            self._broken = False
             logger.debug("SocketWriter connected to %s", address)
 
     def close(self) -> None:
@@ -170,7 +174,7 @@ class SocketWriter:
     def is_connected(self) -> bool:
         """Return True iff the socket is open."""
         with self._lock:
-            return self._sock is not None and not self._closed
+            return self._sock is not None and not self._closed and not self._broken
 
     # -- Frame I/O ---------------------------------------------------
 
@@ -261,14 +265,25 @@ class SocketWriter:
         payload = (line + "\n").encode("utf-8")
         with self._lock:
             sock = self._sock
-            if sock is None:
-                logger.debug("SocketWriter.write_frame: not connected; dropped")
+            if sock is None or self._broken:
+                # Not connected, or the peer is already known to be gone:
+                # drop silently. No log call on this path -- the root
+                # logger's OtlpDataPlaneHandler writes through this very
+                # writer.
                 return
             try:
                 sock.sendall(payload)
             except OSError as exc:
+                # Mark the writer dead BEFORE logging. The warning below
+                # is forwarded by the OtlpDataPlaneHandler back into this
+                # writer; with ``_broken`` set the handler drops it instead
+                # of re-entering ``sendall`` on the dead socket (which used
+                # to recurse until RecursionError and print one
+                # "--- Logging error ---" traceback per record to stderr).
+                self._broken = True
                 logger.warning(
-                    "SocketWriter.write_frame: sendall failed (%s); frame dropped",
+                    "SocketWriter.write_frame: sendall failed (%s); peer gone, "
+                    "this and later frames dropped",
                     exc,
                 )
 
