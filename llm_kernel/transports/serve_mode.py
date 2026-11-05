@@ -35,6 +35,7 @@ V1 design choices
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hmac
 import json
 import logging
@@ -44,6 +45,7 @@ import socket
 import sys
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from llm_kernel.wire import WIRE_MAJOR, WIRE_VERSION
@@ -260,44 +262,65 @@ def _validate_handshake(
 # ---------------------------------------------------------------------------
 
 
-def _boot_kernel_for_serve(proxy_mode: str) -> Dict[str, Any]:
-    """Boot the minimum kernel surface needed to dispatch envelopes.
+class _ServeKernelShell:
+    """Kernel-shaped egress for the facade in serve mode.
 
-    Returns a dict carrying the dispatcher, tracker, server, etc. The
-    caller owns teardown. Mirrors the boot scaffold in
-    ``__main__._run_agent_supervisor_smoke`` and ``llm_client.boot``;
-    factored out so the serve loop stays readable.
+    The dispatcher reads ``session``, ``iopub_socket``, ``shell.comm_manager``
+    and ``_parent_header``. Serve mode taps ``dispatcher.emit`` per
+    connection (see :func:`_serve_connection`), so the Comm side is inert:
+    nothing is attached, nothing is written by the shell itself.
     """
-    from unittest.mock import MagicMock
-
-    from llm_kernel.capture.custom_messages import CustomMessageDispatcher
-    from llm_kernel.capture.run_tracker import RunTracker
-
-    # MagicMock kernel shell -- the dispatcher needs ``.session``,
-    # ``.iopub_socket``, ``.shell.comm_manager``, ``._parent_header``.
-    # Same pattern as the smokes; isolated to this boot helper.
-    kernel = MagicMock()
 
     class _Session:
         def send(self, *_args: Any, **_kwargs: Any) -> None:
             pass
 
-    class _CommMgr:
+    class _CommManager:
         def register_target(self, *_args: Any, **_kwargs: Any) -> None: ...
         def unregister_target(self, *_args: Any, **_kwargs: Any) -> None: ...
 
-    kernel.session = _Session()
-    kernel.iopub_socket = MagicMock()
-    kernel.shell.comm_manager = _CommMgr()
-    kernel._parent_header = {}
+    class _Shell:
+        def __init__(self) -> None:
+            self.comm_manager = _ServeKernelShell._CommManager()
 
-    session_id = str(uuid.uuid4())
-    dispatcher = CustomMessageDispatcher(kernel)
-    tracker = RunTracker(
-        trace_id=session_id, sink=dispatcher,
-        agent_id="serve", zone_id="serve",
+    def __init__(self) -> None:
+        self.session = _ServeKernelShell._Session()
+        self.iopub_socket = "<serve-iopub-placeholder>"
+        self.shell = _ServeKernelShell._Shell()
+        self._parent_header: Dict[str, Any] = {}
+
+
+def _boot_kernel_for_serve(
+    proxy_mode: str, *, workdir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Start the kernel facade for serve mode (PLAN-kernel-facade commit 7).
+
+    The serve loop is threaded (blocking accept), while the facade is
+    async-first, so the facade runs on a private event loop owned by a
+    daemon thread; ``start``/``shutdown`` are driven through
+    ``run_coroutine_threadsafe``. Returns a dict carrying the kernel, the
+    subsystems the connection handler needs, the optional proxy and the
+    loop bookkeeping that :func:`_teardown_serve_kernel` undoes.
+    """
+    from llm_kernel.kernel_facade import Kernel
+
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(
+        target=loop.run_forever, name="llmkernel-serve-loop", daemon=True,
     )
-
+    loop_thread.start()
+    kernel = Kernel(
+        workdir=workdir or Path.cwd(), kernel_shell=_ServeKernelShell(), loop=loop,
+    )
+    try:
+        asyncio.run_coroutine_threadsafe(kernel.start(), loop).result(timeout=60.0)
+    except BaseException:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=5.0)
+        raise
+    dispatcher = kernel.dispatcher
+    tracker = kernel.run_tracker
+    session_id = kernel.trace_id or str(uuid.uuid4())
     # Optional proxy lifecycle. Most external-driver use cases supply
     # their own proxy out-of-band; default 'none' keeps the serve
     # surface minimal.
@@ -315,24 +338,39 @@ def _boot_kernel_for_serve(proxy_mode: str) -> Dict[str, Any]:
             run_tracker=tracker, host="127.0.0.1", port=0,
         )
         server.start()
-
     return {
         "kernel": kernel,
         "dispatcher": dispatcher,
         "tracker": tracker,
         "server": server,
         "session_id": session_id,
+        "loop": loop,
+        "loop_thread": loop_thread,
     }
 
 
 def _teardown_serve_kernel(state: Dict[str, Any]) -> None:
-    """Stop subsystems started by :func:`_boot_kernel_for_serve`."""
+    """Stop what :func:`_boot_kernel_for_serve` started: proxy first (it
+    emits into the run tracker), then the facade, then its loop."""
     server = state.get("server")
     if server is not None:
         try:
             server.stop()
         except Exception:  # pragma: no cover - defensive
             logger.exception("serve: proxy stop raised")
+    kernel = state.get("kernel")
+    loop = state.get("loop")
+    if kernel is not None and loop is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(kernel.shutdown(), loop).result(timeout=30.0)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("serve: kernel shutdown raised")
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread = state.get("loop_thread")
+        if loop_thread is not None:
+            loop_thread.join(timeout=5.0)
+        if not loop.is_running():
+            loop.close()
 
 
 # ---------------------------------------------------------------------------

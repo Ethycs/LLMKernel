@@ -41,6 +41,7 @@ This module is ALSO the only place :envvar:`LLMKERNEL_IPC_SOCKET` and
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import platform
@@ -50,6 +51,7 @@ import sys
 import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from llm_kernel.capture._otlp_log_handler import OtlpDataPlaneHandler
@@ -281,157 +283,60 @@ def _set_raw_mode_if_tty() -> Optional[Callable[[], None]]:
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Run the pty-mode kernel; return a process exit code.
+# ---------------------------------------------------------------------------
+# Facade transport adapter (PLAN-kernel-facade commit 6).
+#
+# Everything that is a wire or process concern lives here: the socket, the
+# ready handshake, the kernel-owned proxy, the OTLP log handler, termios
+# state, signal handlers and the inbound read loop. The :class:`Kernel`
+# facade owns the subsystems and their start/shutdown ordering. One
+# lifetime looks like::
+#
+#     transport = PtyTransport(address=..., session_id=...)
+#     rc = transport.prepare()                 # RFC-008 §4 steps 1-3
+#     async with Kernel(workdir, kernel_shell=transport.kernel_shell) as k:
+#         await k.bind_transport(transport)    # read loop starts
+#         await transport.wait_closed()        # EOF / shutdown request
+#     transport.close()                        # after the final snapshot hit the wire
+#
+# The socket deliberately outlives ``Kernel.shutdown()``: the facade drains
+# transports first and emits the final ``notebook.metadata`` snapshot during
+# subsystem teardown, so closing the writer in ``stop()`` would drop the
+# RFC-008 §4 step-6 frame. ``stop()`` only halts the read loop.
+# ---------------------------------------------------------------------------
 
-    Reads ``LLMKERNEL_IPC_SOCKET`` from the env. Fails fast (returns 2
-    after writing to PTY stderr) when missing -- the extension is
-    expected to set this before spawning per RFC-008 §4 step 1.
+
+def _current_volatile() -> Dict[str, Any]:
+    """Current volatile kernel state for ``DriftDetector.compare``."""
+    return {
+        "kernel": {
+            "rfc_001_version": "1.0.0",
+            "rfc_002_version": "1.0.1",
+            "rfc_003_version": "2.0.2",  # RFC-006 actually
+            "rfc_005_version": "1.0.0",
+            "rfc_006_version": "2.0.2",
+            "rfc_008_version": "1.0.0",
+            "kernel_version": KERNEL_VERSION,
+        },
+    }
+
+
+def _install_signal_handlers(
+    shutdown_event: threading.Event, interrupt_event: threading.Event,
+) -> None:
+    """SIGINT -> interrupt_event, SIGTERM -> shutdown_event (main thread only).
+
+    ``signal.signal`` only works on the main thread; callers that run on a
+    worker thread (tests, uvicorn's lifespan) skip installation gracefully.
+    The handlers stay minimal: ``logger.info`` here could re-enter the
+    SocketWriter lock from the signal frame.
     """
-    from llm_kernel._internal import _diagnostics
-    _diagnostics.mark("pty_mode_main_entry")
-    address = os.environ.get(ENV_IPC_SOCKET, "")
-    pty_flag = os.environ.get(ENV_PTY_MODE) == "1"
-    session_id = os.environ.get(ENV_SESSION_ID) or str(uuid.uuid4())
-    _diagnostics.mark("pty_mode_env_read", socket=address, session_id=session_id, pty_flag=pty_flag)
-    if not address:
-        sys.stderr.write(
-            f"LLMKernel pty-mode: {ENV_IPC_SOCKET} env var is required\n"
-        )
-        sys.stderr.flush()
-        _diagnostics.mark("pty_mode_exit_no_socket", rc=2)
-        return 2
-
-    # Termios raw mode -- only meaningful under a real PTY. The smoke
-    # spawns under pipes, so this is typically a no-op.
-    termios_restore = _set_raw_mode_if_tty() if pty_flag else None
-
-    writer = SocketWriter()
-    try:
-        writer.connect(address)
-    except OSError as exc:
-        sys.stderr.write(
-            f"LLMKernel pty-mode: failed to connect to socket {address!r}: {exc}\n"
-        )
-        sys.stderr.flush()
-        if termios_restore is not None:
-            termios_restore()
-        _diagnostics.mark("pty_mode_exit_socket_connect_failed", error=str(exc), rc=3)
-        return 3
-    _diagnostics.mark("pty_mode_socket_connected")
-
-    # Banner BEFORE installing the OTLP handler so it actually reaches
-    # PTY stderr (RFC-008 §3 "Boot output"). Once the handler is up,
-    # nothing else writes to stderr unless the OTLP pipeline crashes.
-    sys.stderr.write(
-        f"LLMKernel pty-mode v{KERNEL_VERSION}; socket={address}\n"
-    )
-    sys.stderr.flush()
-
-    # Ready handshake FIRST -- RFC-008 §4 makes this the first frame on
-    # the data plane. Subsystem initialization below logs through the
-    # OTLP handler; logs MUST come after the ready record so the
-    # extension can recognize the kernel before processing anything else.
-    _emit_ready_handshake(writer, session_id)
-    _diagnostics.mark("pty_mode_ready_emitted")
-
-    # BSP-001: proxy lifecycle. Either trust an externally-provided URL
-    # (operator already started a proxy and points us at it) or start
-    # one ourselves and publish its URL via the env var that
-    # ``attach_agent_supervisor`` reads downstream. Failures here are
-    # K11/K12 and we exit BEFORE attaching subsystems.
-    proxy_server = _start_owned_proxy_or_none()
-    if proxy_server is _PROXY_START_FAILED:
-        # K12 already marked + stderr already written by helper.
-        if termios_restore is not None:
-            termios_restore()
-        return 12
-    if proxy_server is _PROXY_CONFIG_REJECTED:
-        # K11 already marked + stderr already written by helper.
-        if termios_restore is not None:
-            termios_restore()
-        return 11
-
-    # Install OTLP handler on the root + ``llm_kernel`` namespace.
-    # Removing existing stdout-bound StreamHandlers per RFC-008 §7
-    # ("once the handler is up, no Python text reaches the PTY").
-    handler = OtlpDataPlaneHandler(
-        socket_writer=writer,
-        extra_attributes={"llmnb.kernel.session_id": session_id},
-    )
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    handler_restore = _install_handler(handler)
-
-    # Bring up subsystems against the synthetic kernel shell.
-    kernel = _PtyKernel(writer)
-    # Inline import: ``_kernel_hooks`` pulls a chunk of dependencies the
-    # tests don't always need at module import time.
-    from llm_kernel._kernel_hooks import attach_kernel_subsystems
-    dispatcher, tracker, bridge, supervisor, metadata_writer = (
-        attach_kernel_subsystems(kernel)
-    )
-
-    # ``MetadataWriter.snapshot`` already calls ``dispatcher.emit``,
-    # which routes through our synthetic Comm to the SocketWriter --
-    # no extra wiring needed. The hook below is for shutdown-time final
-    # snapshot triggered explicitly (RFC-008 §4 step 6).
-    shutdown_event = threading.Event()
-    interrupt_event = threading.Event()
-
-    # Wire K-CM dispatcher's collaborators (added in the V1 mega-round).
-    # The dispatcher's hydrate / shutdown / B / C handlers consult these
-    # attributes; missing wiring means the handlers fall back to logging
-    # and EOF-driven shutdown rather than the spec'd paths. See RFC-006
-    # §7.1, §"Family B", §"Family C", §8 v2.0.2 hydrate.
-    if hasattr(dispatcher, "set_shutdown_event"):
-        dispatcher.set_shutdown_event(shutdown_event)
-    if hasattr(dispatcher, "set_metadata_writer"):
-        dispatcher.set_metadata_writer(metadata_writer)
-    if hasattr(dispatcher, "set_agent_supervisor"):
-        dispatcher.set_agent_supervisor(supervisor)
-    if hasattr(dispatcher, "set_drift_detector"):
-        from llm_kernel.capture.drift_detector import DriftDetector
-        dispatcher.set_drift_detector(DriftDetector())
-    # Register the dispatcher's Comm target with the synthetic kernel so
-    # inbound RFC-006 v2 envelopes (operator.action, layout.edit,
-    # agent_graph.query, notebook.metadata, kernel.shutdown_request)
-    # actually reach their handlers. Without this start() call, the
-    # `kernel.shell.comm_manager.deliver(...)` in `_dispatch_inbound_line`
-    # finds no target and silently drops every inbound envelope.
-    dispatcher.start()
-    _diagnostics.mark("pty_mode_dispatcher_started")
-
-    if hasattr(dispatcher, "set_current_volatile_provider"):
-        # Provide a callable that returns the kernel's current volatile
-        # state for DriftDetector.compare(persisted_volatile, current).
-        def _current_volatile() -> Dict[str, Any]:
-            return {
-                "kernel": {
-                    "rfc_001_version": "1.0.0",
-                    "rfc_002_version": "1.0.1",
-                    "rfc_003_version": "2.0.2",  # RFC-006 actually
-                    "rfc_005_version": "1.0.0",
-                    "rfc_006_version": "2.0.2",
-                    "rfc_008_version": "1.0.0",
-                    "kernel_version": KERNEL_VERSION,
-                },
-            }
-        dispatcher.set_current_volatile_provider(_current_volatile)
-
     def _on_sigint(_signum: int, _frame: Any) -> None:
-        # Keep the handler minimal -- ``logger.info`` here would acquire
-        # the SocketWriter lock from the same thread that may already
-        # hold it (Python signals run on the main thread between
-        # bytecodes), risking a deadlock. The interrupt event is set;
-        # the read loop notices and emits the LogRecord cleanly.
         interrupt_event.set()
 
     def _on_sigterm(_signum: int, _frame: Any) -> None:
         shutdown_event.set()
 
-    # ``signal.signal`` only works on the main thread; tests that run
-    # ``main`` in a worker thread skip handler installation gracefully.
     if hasattr(signal, "SIGINT"):
         try:
             signal.signal(signal.SIGINT, _on_sigint)
@@ -443,32 +348,150 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ValueError:
             logger.debug("pty_mode: SIGTERM handler not installable from this thread")
 
-    # The ready handshake was emitted earlier (right after socket
-    # connect, before subsystem init logs) so it is genuinely the first
-    # frame on the data plane per RFC-008 §4.
 
-    # Read loop: parse newline-delimited JSON frames and dispatch.
-    try:
-        _run_read_loop(writer, kernel, shutdown_event, interrupt_event)
-    except Exception:  # pragma: no cover - defensive
-        logger.exception("pty_mode: read loop crashed; shutting down")
-    finally:
-        # Final notebook.metadata snapshot per RFC-008 §4 step 6 ("Kernel
-        # emits final notebook.metadata snapshot").
+class PtyTransport:
+    """RFC-008 pty-mode transport for the :class:`~llm_kernel.kernel_facade.Kernel`.
+
+    Satisfies the facade's thin transport hook (async ``bind(kernel)`` /
+    ``stop()``) and adds the process-side steps around it. Exit codes from
+    :meth:`prepare` match the legacy ``main``: 3 socket connect failed,
+    11 proxy configuration rejected (K11), 12 proxy start failed (K12).
+    """
+
+    def __init__(
+        self, *, address: str, session_id: str, pty_flag: bool = False,
+    ) -> None:
+        self.address: str = address
+        self.session_id: str = session_id
+        self.pty_flag: bool = pty_flag
+        self.writer: SocketWriter = SocketWriter()
+        #: The transport-supplied egress handed to ``Kernel(kernel_shell=...)``.
+        self.kernel_shell: _PtyKernel = _PtyKernel(self.writer)
+        self.shutdown_event: threading.Event = threading.Event()
+        self.interrupt_event: threading.Event = threading.Event()
+        self._termios_restore: Optional[Callable[[], None]] = None
+        self._handler_restore: Optional[Callable[[], None]] = None
+        self._proxy_server: Any = None
+        self._read_thread: Optional[threading.Thread] = None
+        self._prepared: bool = False
+        self._closed: bool = False
+
+    # -- RFC-008 §4 steps 1-3: connect, ready handshake, proxy, OTLP handler
+    def prepare(self) -> int:
+        """Bring the wire up. Returns 0, or the process exit code to use."""
+        from llm_kernel._internal import _diagnostics
+
+        # Termios raw mode -- only meaningful under a real PTY. The smoke
+        # spawns under pipes, so this is typically a no-op.
+        self._termios_restore = _set_raw_mode_if_tty() if self.pty_flag else None
         try:
-            metadata_writer.snapshot(trigger="shutdown")
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("pty_mode: final metadata snapshot raised")
-        try:
-            metadata_writer.stop(emit_final=False)
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("pty_mode: metadata_writer.stop raised")
-        try:
-            dispatcher.stop()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("pty_mode: dispatcher.stop raised")
-        # BSP-001 §3 step 7: stop kernel-owned proxy on exit. None means
-        # external lifecycle (operator owns it; not ours to stop).
+            self.writer.connect(self.address)
+        except OSError as exc:
+            sys.stderr.write(
+                f"LLMKernel pty-mode: failed to connect to socket "
+                f"{self.address!r}: {exc}\n"
+            )
+            sys.stderr.flush()
+            self._restore_terminal()
+            _diagnostics.mark(
+                "pty_mode_exit_socket_connect_failed", error=str(exc), rc=3,
+            )
+            return 3
+        _diagnostics.mark("pty_mode_socket_connected")
+        # Banner BEFORE installing the OTLP handler so it actually reaches
+        # PTY stderr (RFC-008 §3 "Boot output").
+        sys.stderr.write(
+            f"LLMKernel pty-mode v{KERNEL_VERSION}; socket={self.address}\n"
+        )
+        sys.stderr.flush()
+        # Ready handshake FIRST -- RFC-008 §4 makes this the first frame on
+        # the data plane; subsystem logs must come after it.
+        _emit_ready_handshake(self.writer, self.session_id)
+        _diagnostics.mark("pty_mode_ready_emitted")
+        # BSP-001 proxy lifecycle; K11/K12 exit before any subsystem exists.
+        proxy_server = _start_owned_proxy_or_none()
+        if proxy_server is _PROXY_START_FAILED:
+            self._restore_terminal()
+            return 12
+        if proxy_server is _PROXY_CONFIG_REJECTED:
+            self._restore_terminal()
+            return 11
+        self._proxy_server = proxy_server
+        # OTLP handler on root + ``llm_kernel``; strips stdout sinks per
+        # RFC-008 §7 so no Python text reaches the PTY after this point.
+        handler = OtlpDataPlaneHandler(
+            socket_writer=self.writer,
+            extra_attributes={"llmnb.kernel.session_id": self.session_id},
+        )
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        self._handler_restore = _install_handler(handler)
+        self._prepared = True
+        return 0
+
+    # -- facade transport hook ----------------------------------------
+    async def bind(self, kernel: Any) -> None:
+        """Attach the transport collaborators and start the read loop.
+
+        Called by ``Kernel.bind_transport`` once the subsystems are wired.
+        """
+        from llm_kernel._internal import _diagnostics
+
+        if not self._prepared:
+            raise RuntimeError("PtyTransport.prepare() must succeed before bind()")
+        dispatcher = kernel.dispatcher
+        # K-CM collaborators that are transport concerns: the shutdown
+        # event the ``kernel.shutdown_request`` handler sets, and the
+        # volatile-state provider the drift detector compares against.
+        if hasattr(dispatcher, "set_shutdown_event"):
+            dispatcher.set_shutdown_event(self.shutdown_event)
+        if hasattr(dispatcher, "set_current_volatile_provider"):
+            dispatcher.set_current_volatile_provider(_current_volatile)
+        _install_signal_handlers(self.shutdown_event, self.interrupt_event)
+        self._read_thread = threading.Thread(
+            target=_run_read_loop,
+            args=(
+                self.writer, self.kernel_shell,
+                self.shutdown_event, self.interrupt_event,
+            ),
+            name="llmkernel-read-loop",
+            daemon=True,
+        )
+        self._read_thread.start()
+        _diagnostics.mark("pty_mode_read_loop_started")
+
+    async def wait_closed(self) -> None:
+        """Block until the read loop ends (peer EOF, SIGTERM or a
+        ``kernel.shutdown_request``)."""
+        thread = self._read_thread
+        if thread is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, thread.join)
+
+    async def stop(self) -> None:
+        """Halt the read loop. The socket stays open: ``Kernel.shutdown``
+        still has to emit the final snapshot through it (RFC-008 §4 step 6).
+        """
+        self.shutdown_event.set()
+        thread = self._read_thread
+        if (
+            thread is not None and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: thread.join(timeout=5.0))
+
+    # -- process-side teardown, after the facade is down ---------------
+    def close(self) -> None:
+        """Stop the kernel-owned proxy, close the socket, restore the
+        terminal and the logging handlers. Idempotent."""
+        from llm_kernel._internal import _diagnostics
+
+        if self._closed:
+            return
+        self._closed = True
+        proxy_server = self._proxy_server
         if proxy_server is not None and proxy_server not in (
             _PROXY_START_FAILED, _PROXY_CONFIG_REJECTED,
         ):
@@ -477,12 +500,77 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _diagnostics.mark("pty_mode_proxy_stopped")
             except Exception:  # pragma: no cover - defensive
                 logger.exception("pty_mode: proxy_server.stop raised")
-        writer.close()
-        if termios_restore is not None:
-            termios_restore()
-        if handler_restore is not None:
-            handler_restore()
+        self.writer.close()
+        self._restore_terminal()
+        if self._handler_restore is not None:
+            self._handler_restore()
+            self._handler_restore = None
+
+    def _restore_terminal(self) -> None:
+        if self._termios_restore is not None:
+            self._termios_restore()
+            self._termios_restore = None
+
+
+async def run_pty_kernel(
+    transport: PtyTransport, *, workdir: Optional[Path] = None,
+) -> int:
+    """One pty-mode kernel lifetime on the facade. Returns the exit code.
+
+    ``transport.prepare()`` must already have returned 0.
+    """
+    from llm_kernel._internal import _diagnostics
+    from llm_kernel.kernel_facade import Kernel, KernelStartError
+
+    try:
+        try:
+            async with Kernel(
+                workdir=workdir or Path.cwd(),
+                kernel_shell=transport.kernel_shell,
+            ) as kernel:
+                await kernel.bind_transport(transport)
+                _diagnostics.mark("pty_mode_dispatcher_started")
+                await transport.wait_closed()
+        except KernelStartError:
+            logger.exception("pty_mode: kernel start failed")
+            return 1
+    finally:
+        # Only now, after the final notebook.metadata snapshot has been
+        # emitted by Kernel.shutdown(), may the socket go away.
+        transport.close()
     return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Run the pty-mode kernel; return a process exit code.
+
+    Reads ``LLMKERNEL_IPC_SOCKET`` from the env. Fails fast (returns 2
+    after writing to PTY stderr) when missing -- the extension is
+    expected to set this before spawning per RFC-008 §4 step 1.
+    """
+    from llm_kernel._internal import _diagnostics
+
+    _diagnostics.mark("pty_mode_main_entry")
+    address = os.environ.get(ENV_IPC_SOCKET, "")
+    pty_flag = os.environ.get(ENV_PTY_MODE) == "1"
+    session_id = os.environ.get(ENV_SESSION_ID) or str(uuid.uuid4())
+    _diagnostics.mark(
+        "pty_mode_env_read", socket=address, session_id=session_id, pty_flag=pty_flag,
+    )
+    if not address:
+        sys.stderr.write(
+            f"LLMKernel pty-mode: {ENV_IPC_SOCKET} env var is required\n"
+        )
+        sys.stderr.flush()
+        _diagnostics.mark("pty_mode_exit_no_socket", rc=2)
+        return 2
+    transport = PtyTransport(
+        address=address, session_id=session_id, pty_flag=pty_flag,
+    )
+    rc = transport.prepare()
+    if rc != 0:
+        return rc
+    return asyncio.run(run_pty_kernel(transport))
 
 
 # ---------------------------------------------------------------------------
@@ -662,265 +750,6 @@ def _utc_epoch_ns() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
 
 
-async def _async_serve_socket(state: Dict[str, Any]) -> None:
-    """Drive the existing sync inbound-line dispatcher off uvicorn's loop.
-
-    BSP-004 V2 (focused retry): runs :func:`_run_read_loop` on a DEDICATED
-    :class:`threading.Thread`, not the default :class:`ThreadPoolExecutor`.
-
-    Why dedicated thread, not executor:
-      - Executor pool workers have ambiguous lifecycle — Python may reuse
-        the same OS thread for unrelated callables, can recycle a worker
-        out from under blocking I/O during shutdown, and on Windows
-        there's a known interaction where ``subprocess.Popen`` invoked
-        on a pool worker during a blocking ``select`` (which is what
-        ``_run_read_loop`` is doing) regressed test #4 by EOF'ing the
-        parent's socket recv ~1.4s after agent_spawn dispatch.
-      - A dedicated thread mirrors the pre-BSP-004 main-thread behavior
-        as closely as possible while keeping uvicorn on the asyncio loop.
-        It owns the read loop's select/recv pair end-to-end with no pool
-        scheduling between iterations.
-      - Lifecycle is explicit: thread starts here, exits on
-        shutdown_event or socket EOF, joined by lifespan shutdown.
-
-    Halts when the socket EOFs or :attr:`state["async_done"]` is set
-    (lifespan shutdown signals this; the inner _run_read_loop polls
-    shutdown_event every 500ms via select timeout).
-    """
-    import asyncio
-    from llm_kernel._internal import _diagnostics
-
-    sock = state["writer"]._sock  # type: ignore[attr-defined]
-    if sock is None:
-        _diagnostics.mark("async_serve_socket_no_sock")
-        return
-    kernel = state["kernel"]
-    shutdown_event = state["shutdown_event"]
-    interrupt_event = state.get("interrupt_event")
-    done = asyncio.Event()
-    state["async_done"] = done
-
-    _diagnostics.mark("async_serve_socket_started")
-
-    # Dedicated thread, not executor. daemon=True so a stuck read loop
-    # (paranoid — _run_read_loop has a select timeout and exits on
-    # shutdown_event) doesn't block process exit.
-    read_thread = threading.Thread(
-        target=_run_read_loop,
-        args=(state["writer"], kernel, shutdown_event, interrupt_event),
-        name="llmkernel-read-loop",
-        daemon=True,
-    )
-    state["read_thread"] = read_thread
-    read_thread.start()
-
-    # Bridge: when the lifespan shutdown signals state["async_done"],
-    # set shutdown_event so the read thread's select timeout notices and
-    # the loop exits cleanly within ~500ms.
-    async def _watch_shutdown() -> None:
-        await done.wait()
-        shutdown_event.set()
-
-    watch_task = asyncio.create_task(_watch_shutdown())
-
-    # Park the lifespan-attached coroutine here until the read thread
-    # exits (socket EOF or shutdown). Polling instead of join() because
-    # join() is blocking and would freeze the asyncio loop; this poll
-    # cycles at the shutdown_event's natural cadence.
-    try:
-        while read_thread.is_alive():
-            await asyncio.sleep(0.5)
-    finally:
-        _diagnostics.mark("async_serve_socket_exited")
-        watch_task.cancel()
-        try:
-            await watch_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        # Give the read thread a moment to finish its current iteration
-        # if shutdown_event has been set; the daemon flag ensures we
-        # don't hang here forever.
-        read_thread.join(timeout=2.0)
-
-
-def boot_kernel() -> Any:
-    """BSP-004: synchronous boot. Returns a state dict on success or an int
-    exit code on early failure (matches the legacy :func:`main` exit codes:
-    2 = no socket env var, 3 = socket connect failed, 11 = K11 proxy config,
-    12 = K12 proxy start). Used by :mod:`llm_kernel.app` lifespan.
-    """
-    from llm_kernel._internal import _diagnostics
-    _diagnostics.mark("pty_mode_main_entry")
-    address = os.environ.get(ENV_IPC_SOCKET, "")
-    pty_flag = os.environ.get(ENV_PTY_MODE) == "1"
-    session_id = os.environ.get(ENV_SESSION_ID) or str(uuid.uuid4())
-    _diagnostics.mark("pty_mode_env_read", socket=address, session_id=session_id, pty_flag=pty_flag)
-    if not address:
-        sys.stderr.write(
-            f"LLMKernel pty-mode: {ENV_IPC_SOCKET} env var is required\n"
-        )
-        sys.stderr.flush()
-        _diagnostics.mark("pty_mode_exit_no_socket", rc=2)
-        return 2
-
-    termios_restore = _set_raw_mode_if_tty() if pty_flag else None
-
-    writer = SocketWriter()
-    try:
-        writer.connect(address)
-    except OSError as exc:
-        sys.stderr.write(
-            f"LLMKernel pty-mode: failed to connect to socket {address!r}: {exc}\n"
-        )
-        sys.stderr.flush()
-        if termios_restore is not None:
-            termios_restore()
-        _diagnostics.mark("pty_mode_exit_socket_connect_failed", error=str(exc), rc=3)
-        return 3
-    _diagnostics.mark("pty_mode_socket_connected")
-
-    sys.stderr.write(
-        f"LLMKernel pty-mode v{KERNEL_VERSION}; socket={address}\n"
-    )
-    sys.stderr.flush()
-
-    _emit_ready_handshake(writer, session_id)
-    _diagnostics.mark("pty_mode_ready_emitted")
-
-    proxy_server = _start_owned_proxy_or_none()
-    if proxy_server is _PROXY_START_FAILED:
-        if termios_restore is not None:
-            termios_restore()
-        return 12
-    if proxy_server is _PROXY_CONFIG_REJECTED:
-        if termios_restore is not None:
-            termios_restore()
-        return 11
-
-    handler = OtlpDataPlaneHandler(
-        socket_writer=writer,
-        extra_attributes={"llmnb.kernel.session_id": session_id},
-    )
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    handler_restore = _install_handler(handler)
-
-    kernel = _PtyKernel(writer)
-    from llm_kernel._kernel_hooks import attach_kernel_subsystems
-    dispatcher, tracker, bridge, supervisor, metadata_writer = (
-        attach_kernel_subsystems(kernel)
-    )
-
-    shutdown_event = threading.Event()
-    interrupt_event = threading.Event()
-
-    if hasattr(dispatcher, "set_shutdown_event"):
-        dispatcher.set_shutdown_event(shutdown_event)
-    if hasattr(dispatcher, "set_metadata_writer"):
-        dispatcher.set_metadata_writer(metadata_writer)
-    if hasattr(dispatcher, "set_agent_supervisor"):
-        dispatcher.set_agent_supervisor(supervisor)
-    if hasattr(dispatcher, "set_drift_detector"):
-        from llm_kernel.capture.drift_detector import DriftDetector
-        dispatcher.set_drift_detector(DriftDetector())
-    dispatcher.start()
-    _diagnostics.mark("pty_mode_dispatcher_started")
-
-    if hasattr(dispatcher, "set_current_volatile_provider"):
-        def _current_volatile() -> Dict[str, Any]:
-            return {
-                "kernel": {
-                    "rfc_001_version": "1.0.0",
-                    "rfc_002_version": "1.0.1",
-                    "rfc_003_version": "2.0.2",
-                    "rfc_005_version": "1.0.0",
-                    "rfc_006_version": "2.0.2",
-                    "rfc_008_version": "1.0.0",
-                    "kernel_version": KERNEL_VERSION,
-                },
-            }
-        dispatcher.set_current_volatile_provider(_current_volatile)
-
-    # Signal handlers — only if on the main thread (uvicorn calls lifespan
-    # off the main thread, so signal.signal raises ValueError; uvicorn
-    # installs its own signal handlers anyway and translates them to
-    # lifespan shutdown).
-    def _on_sigint(_signum: int, _frame: Any) -> None:
-        interrupt_event.set()
-
-    def _on_sigterm(_signum: int, _frame: Any) -> None:
-        shutdown_event.set()
-
-    if hasattr(signal, "SIGINT"):
-        try:
-            signal.signal(signal.SIGINT, _on_sigint)
-        except ValueError:
-            logger.debug("pty_mode: SIGINT handler not installable from this thread")
-    if hasattr(signal, "SIGTERM"):
-        try:
-            signal.signal(signal.SIGTERM, _on_sigterm)
-        except ValueError:
-            logger.debug("pty_mode: SIGTERM handler not installable from this thread")
-
-    return {
-        "writer": writer,
-        "kernel": kernel,
-        "dispatcher": dispatcher,
-        "tracker": tracker,
-        "bridge": bridge,
-        "supervisor": supervisor,
-        "metadata_writer": metadata_writer,
-        "shutdown_event": shutdown_event,
-        "interrupt_event": interrupt_event,
-        "termios_restore": termios_restore,
-        "handler_restore": handler_restore,
-        "proxy_server": proxy_server,
-        "session_id": session_id,
-    }
-
-
-def shutdown_kernel(state: Dict[str, Any]) -> None:
-    """BSP-004: cleanup matching :func:`boot_kernel`. Mirrors the legacy
-    :func:`main`'s ``finally`` block.
-    """
-    from llm_kernel._internal import _diagnostics
-    metadata_writer = state.get("metadata_writer")
-    dispatcher = state.get("dispatcher")
-    proxy_server = state.get("proxy_server")
-    writer = state.get("writer")
-    termios_restore = state.get("termios_restore")
-    handler_restore = state.get("handler_restore")
-
-    if metadata_writer is not None:
-        try:
-            metadata_writer.snapshot(trigger="shutdown")
-        except Exception:
-            logger.exception("shutdown_kernel: final metadata snapshot raised")
-        try:
-            metadata_writer.stop(emit_final=False)
-        except Exception:
-            logger.exception("shutdown_kernel: metadata_writer.stop raised")
-    if dispatcher is not None:
-        try:
-            dispatcher.stop()
-        except Exception:
-            logger.exception("shutdown_kernel: dispatcher.stop raised")
-    if proxy_server is not None and proxy_server not in (
-        _PROXY_START_FAILED, _PROXY_CONFIG_REJECTED,
-    ):
-        try:
-            proxy_server.stop()
-            _diagnostics.mark("pty_mode_proxy_stopped")
-        except Exception:
-            logger.exception("shutdown_kernel: proxy_server.stop raised")
-    if writer is not None:
-        writer.close()
-    if termios_restore is not None:
-        termios_restore()
-    if handler_restore is not None:
-        handler_restore()
-
-
 def _run_read_loop(
     writer: SocketWriter,
     kernel: _PtyKernel,
@@ -1022,7 +851,9 @@ __all__ = [
     "ENV_SESSION_ID",
     "KERNEL_VERSION",
     "OtlpDataPlaneHandler",
+    "PtyTransport",
     "RFC_VERSIONS",
     "SocketWriter",
     "main",
+    "run_pty_kernel",
 ]
