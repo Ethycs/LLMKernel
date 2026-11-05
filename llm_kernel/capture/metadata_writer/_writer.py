@@ -1668,7 +1668,56 @@ class MetadataWriter:
                 self._config.pop("magic_pin_fingerprint", None)
             else:
                 self._config["magic_pin_fingerprint"] = fingerprint
+            # An in-session decision supersedes whatever a file claimed
+            # (see ``_quarantine_persisted_trust``).
+            persisted = self._config.get("persisted")
+            if isinstance(persisted, dict):
+                for key in self._HASH_MODE_CONFIG_KEYS:
+                    persisted.pop(key, None)
+                if not persisted:
+                    self._config.pop("persisted", None)
             self._dirty = True
+
+    def _quarantine_persisted_trust(self) -> None:
+        """Move file-sourced trust out of the live config (hydrate only).
+
+        Trust does not come from a file: a notebook on disk can carry
+        ``magic_emit_privileges`` and a ``magic_hash_enabled`` pair, but
+        only an operator acting in-session (``grant_magic_emit_privilege``
+        intent, ``@auth set``) may make them effective. After
+        :meth:`hydrate` the file's grants live under
+        ``config.persisted.magic_emit_privileges`` where
+        :meth:`get_magic_emit_privileges` / :meth:`has_magic_emit_privilege`
+        never look; they round-trip through :meth:`snapshot` under that
+        same marker so persisted and in-session trust stay distinct. The
+        hash-mode pair stays live only when the in-session pin reproduces
+        the stored fingerprint (the operator resuming their own session);
+        otherwise it is parked under ``persisted`` too and the parser
+        runs in the legacy mode the operator already accepts for any
+        notebook. Caller holds ``self._lock``.
+        """
+        from llm_kernel.text.magic_hash import resolve_operator_pin
+
+        persisted = self._config.get("persisted")
+        if not isinstance(persisted, dict):
+            persisted = {}
+        grants = self._config.pop("magic_emit_privileges", None)
+        if isinstance(grants, list) and grants:
+            kept = persisted.get("magic_emit_privileges")
+            if not isinstance(kept, list):
+                kept = []
+            kept.extend(r for r in grants if isinstance(r, dict))
+            persisted["magic_emit_privileges"] = kept
+        if bool(self._config.get("magic_hash_enabled", False)):
+            fingerprint = self._config.get("magic_pin_fingerprint")
+            if resolve_operator_pin(fingerprint) is None:
+                for key in self._HASH_MODE_CONFIG_KEYS:
+                    if key in self._config:
+                        persisted[key] = self._config.pop(key)
+        if persisted:
+            self._config["persisted"] = persisted
+        else:
+            self._config.pop("persisted", None)
 
     def flag_cells_contaminated_by_agent(
         self,
@@ -1909,17 +1958,34 @@ class MetadataWriter:
         PLAN-S5.0.2 §4.2. The pin itself is NEVER stored in the
         notebook (only its fingerprint, per S5.0.1b). V1 sources the
         pin from the ``LLMNB_OPERATOR_PIN`` env var; V1.5+ may add an
-        OS-keychain integration. Returns None when hash mode is off
-        OR when the env var is unset / empty.
+        OS-keychain integration. Returns None when hash mode is off,
+        when the env var is unset / empty, OR when the env pin does not
+        reproduce the stored ``magic_pin_fingerprint`` -- a wrong pin
+        must never validate (or stamp) a hashed magic.
         """
         if not bool(self.get_config_setting("magic_hash_enabled")):
             return None
-        import os
+        from llm_kernel.text.magic_hash import resolve_operator_pin
 
-        pin = os.environ.get("LLMNB_OPERATOR_PIN")
-        if isinstance(pin, str) and pin:
-            return pin
-        return None
+        return resolve_operator_pin(
+            self.get_config_setting("magic_pin_fingerprint"),
+        )
+
+    def parser_context(self):
+        """Return the :class:`cell_text.ParserContext` for the live config.
+
+        Every production parse of a cell held by this writer goes
+        through this context so hash mode governs it (PLAN-S5.0.1b
+        §3.5). ``None`` when hash mode is off (legacy / permissive
+        parse). When hash mode is on but no matching pin is loaded the
+        context carries ``pin=None`` and the parser takes its degraded
+        path (plain magics are K35-body; nothing dispatches).
+        """
+        from llm_kernel.text.cell_text import ParserContext  # lazy import
+
+        if not bool(self.get_config_setting("magic_hash_enabled")):
+            return None
+        return ParserContext(hash_mode_on=True, pin=self.get_operator_pin())
 
     def get_workspace_root(self) -> Path:
         """Return the workspace root path. PLAN-S5.0.2 §4.2 helper."""
@@ -2008,6 +2074,26 @@ class MetadataWriter:
                     ),
                 })
             self._config["magic_emit_privileges"] = entries
+            # An in-session grant supersedes a file-sourced one for the
+            # same pair (see ``_quarantine_persisted_trust``).
+            persisted = self._config.get("persisted")
+            if isinstance(persisted, dict):
+                stale = persisted.get("magic_emit_privileges")
+                if isinstance(stale, list):
+                    remaining = [
+                        r for r in stale
+                        if not (
+                            isinstance(r, dict)
+                            and r.get("agent_id") == agent_id
+                            and r.get("zone_id") == zone_id
+                        )
+                    ]
+                    if remaining:
+                        persisted["magic_emit_privileges"] = remaining
+                    else:
+                        persisted.pop("magic_emit_privileges", None)
+                if not persisted:
+                    self._config.pop("persisted", None)
             self._dirty = True
 
     def revoke_magic_emit_privilege(
@@ -2248,11 +2334,18 @@ class MetadataWriter:
         """Return the parsed :class:`cell_text.ParsedCell` for ``cell_id``.
 
         Per PLAN-S5.0 §3.5: text-hash caching. Cache hit when the
-        text's SHA-256 matches the entry; miss re-runs ``parse_cell``.
-        Returns ``None`` when the cell does not exist.
+        text's SHA-256 AND the hash-mode state (enabled flag + resolved
+        pin) match the entry; miss re-runs ``parse_cell`` under
+        :meth:`parser_context`, so toggling hash mode or the pin
+        re-parses every cell. Returns ``None`` when the cell does not
+        exist.
         """
         from llm_kernel.text.cell_text import parse_cell  # lazy import
 
+        ctx = self.parser_context()
+        hash_state = (
+            (ctx.hash_mode_on, ctx.pin) if ctx is not None else (False, None)
+        )
         with self._lock:
             record = self._cells.get(cell_id)
             if record is None:
@@ -2260,17 +2353,17 @@ class MetadataWriter:
             text = record.get("text", "")
             cache = getattr(self, "_cell_view_cache", None)
             if cache is None:
-                self._cell_view_cache: Dict[str, Tuple[str, Any]] = {}
+                self._cell_view_cache: Dict[str, Tuple[Tuple[Any, ...], Any]] = {}
                 cache = self._cell_view_cache
-            text_hash = _sha256_hex(text or "")
+            cache_key = (_sha256_hex(text or ""), *hash_state)
             cached = cache.get(cell_id)
-            if cached is not None and cached[0] == text_hash:
+            if cached is not None and cached[0] == cache_key:
                 return cached[1]
         # Parse outside the lock so a future K30/K31 raise doesn't hold
         # writes against the snapshot lock.
-        view = parse_cell(text or "")
+        view = parse_cell(text or "", parser_context=ctx)
         with self._lock:
-            self._cell_view_cache[cell_id] = (text_hash, view)
+            self._cell_view_cache[cell_id] = (cache_key, view)
         return view
 
     def migrate_cells_to_canonical_text(self) -> Dict[str, Any]:
@@ -3730,6 +3823,7 @@ class MetadataWriter:
             cfg = snapshot.get("config")
             if isinstance(cfg, dict):
                 self._config = _deepcopy_json(cfg)
+                self._quarantine_persisted_trust()
             persisted_version = snapshot.get("snapshot_version", 0)
             try:
                 self._snapshot_version = int(persisted_version)

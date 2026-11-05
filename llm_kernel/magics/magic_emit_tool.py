@@ -86,6 +86,67 @@ def _format_args(args: Optional[Dict[str, Any]]) -> str:
     return " ".join(pieces)
 
 
+def _smuggled_magic_line(text: str, *, first_segment_is_line_start: bool) -> Optional[str]:
+    """Return the first segment of ``text`` that would land at column 0 as a magic.
+
+    The composed cell text is re-split by the parser with
+    ``str.splitlines()``, so *any* of its separators (``\\n``, ``\\r``,
+    ``\\x0b``, ``\\x0c``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028``,
+    ``\\u2029``) inside an args value or a body would start a fresh
+    line. A segment beginning with ``@`` on such a line is a second
+    magic the grant never covered. ``first_segment_is_line_start`` is
+    True for the body (which already begins on its own line) and False
+    for args (whose first segment sits mid-line after ``key=``).
+    """
+    if not isinstance(text, str) or "@" not in text:
+        return None
+    for idx, segment in enumerate(text.splitlines()):
+        if idx == 0 and not first_segment_is_line_start:
+            continue
+        if segment.startswith("@"):
+            return segment
+    return None
+
+
+def _reject_smuggled_magic(name: str, args: Optional[Dict[str, Any]], body: Optional[str]) -> None:
+    """Raise K3K when ``name`` / ``args`` / ``body`` would emit more than ONE magic.
+
+    PLAN-S5.0.4 clause 1: the grant authorizes exactly the named cell
+    magic. ``name`` must be a registered cell magic and never the
+    ``break`` separator (which would split the emission into two
+    cells); no args key/value or body line may carry a line that the
+    parser -- or the contamination detector -- would read as another
+    ``@``/``@@`` magic.
+    """
+    from llm_kernel.text.magic_registry import CELL_MAGICS
+
+    if name == "break" or name not in CELL_MAGICS:
+        raise MagicEmitError(
+            K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT,
+            f"magic name {name!r} is not an emittable cell magic",
+        )
+    if isinstance(args, dict):
+        for key, value in args.items():
+            for part in (key, value if isinstance(value, str) else str(value)):
+                offending = _smuggled_magic_line(
+                    part, first_segment_is_line_start=False,
+                )
+                if offending is not None:
+                    raise MagicEmitError(
+                        K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT,
+                        f"args for {name!r} would emit an extra magic line "
+                        f"{offending[:64]!r}; the grant covers only @@{name}",
+                    )
+    if isinstance(body, str):
+        offending = _smuggled_magic_line(body, first_segment_is_line_start=True)
+        if offending is not None:
+            raise MagicEmitError(
+                K3K_UNPRIVILEGED_AGENT_MAGIC_EMIT,
+                f"body for {name!r} would emit an extra magic line "
+                f"{offending[:64]!r}; the grant covers only @@{name}",
+            )
+
+
 def emit_magic_cell(
     *,
     agent_id: str,
@@ -170,6 +231,9 @@ def emit_magic_cell(
             f"no privilege grant for agent_id={agent_id!r} "
             f"zone_id={zone_id!r} magic={name!r}",
         )
+
+    # --- One magic per grant: no smuggled second magic (clause 1) -----------
+    _reject_smuggled_magic(name, args, body)
 
     # --- Compose canonical cell text (clause 3) -----------------------------
     from llm_kernel.text.magic_hash import emit_magic_line

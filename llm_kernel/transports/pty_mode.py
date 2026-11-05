@@ -393,6 +393,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(dispatcher, "set_drift_detector"):
         from llm_kernel.capture.drift_detector import DriftDetector
         dispatcher.set_drift_detector(DriftDetector())
+    # PLAN-S5.0.1: contamination flagging + outbound hashed-magic
+    # sanitizer are live only once bound to the writer and the socket.
+    from llm_kernel._kernel_hooks import wire_magic_defense
+    wire_magic_defense(
+        supervisor=supervisor, metadata_writer=metadata_writer,
+        socket_writer=writer,
+    )
     # Register the dispatcher's Comm target with the synthetic kernel so
     # inbound RFC-006 v2 envelopes (operator.action, layout.edit,
     # agent_graph.query, notebook.metadata, kernel.shutdown_request)
@@ -823,6 +830,13 @@ def boot_kernel() -> Any:
     if hasattr(dispatcher, "set_drift_detector"):
         from llm_kernel.capture.drift_detector import DriftDetector
         dispatcher.set_drift_detector(DriftDetector())
+    # PLAN-S5.0.1: contamination flagging + outbound hashed-magic
+    # sanitizer are live only once bound to the writer and the socket.
+    from llm_kernel._kernel_hooks import wire_magic_defense
+    wire_magic_defense(
+        supervisor=supervisor, metadata_writer=metadata_writer,
+        socket_writer=writer,
+    )
     dispatcher.start()
     _diagnostics.mark("pty_mode_dispatcher_started")
 

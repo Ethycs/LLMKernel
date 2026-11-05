@@ -152,6 +152,17 @@ def handle_promote_stream_magic(
             cell_id,
         )
         return None
+    # Anchor to evidence: the operator may only promote a line the
+    # Layer-1 detector actually observed in this cell's stream. A chip
+    # click (or a forged operator.action) naming any other line gets
+    # nothing -- promotion is recovery from an audited emission, not a
+    # free magic-emit surface.
+    if not _line_in_contamination_log(record, line):
+        logger.warning(
+            "promote_stream_magic: line is not in cell_id=%s "
+            "contamination_log; refusing (%r)", cell_id, line[:64],
+        )
+        return None
     # Parse the line.
     try:
         name, args = _parse_magic_line(line)
@@ -161,6 +172,7 @@ def handle_promote_stream_magic(
     # Synthesize the emit_magic_cell call. ``promoted_from_stream``
     # tags the resulting cell's provenance per PLAN §3.3.
     from llm_kernel.magics import magic_emit_tool
+    from llm_kernel.notebook.cell_manager import CellManagerPreconditionError
 
     try:
         result = magic_emit_tool.emit_magic_cell(
@@ -185,4 +197,42 @@ def handle_promote_stream_magic(
             agent_id, name, exc,
         )
         return None
+    except CellManagerPreconditionError as exc:
+        # K3C: the source cell's agent is still running. (K3E does not
+        # fire for promotions -- the anchor is contaminated by design.)
+        logger.warning(
+            "promote_stream_magic: cell manager refused (cell_id=%s): %s",
+            cell_id, exc,
+        )
+        return None
     return result
+
+
+def _normalize_evidence_line(line: str) -> str:
+    """Canonical form for comparing a chip's line with a log entry."""
+    candidate = line.strip()
+    if candidate.startswith("\\@"):
+        candidate = candidate[1:]
+    return candidate[:256]
+
+
+def _line_in_contamination_log(record: Dict[str, Any], line: str) -> bool:
+    """True iff ``line`` matches an entry in ``record["contamination_log"]``.
+
+    The detector stores the raw emitted line truncated to 256 chars;
+    the renderer may hand back the Layer-2 escaped form (``\\@@...``)
+    from outputs, so both sides are normalized the same way.
+    """
+    log = record.get("contamination_log")
+    if not isinstance(log, list):
+        return False
+    wanted = _normalize_evidence_line(line)
+    if not wanted:
+        return False
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        logged = entry.get("line")
+        if isinstance(logged, str) and _normalize_evidence_line(logged) == wanted:
+            return True
+    return False

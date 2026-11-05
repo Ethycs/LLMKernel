@@ -68,7 +68,7 @@ __all__ = (
 #: Environment variable that carries the active operator pin in V1.
 #: Per the slice plan: no keychain, no .env fallback. Operator types
 #: ``@auth set`` per session and the handler writes here.
-PIN_ENV_VAR: str = "LLMNB_OPERATOR_PIN"
+PIN_ENV_VAR: str = MH.OPERATOR_PIN_ENV_VAR
 
 
 # K-codes used by the auth handlers. K38/K39/K3B are registered in

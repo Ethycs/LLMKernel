@@ -41,7 +41,12 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from llm_kernel.text.cell_text import split_at_breaks, parse_cell
+from llm_kernel.text.cell_text import (
+    ParserContext,
+    parse_cell,
+    parser_context_from_config,
+    split_at_breaks,
+)
 
 
 __all__ = [
@@ -199,6 +204,7 @@ def magic_to_llmnb(
     magic_text: str,
     *,
     base_metadata: dict | None = None,
+    parser_context: ParserContext | None = None,
 ) -> dict:
     """Convert magic-text to a parsed .llmnb dict (a JSON object).
 
@@ -211,8 +217,16 @@ def magic_to_llmnb(
     ``base_metadata`` (when provided) is deep-copied and used as the
     starting ``rts`` namespace; useful for round-tripping where the
     caller wants to preserve config / agents / event_log.
+
+    ``parser_context`` governs hash mode for the per-fragment parse
+    (PLAN-S5.0.1b §3.5). When omitted it is derived from
+    ``base_metadata["config"]`` via :func:`parser_context_from_config`,
+    so a hash-mode notebook's plain ``@@<name>`` lines classify as
+    K35-body here exactly as they do in the kernel.
     """
     fragments = split_at_breaks(magic_text or "")
+    if parser_context is None and isinstance(base_metadata, dict):
+        parser_context = parser_context_from_config(base_metadata.get("config"))
 
     cells_dict: dict[str, dict[str, Any]] = {}
     layout_children: list[dict[str, Any]] = []
@@ -229,7 +243,7 @@ def magic_to_llmnb(
     for idx, text in enumerate(fragments):
         cell_id = f"cell-{idx}"
         try:
-            parsed = parse_cell(text)
+            parsed = parse_cell(text, parser_context=parser_context)
             kind = parsed.kind
             args = parsed.args if isinstance(parsed.args, dict) else {}
             bound_agent_id = args.get("agent_id")
