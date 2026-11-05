@@ -49,6 +49,7 @@ logger: logging.Logger = logging.getLogger("llm_kernel.capture.socket_writer")
 _OUTPUT_TEXT_FIELDS: Tuple[str, ...] = (
     "emit_content",
     "text",
+    "content",
     "observation",
     "preview",
     "message",
@@ -392,37 +393,59 @@ def sanitize_outbound_text(text: str) -> str:
 def sanitize_outbound_record(record: Dict[str, Any]) -> Dict[str, Any]:
     """Walk a frame ``record`` and sanitize known text fields.
 
-    Walks the record dict (and nested ``metadata`` / ``attributes`` /
-    ``data`` sub-dicts when present) looking for keys in
-    :data:`_OUTPUT_TEXT_FIELDS`. String values are run through
-    :func:`sanitize_outbound_text`; non-string values are passed
-    through unchanged.
+    Walks the record dict -- every nested dict and list, at any depth
+    (a ``content`` list of text blocks, an OTLP ``attributes`` array,
+    ...) -- looking for keys in :data:`_OUTPUT_TEXT_FIELDS`. A string
+    under such a key is run through :func:`sanitize_outbound_text`;
+    so is every string nested anywhere below it (a list of blocks, an
+    OTLP ``{"stringValue": ...}`` wrapper). An OTLP attribute pair
+    ``{"key": <text field>, "value": ...}`` counts as that field.
+    Other values pass through unchanged.
 
     Returns a new dict on rewrite, or the input dict on identity
-    short-circuit. The function is shallow-copy at the top level
-    when a rewrite happens, deep enough to not mutate the caller's
-    data.
+    short-circuit. Containers are copied only along the rewritten
+    path so the caller's data is never mutated.
     """
+    return _sanitize_outbound_dict(record, text_field=False)
+
+
+def _sanitize_outbound_dict(record: Dict[str, Any], *, text_field: bool) -> Dict[str, Any]:
     if not isinstance(record, dict):
         return record
+    attribute_key = record.get("key")
     out = record  # may rebind to a shallow copy below
-    rewrote = False
     for key, value in record.items():
-        if key in _OUTPUT_TEXT_FIELDS and isinstance(value, str):
-            new_value = sanitize_outbound_text(value)
-            if new_value is not value:
-                if not rewrote:
-                    out = dict(record)
-                    rewrote = True
-                out[key] = new_value
-        elif isinstance(value, dict):
-            new_value = sanitize_outbound_record(value)
-            if new_value is not value:
-                if not rewrote:
-                    out = dict(record)
-                    rewrote = True
-                out[key] = new_value
+        new_value = _sanitize_outbound_value(
+            value,
+            text_field=(
+                text_field
+                or key in _OUTPUT_TEXT_FIELDS
+                or (key == "value" and attribute_key in _OUTPUT_TEXT_FIELDS)
+            ),
+        )
+        if new_value is not value:
+            if out is record:
+                out = dict(record)
+            out[key] = new_value
     return out
+
+
+def _sanitize_outbound_value(value: Any, *, text_field: bool) -> Any:
+    """Sanitize one record value; identity when nothing was rewritten."""
+    if isinstance(value, str):
+        return sanitize_outbound_text(value) if text_field else value
+    if isinstance(value, dict):
+        return _sanitize_outbound_dict(value, text_field=text_field)
+    if isinstance(value, list):
+        out = value
+        for idx, item in enumerate(value):
+            new_item = _sanitize_outbound_value(item, text_field=text_field)
+            if new_item is not item:
+                if out is value:
+                    out = list(value)
+                out[idx] = new_item
+        return out
+    return value
 
 
 __all__ = [

@@ -741,6 +741,110 @@ def _utc_epoch_ns() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
 
 
+# ---------------------------------------------------------------------------
+# BSP-004 synchronous boot helpers, as facade consumers.
+#
+# ``boot_kernel`` / ``shutdown_kernel`` are the in-process pty-mode lifetime
+# for a caller that does not own an event loop. They run exactly one
+# :class:`~llm_kernel.kernel_facade.Kernel` on a private loop thread, the
+# way serve mode's ``_boot_kernel_for_serve`` does, and reach the subsystems
+# through the facade's read-only accessors. ``Kernel.start`` owns the wiring:
+# the dispatcher, the metadata writer, the supervisor, the drift detector and
+# the volatile-version provider, plus the PLAN-S5.0.1 defense (the
+# contamination detector bound to the writer, the outbound sanitizer bound to
+# the transport's socket writer). Nothing is attached by hand here.
+# ---------------------------------------------------------------------------
+
+
+def boot_kernel(*, workdir: Optional[Path] = None) -> Any:
+    """BSP-004: synchronous boot. Returns a state dict on success or an int
+    exit code on early failure (matches :func:`main`: 2 = no socket env var,
+    3 = socket connect failed, 11 = K11 proxy config, 12 = K12 proxy start).
+    """
+    from llm_kernel._internal import _diagnostics
+    from llm_kernel.kernel_facade import Kernel
+
+    _diagnostics.mark("pty_mode_main_entry")
+    address = os.environ.get(ENV_IPC_SOCKET, "")
+    pty_flag = os.environ.get(ENV_PTY_MODE) == "1"
+    session_id = os.environ.get(ENV_SESSION_ID) or str(uuid.uuid4())
+    _diagnostics.mark(
+        "pty_mode_env_read", socket=address, session_id=session_id, pty_flag=pty_flag,
+    )
+    if not address:
+        sys.stderr.write(
+            f"LLMKernel pty-mode: {ENV_IPC_SOCKET} env var is required\n"
+        )
+        sys.stderr.flush()
+        _diagnostics.mark("pty_mode_exit_no_socket", rc=2)
+        return 2
+    transport = PtyTransport(
+        address=address, session_id=session_id, pty_flag=pty_flag,
+    )
+    rc = transport.prepare()
+    if rc != 0:
+        return rc
+
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(
+        target=loop.run_forever, name="llmkernel-pty-loop", daemon=True,
+    )
+    loop_thread.start()
+    kernel = Kernel(
+        workdir=workdir or Path.cwd(), kernel_shell=transport.kernel_shell, loop=loop,
+    )
+
+    async def _start() -> None:
+        await kernel.start()
+        await kernel.bind_transport(transport)
+        _diagnostics.mark("pty_mode_dispatcher_started")
+
+    try:
+        asyncio.run_coroutine_threadsafe(_start(), loop).result(timeout=60.0)
+    except BaseException:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=5.0)
+        transport.close()
+        raise
+    return {
+        "kernel": transport.kernel_shell,
+        "facade": kernel,
+        "transport": transport,
+        "writer": transport.writer,
+        "dispatcher": kernel.dispatcher,
+        "tracker": kernel.run_tracker,
+        "supervisor": kernel.supervisor,
+        "metadata_writer": kernel.metadata_writer,
+        "shutdown_event": transport.shutdown_event,
+        "interrupt_event": transport.interrupt_event,
+        "session_id": session_id,
+        "loop": loop,
+        "loop_thread": loop_thread,
+    }
+
+
+def shutdown_kernel(state: Dict[str, Any]) -> None:
+    """BSP-004: cleanup matching :func:`boot_kernel`. ``Kernel.shutdown``
+    halts the read loop, emits the final ``notebook.metadata`` snapshot and
+    stops the subsystems; only then does the socket go away."""
+    kernel = state.get("facade")
+    loop = state.get("loop")
+    if kernel is not None and loop is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(kernel.shutdown(), loop).result(timeout=30.0)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("shutdown_kernel: kernel shutdown raised")
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread = state.get("loop_thread")
+        if loop_thread is not None:
+            loop_thread.join(timeout=5.0)
+        if not loop.is_running():
+            loop.close()
+    transport = state.get("transport")
+    if transport is not None:
+        transport.close()
+
+
 def _run_read_loop(
     writer: SocketWriter,
     kernel: _PtyKernel,

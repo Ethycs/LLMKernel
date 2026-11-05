@@ -39,7 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
-from llm_kernel._kernel_hooks import _DEFAULT_LITELLM_ENDPOINT
+from llm_kernel._kernel_hooks import _DEFAULT_LITELLM_ENDPOINT, wire_magic_defense
 from llm_kernel.capture.custom_messages import CustomMessageDispatcher
 from llm_kernel.wire import versions as _versions
 from llm_kernel.capture.drift_detector import DriftDetector
@@ -228,6 +228,24 @@ class _EmbeddedKernel:
 # ---------------------------------------------------------------------------
 
 
+def _socket_writer_of(shell: Any) -> Optional[Any]:
+    """Return the transport ``SocketWriter`` behind a kernel-shaped shell.
+
+    The pty transport's ``_PtyKernel`` keeps its writer on the session
+    (``shell.session._writer``); a transport may also expose it directly.
+    Only an object with ``set_hash_mode_provider`` qualifies, so the
+    embedded sink (no wire) yields ``None`` and no sanitizer is wired.
+    """
+    for holder in (shell, getattr(shell, "session", None)):
+        for attr in ("_writer", "writer", "socket_writer"):
+            candidate = getattr(holder, attr, None)
+            if candidate is not None and callable(
+                getattr(candidate, "set_hash_mode_provider", None)
+            ):
+                return candidate
+    return None
+
+
 class Kernel:
     """Embeddable LLMKernel facade.
 
@@ -344,6 +362,13 @@ class Kernel:
                 dispatcher.set_agent_supervisor(supervisor)
                 dispatcher.set_drift_detector(DriftDetector())
                 dispatcher.set_current_volatile_provider(_versions.current_volatile)
+                # PLAN-S5.0.1: the contamination detector flags cells
+                # through the writer, and a transport-supplied socket
+                # writer sanitizes hashed magics on the wire.
+                wire_magic_defense(
+                    supervisor=supervisor, metadata_writer=metadata_writer,
+                    socket_writer=_socket_writer_of(self._kernel_shell),
+                )
             except Exception as exc:
                 # Best-effort partial teardown so a failed start leaves no
                 # autosave / heartbeat threads running.

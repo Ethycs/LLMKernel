@@ -32,6 +32,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 __all__ = (
     "ParsedCell",
     "ParserContext",
+    "parser_context_from_config",
     "split_at_breaks",
     "parse_cell",
     "CellParseError",
@@ -102,6 +103,35 @@ class ParserContext:
     hash_mode_on: bool = False
     pin: Optional[str] = None
     known_magics: FrozenSet[str] = field(default_factory=frozenset)
+
+
+def parser_context_from_config(
+    config: Any, *, env: Optional[Dict[str, str]] = None,
+) -> Optional[ParserContext]:
+    """Build the :class:`ParserContext` a *file-sourced* ``rts.config`` earns.
+
+    PLAN-S5.0.1 defense wiring. Callers that parse notebook text
+    without a live :class:`MetadataWriter` (format converters, the
+    driver, ``llmnb validate``) pass the notebook's ``metadata.rts.
+    config`` here. Hash mode is honoured only when the config says
+    ``magic_hash_enabled`` AND the in-session pin reproduces the stored
+    ``magic_pin_fingerprint`` (:func:`magic_hash.resolve_operator_pin`);
+    a file cannot switch the parser into a mode whose key material the
+    session does not hold. Returns ``None`` (legacy / permissive parse)
+    otherwise. Live writers build their context via
+    ``MetadataWriter.parser_context`` instead, which keeps the
+    in-session "hash on, pin missing" degraded path.
+    """
+    if not isinstance(config, dict):
+        return None
+    if not bool(config.get("magic_hash_enabled", False)):
+        return None
+    from llm_kernel.text.magic_hash import resolve_operator_pin
+
+    pin = resolve_operator_pin(config.get("magic_pin_fingerprint"), env=env)
+    if pin is None:
+        return None
+    return ParserContext(hash_mode_on=True, pin=pin)
 
 
 @dataclass

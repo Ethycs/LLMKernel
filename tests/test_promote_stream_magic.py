@@ -33,6 +33,12 @@ def writer(tmp_path) -> MetadataWriter:
     record = dict(w.get_cell_record("c_src") or {})
     record["bound_agent_id"] = "alpha"
     w._cells["c_src"] = record
+    # Promotion is anchored to evidence: the Layer-1 detector must have
+    # logged the stream-emitted line on this cell (which also marks the
+    # cell contaminated -- the state every real promotion starts from).
+    w.flag_cells_contaminated_by_agent(
+        agent_id="alpha", line="@@scratch hello", source="stdout", layer="plain",
+    )
     return w
 
 

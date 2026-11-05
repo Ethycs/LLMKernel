@@ -175,7 +175,38 @@ def attach_kernel_subsystems(
     bridge.kernel = kernel
     bridge.agent_supervisor = supervisor
     bridge.metadata_writer = metadata_writer
+    wire_magic_defense(supervisor=supervisor, metadata_writer=metadata_writer)
     return dispatcher, tracker, bridge, supervisor, metadata_writer
+
+
+def wire_magic_defense(
+    *,
+    supervisor: AgentSupervisor,
+    metadata_writer: MetadataWriter,
+    socket_writer: Optional[object] = None,
+) -> None:
+    """Bind the cell-magic injection defense to the live metadata writer.
+
+    PLAN-S5.0.1 production wiring -- the one call every boot path
+    (facade ``Kernel.start``, both pty-mode entry points, the IPython
+    hooks) makes so the library-level defenses actually enforce:
+
+    * ``supervisor.set_metadata_writer`` -- the Layer-1 contamination
+      detector flags the emitting agent's bound cells in the writer
+      (``contamination_log``) instead of only marking diagnostics.
+    * ``socket_writer.set_hash_mode_provider`` -- the outbound
+      sanitizer escapes hashed-magic lines on the wire whenever the
+      writer's config says hash mode is on. Skipped when no transport
+      writer exists (embedded sink) or it lacks the setter.
+
+    Idempotent: re-wiring the same pair is a no-op.
+    """
+    supervisor.set_metadata_writer(metadata_writer)
+    setter = getattr(socket_writer, "set_hash_mode_provider", None)
+    if callable(setter):
+        setter(lambda: bool(
+            metadata_writer.get_config_setting("magic_hash_enabled")
+        ))
 
 
 __all__ = [
@@ -183,5 +214,5 @@ __all__ = [
     "ATTR_OPERATOR_BRIDGE", "ATTR_RUN_TRACKER",
     "attach_agent_supervisor", "attach_dispatcher",
     "attach_kernel_subsystems", "attach_metadata_writer",
-    "attach_run_tracker",
+    "attach_run_tracker", "wire_magic_defense",
 ]
