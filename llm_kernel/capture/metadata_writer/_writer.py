@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from llm_kernel.capture.run_tracker import RunTracker
 
 from llm_kernel.capture.metadata_writer._serialize import *  # noqa: F401,F403
+from llm_kernel.notebook.notebook_format import check_rts_integrity
 from llm_kernel.wire import versions as _versions
 
 
@@ -757,7 +758,9 @@ class MetadataWriter:
             response_payload = outcome
             # Mutation-style outcomes carry "ok"; query-style do not.
             ok = bool(outcome.get("ok", True))
-        elif isinstance(outcome, int):
+        elif isinstance(outcome, int) and not isinstance(outcome, bool):
+            # (bool is an int subclass: ``True`` from record_event /
+            # acknowledge_drift is a plain success, not a version.)
             # apply_layout_edit returns the post-bump version; if the
             # version DIDN'T change the apply was a no-op (K42-like).
             ok = outcome > pre_version
@@ -2588,7 +2591,46 @@ class MetadataWriter:
             # install the live sub-dicts.
             "_install_zone_subdict": self._install_zone_subdict,
             "is_cell_executing": self._is_cell_executing_for_overlay,
+            "resolve_span": self._resolve_span_for_overlay,
         }
+
+    def _resolve_span_for_overlay(
+        self, span_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Find ``span_id`` on a turn in ``zone.agents[*].turns[*].spans[]``.
+
+        Read-only lookup used by the ``promote_span`` validator. Returns
+        ``{"span": <span with decoded attributes>, "turn_id": ...,
+        "cell_id": ...}`` or ``None``. ``cell_id`` is the parent turn's
+        ``cell_id``, falling back to the span's ``llmnb.cell_id``.
+        """
+        from llm_kernel._internal._attrs import decode_attrs
+        with self._lock:
+            for agent_state in (self._zone.get("agents") or {}).values():
+                if not isinstance(agent_state, dict):
+                    continue
+                for turn in agent_state.get("turns") or []:
+                    if not isinstance(turn, dict):
+                        continue
+                    for span in turn.get("spans") or []:
+                        if not isinstance(span, dict):
+                            continue
+                        if span.get("spanId") != span_id:
+                            continue
+                        span_out = _deepcopy_json(span)
+                        attrs = span_out.get("attributes")
+                        if isinstance(attrs, list):
+                            attrs = decode_attrs(attrs)
+                        if not isinstance(attrs, dict):
+                            attrs = {}
+                        span_out["attributes"] = attrs
+                        cell_id = turn.get("cell_id") or attrs.get("llmnb.cell_id")
+                        return {
+                            "span": span_out,
+                            "turn_id": turn.get("id"),
+                            "cell_id": cell_id,
+                        }
+        return None
 
     def _install_zone_subdict(self, key: str) -> Dict[str, Any]:
         """Install a writer-owned sub-dict at ``self._zone[key]`` if absent.
@@ -2697,6 +2739,11 @@ class MetadataWriter:
 
         with self._lock:
             state_view = self._build_overlay_state_view()
+            # Section-status gate: commit-level confirmation that the
+            # operator accepted editing a ``complete`` section.
+            state_view["operator_confirmed"] = bool(
+                params.get("operator_confirmed"),
+            )
             commit_id, _record = _overlay_applier.apply_commit(
                 state_view,
                 operations,
@@ -2820,6 +2867,12 @@ class MetadataWriter:
         * **K102**: a ``run_id`` that already exists with a DIFFERENT
           ``cell_id`` is rejected. Same-``cell_id`` resubmission is the
           terminal-status update path described in the atom invariants.
+        * ``unknown_executor``: ``executor_id`` is neither a
+          ``zone.agents`` key nor an ``agent`` node in the agent graph.
+        * ``unknown_context_manifest``: ``context_manifest_id`` is not
+          in ``zone.context_manifests``.
+        * ``runframe_terminal``: the stored frame for ``run_id`` already
+          has a terminal status; only ``running`` frames may be updated.
 
         Storage key: ``metadata.rts.zone.run_frames[<run_id>]``.
         RunFrames are append-only across distinct ``run_id`` values per
@@ -2890,7 +2943,28 @@ class MetadataWriter:
 
         record = _deepcopy_json(frame)
         with self._lock:
-            zone = self._zone.setdefault("run_frames", {})
+            # PLAN-S6 §3.4: the executor must be a registered agent (a
+            # zone turn-graph agent or an ``agent`` node in the agent
+            # graph) and the manifest must already be recorded.
+            graph_agent_ids = {
+                n.get("id") for n in self._agent_graph.get("nodes", []) or []
+                if isinstance(n, dict) and n.get("type") == "agent"
+            }
+            if (executor_id not in (self._zone.get("agents") or {})
+                    and executor_id not in graph_agent_ids):
+                raise ValueError(
+                    f"unknown_executor: record_run_frame: executor_id "
+                    f"{executor_id!r} is not a registered agent"
+                )
+            if context_manifest_id not in (
+                self._zone.get("context_manifests") or {}
+            ):
+                raise ValueError(
+                    f"unknown_context_manifest: record_run_frame: "
+                    f"context_manifest_id {context_manifest_id!r} is not "
+                    "in zone.context_manifests"
+                )
+            zone = self._zone.get("run_frames") or {}
             existing = zone.get(run_id)
             if existing is not None:
                 existing_cell_id = existing.get("cell_id")
@@ -2916,6 +2990,17 @@ class MetadataWriter:
                         f"exists with cell_id {existing_cell_id!r}; refusing "
                         f"to rebind to {cell_id!r}"
                     )
+                existing_status = existing.get("status")
+                if existing_status != "running":
+                    # PLAN-S6 §4: RunFrames are immutable once a terminal
+                    # status is recorded.
+                    raise ValueError(
+                        f"runframe_terminal: record_run_frame: run_id "
+                        f"{run_id!r} already has terminal status "
+                        f"{existing_status!r}; RunFrames are immutable "
+                        "after terminal status"
+                    )
+            zone = self._zone.setdefault("run_frames", {})
             zone[run_id] = record
             self._dirty = True
         return {
@@ -3736,6 +3821,12 @@ class MetadataWriter:
         2. Validate the inner ``config`` block contains no forbidden
            secret fields (RFC-005 §F2).  Forbidden field raises
            :class:`ValueError("forbidden secret in config")`.
+        2a. Apply the RFC-005 integrity checks
+           (:func:`~llm_kernel.notebook.notebook_format.check_rts_integrity`)
+           to a copy of the snapshot: F5 / F9 / F10 / F11 raise
+           :class:`LlmnbIntegrityError` (a ``ValueError``) before any
+           state moves; F4 missing-blob placeholders and F12 timestamp
+           coercion are applied to the copy and logged as warnings.
         3. Replace ``_layout``, ``_agent_graph``, ``_extra_runs``,
            ``_blobs``, ``_drift_log``, ``_config``, and
            ``_snapshot_version`` with values from the snapshot.
@@ -3781,6 +3872,12 @@ class MetadataWriter:
                 reject_secrets(config, path="config")
             except SecretRejected as exc:
                 raise ValueError("forbidden secret in config") from exc
+        snapshot = _deepcopy_json(snapshot)
+        for warning in check_rts_integrity(snapshot):
+            logger.warning(
+                "hydrate: %s", warning,
+                extra={"event.name": "kernel.hydrate.integrity_warning"},
+            )
         # Apply.  All state under the writer's RLock so a concurrent
         # ``snapshot()`` does not see a partial hydrate.
         with self._lock:

@@ -18,6 +18,9 @@ Coverage:
 5. Persistence path: after a successful submit, the writer's snapshot
    surfaces the record at ``zone.run_frames[<run_id>]`` with all of
    the submitted fields preserved.
+6. PLAN-S6 §3.4 / §4: a write after a terminal status is K42
+   ``runframe_terminal``; an unregistered executor or unrecorded
+   manifest is K42 ``unknown_executor`` / ``unknown_context_manifest``.
 
 Engineering Guide §11.7 parallel-test-safety: every test instantiates
 its own writer via :func:`_new_writer` (no shared state, no
@@ -33,7 +36,21 @@ from llm_kernel.capture.metadata_writer import MetadataWriter
 
 
 def _new_writer() -> MetadataWriter:
-    return MetadataWriter(autosave_interval_sec=999.0)
+    """Fresh writer with the executors and manifests the frames reference
+    registered (unknown ones are rejected per PLAN-S6 §3.4)."""
+    writer = MetadataWriter(autosave_interval_sec=999.0)
+    for agent_id in ("agent-alpha", "agent-omega"):
+        writer.apply_agent_graph_command("upsert_node", {
+            "node": {"id": agent_id, "type": "agent", "properties": {}},
+        })
+    for manifest_id in ("manifest-001", "manifest-XYZ"):
+        writer.submit_intent(_envelope(
+            intent_kind="record_context_manifest",
+            parameters={"manifest": {"manifest_id": manifest_id,
+                                     "cell_id": "c1"}},
+            intent_id=f"i-seed-{manifest_id}",
+        ))
+    return writer
 
 
 def _envelope(
@@ -302,3 +319,59 @@ def test_record_run_frame_terminal_without_ended_at_is_accepted() -> None:
         intent_id=f"i-rrf-term-no-ended-{run_id}",
     ))
     assert result["applied"] is True, result
+
+
+# ---------------------------------------------------------------------------
+# 6. PLAN-S6 §3.4 / §4 — terminal immutability + unknown references
+# ---------------------------------------------------------------------------
+
+
+def test_record_run_frame_post_terminal_rejected() -> None:
+    """Once a terminal status is stored, further writes are K42 runframe_terminal."""
+    writer = _new_writer()
+    run_id = uuid.uuid4().hex
+    for idx, status in enumerate(("running", "complete")):
+        r = writer.submit_intent(_envelope(
+            intent_kind="record_run_frame",
+            parameters={"run_frame": _run_frame(
+                run_id=run_id, status=status,
+                ended_at=None if status == "running" else "2026-05-06T12:00:01.000Z",
+            )},
+            intent_id=f"i-rrf-{idx}-{run_id}",
+        ))
+        assert r["applied"] is True, r
+    r3 = writer.submit_intent(_envelope(
+        intent_kind="record_run_frame",
+        parameters={"run_frame": _run_frame(run_id=run_id, status="failed")},
+        intent_id=f"i-rrf-late-{run_id}",
+    ))
+    assert r3["applied"] is False
+    assert r3["error_code"] == "K42"
+    assert "runframe_terminal" in (r3["error_reason"] or "")
+    assert writer.snapshot()["zone"]["run_frames"][run_id]["status"] == "complete"
+
+
+def test_record_run_frame_unknown_executor_k42() -> None:
+    writer = _new_writer()
+    r = writer.submit_intent(_envelope(
+        intent_kind="record_run_frame",
+        parameters={"run_frame": _run_frame(run_id="r-ux", executor_id="ghost")},
+        intent_id="i-rrf-unknown-executor",
+    ))
+    assert r["applied"] is False
+    assert r["error_code"] == "K42"
+    assert "unknown_executor" in (r["error_reason"] or "")
+
+
+def test_record_run_frame_unknown_manifest_k42() -> None:
+    writer = _new_writer()
+    r = writer.submit_intent(_envelope(
+        intent_kind="record_run_frame",
+        parameters={"run_frame": _run_frame(
+            run_id="r-um", context_manifest_id="manifest-missing",
+        )},
+        intent_id="i-rrf-unknown-manifest",
+    ))
+    assert r["applied"] is False
+    assert r["error_code"] == "K42"
+    assert "unknown_context_manifest" in (r["error_reason"] or "")

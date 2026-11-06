@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from llm_kernel.capture.overlay_applier._helpers import *  # noqa: F401,F403
+
+logger = logging.getLogger(__name__)
 
 def _validate_split_cell(state: Dict[str, Any], params: Dict[str, Any]) -> None:
     """Validate + apply ``split_cell`` per BSP-007 §6.2.
@@ -409,9 +412,65 @@ def _validate_move_cells_into_section(
         })
 
 
+#: Span names that are one half of a tool call (discipline/tool-calls-atomic).
+_TOOL_CALL_HALF_SPAN_NAMES: FrozenSet[str] = frozenset({"tool_use", "tool_result"})
+#: Terminal-status span names promoted as ``checkpoint`` (decision D7).
+_CHECKPOINT_SPAN_NAMES: FrozenSet[str] = frozenset({"report_completion", "result"})
+#: Section statuses a promote may target (v1-section-status-interruptibility).
+_PROMOTE_ALLOWED_SECTION_STATUSES: Tuple[str, ...] = ("open", "complete")
+
+
+def _infer_promote_kind(span: Dict[str, Any]) -> Optional[str]:
+    """Decision D7: infer the promoted cell kind from the span.
+
+    Returns ``None`` for half a tool call (``tool_use`` / ``tool_result``
+    on its own), which the caller rejects.
+    """
+    name = span.get("name")
+    attrs = span.get("attributes")
+    if not isinstance(attrs, dict):
+        attrs = {}
+    if name in _TOOL_CALL_HALF_SPAN_NAMES:
+        return None
+    if (name in _CHECKPOINT_SPAN_NAMES
+            or attrs.get("llmnb.tool_name") == "report_completion"):
+        return "checkpoint"
+    # propose_edit, agent_emit / text prose and whole tool-call spans.
+    return "artifact"
+
+
 def _validate_promote_span(state: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """Validate + apply ``promote_span`` per the promote-span atom.
+
+    Preconditions: the span exists on a turn in the zone; it is not
+    half of a tool call; its source cell is not executing (K95); the
+    target section (default: the source cell's section) has status
+    ``open`` or ``complete`` (K95; ``complete`` needs
+    ``operator_confirmed``). The new cell lands at the end of the
+    target section's ``cell_range`` (decision SD3).
+    """
     span_id = _require_str(params, "span_id", "promote_span")
-    cell_kind = params.get("cell_kind", "artifact")
+    resolve = state.get("resolve_span")
+    found = resolve(span_id) if callable(resolve) else None
+    if not isinstance(found, dict) or not isinstance(found.get("span"), dict):
+        raise OverlayRejected(
+            "K90", f"promote_span: unknown span_id {span_id!r}",
+            details={"reason": "unknown_span", "span_id": span_id},
+        )
+    span = found["span"]
+    source_cell_id = found.get("cell_id")
+    inferred_kind = _infer_promote_kind(span)
+    if inferred_kind is None:
+        raise OverlayRejected(
+            "K90",
+            f"promote_span: span {span_id!r} is half of a tool call "
+            f"({span.get('name')!r}); promote the tool call as a unit",
+            details={"reason": "tool_call_half", "span_id": span_id,
+                     "span_name": span.get("name")},
+        )
+    cell_kind = params.get("cell_kind")
+    if cell_kind is None:
+        cell_kind = inferred_kind
     if cell_kind not in ("artifact", "checkpoint"):
         raise OverlayRejected(
             "K90",
@@ -420,11 +479,51 @@ def _validate_promote_span(state: Dict[str, Any], params: Dict[str, Any]) -> Non
             details={"reason": "cell_kind_invalid", "span_id": span_id,
                      "cell_kind": cell_kind},
         )
-    section_id = params.get("section_id")
+    if cell_kind != inferred_kind:
+        # V1 honors the explicit kind but logs the D7 conflict.
+        logger.warning(
+            "promote_span: explicit cell_kind %r conflicts with inferred %r "
+            "(span_id=%s)", cell_kind, inferred_kind, span_id,
+            extra={"event.name": "wire-failure",
+                   "llmnb.span_id": span_id},
+        )
+    if isinstance(source_cell_id, str) and source_cell_id:
+        _check_not_executing(state, source_cell_id, "promote_span",
+                             k_code="K95")
     cells = state.setdefault("cells", {})
     if not isinstance(cells, dict):
         cells = {}
         state["cells"] = cells
+    section_id = params.get("section_id")
+    if section_id is None:
+        src = cells.get(source_cell_id) if isinstance(source_cell_id, str) else None
+        if isinstance(src, dict):
+            section_id = src.get("section_id")
+    sections = state.get("sections") or {}
+    if section_id is not None:
+        if not isinstance(sections, dict) or section_id not in sections:
+            raise OverlayRejected(
+                "K90", f"promote_span: unknown_section {section_id!r}",
+                details={"reason": "unknown_section", "span_id": span_id,
+                         "section_id": section_id},
+            )
+        sec = sections[section_id]
+        current_status = sec.get("status", "open") if isinstance(sec, dict) else "open"
+        confirmed = bool(params.get("operator_confirmed")
+                         or state.get("operator_confirmed"))
+        if (current_status not in _PROMOTE_ALLOWED_SECTION_STATUSES
+                or (current_status == "complete" and not confirmed)):
+            raise OverlayRejected(
+                "K95",
+                f"promote_span: section {section_id!r} status "
+                f"{current_status!r} blocks promotion",
+                details={"reason": "overlay_section_status_blocks",
+                         "span_id": span_id,
+                         "section_id": section_id,
+                         "current_status": current_status,
+                         "required_status": list(_PROMOTE_ALLOWED_SECTION_STATUSES),
+                         "operator_confirmed": confirmed},
+            )
     new_cell_id = params.get("new_cell_id")
     if not isinstance(new_cell_id, str) or not new_cell_id:
         # Non-deterministic by default (Option A per promote-span atom
@@ -439,8 +538,7 @@ def _validate_promote_span(state: Dict[str, Any], params: Dict[str, Any]) -> Non
         "capabilities": [],
         "turns": [],
     }
-    # If a section_id is provided and exists, append the new cell.
-    sections = state.get("sections") or {}
+    # Position default: end of the target section (decision SD3).
     if isinstance(section_id, str) and section_id in sections:
         sec = sections[section_id]
         if isinstance(sec, dict):

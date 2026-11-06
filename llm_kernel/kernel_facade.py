@@ -14,6 +14,15 @@ wiring the pty transport performs after boot; see
 ``docs/04 - Reference/kernel/_wiring-audit.md`` for the audited map this
 was built against.
 
+The facade also owns the kernel's :class:`OperatorBridgeServer`: the one
+``operator.action`` router (RFC-006 §6) per kernel, built on the facade's
+dispatcher, run-tracker, supervisor and metadata writer exactly as
+``attach_kernel_subsystems`` builds it for the IPython kernel. Every
+facade-based start path (serve, pty-mode, the app, library callers)
+therefore acts on operator actions (``agent_spawn`` / ``agent_continue``
+/ ``agent_branch`` / ``agent_revert`` / ``agent_stop`` /
+``approval_response`` / ...) the same way.
+
 Scope of this commit (facade commit 2): the class skeleton —
 ``start`` / ``shutdown`` / async-context-manager lifecycle — and the
 in-process kernel shell the dispatcher needs. Public delegators
@@ -45,6 +54,7 @@ from llm_kernel.wire import versions as _versions
 from llm_kernel.capture.drift_detector import DriftDetector
 from llm_kernel.capture.metadata_writer import MetadataWriter
 from llm_kernel.capture.run_tracker import RunTracker
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
 from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 logger: logging.Logger = logging.getLogger("llm_kernel.kernel_facade")
@@ -295,6 +305,7 @@ class Kernel:
         self._run_tracker: Optional[RunTracker] = None
         self._metadata_writer: Optional[MetadataWriter] = None
         self._supervisor: Optional[AgentSupervisor] = None
+        self._operator_bridge: Optional[OperatorBridgeServer] = None
         self._transports: List[Any] = []
         self._trace_id: Optional[str] = None
         self._started: bool = False
@@ -307,7 +318,8 @@ class Kernel:
 
         Order (mirrors ``_kernel_hooks`` + the pty collaborator wiring):
         dispatcher → run-tracker → metadata-writer → supervisor →
-        dispatcher collaborators. No transports are bound. Raises
+        operator bridge → dispatcher collaborators. No transports are
+        bound. Raises
         :class:`KernelStartError` on failure (never ``os._exit``).
         """
         with self._lifecycle_lock:
@@ -335,10 +347,11 @@ class Kernel:
                     or os.environ.get("LLMKERNEL_RUN_TRACE_ID")
                     or uuid.uuid4().hex
                 )
+                kernel_agent_id = os.environ.get("LLMKERNEL_AGENT_ID", _DEFAULT_AGENT_ID)
+                kernel_zone_id = os.environ.get("LLMKERNEL_ZONE_ID", _DEFAULT_ZONE_ID)
                 run_tracker = RunTracker(
                     trace_id=trace_id, sink=dispatcher,
-                    agent_id=os.environ.get("LLMKERNEL_AGENT_ID", _DEFAULT_AGENT_ID),
-                    zone_id=os.environ.get("LLMKERNEL_ZONE_ID", _DEFAULT_ZONE_ID),
+                    agent_id=kernel_agent_id, zone_id=kernel_zone_id,
                 )
                 metadata_writer = MetadataWriter(
                     dispatcher=dispatcher, run_tracker=run_tracker,
@@ -355,6 +368,20 @@ class Kernel:
                     run_tracker=run_tracker, dispatcher=dispatcher,
                     litellm_endpoint_url=url,
                 )
+                # The operator.action router (RFC-006 §6): the same
+                # construction + cross-wiring attach_kernel_subsystems
+                # does for the IPython kernel, so operator actions reach
+                # the supervisor / writer in every facade start path.
+                # Built after its collaborators exist, so it is fully
+                # wired before anything can deliver an envelope to it.
+                bridge = OperatorBridgeServer(
+                    agent_id=kernel_agent_id, zone_id=kernel_zone_id,
+                    trace_id=trace_id, run_tracker=run_tracker,
+                    dispatcher=dispatcher,
+                )
+                bridge.kernel = kernel
+                bridge.agent_supervisor = supervisor
+                bridge.metadata_writer = metadata_writer
 
                 # Dispatcher collaborator wiring — mirrors pty_mode.main
                 # (the setters attach_kernel_subsystems does not do).
@@ -376,6 +403,7 @@ class Kernel:
                     dispatcher=locals().get("dispatcher"),
                     metadata_writer=locals().get("metadata_writer"),
                     supervisor=None,
+                    bridge=locals().get("bridge"),
                 )
                 raise KernelStartError(f"Kernel.start() failed: {exc}") from exc
 
@@ -384,13 +412,14 @@ class Kernel:
             self._run_tracker = run_tracker
             self._metadata_writer = metadata_writer
             self._supervisor = supervisor
+            self._operator_bridge = bridge
             self._trace_id = trace_id
             self._started = True
 
     async def shutdown(self) -> None:
-        """Reverse construction: drain transports → terminate agents →
-        snapshot + stop the metadata writer → stop the dispatcher → close
-        the sink. Idempotent.
+        """Reverse construction: drain transports → detach the operator
+        bridge → terminate agents → snapshot + stop the metadata writer →
+        stop the dispatcher → close the sink. Idempotent.
         """
         # Flip state + capture references under the lock (no await inside,
         # so we never block the loop holding a threading lock). A concurrent
@@ -405,11 +434,13 @@ class Kernel:
             dispatcher = self._dispatcher
             metadata_writer = self._metadata_writer
             supervisor = self._supervisor
+            bridge = self._operator_bridge
             self._embedded_kernel = None
             self._dispatcher = None
             self._run_tracker = None
             self._metadata_writer = None
             self._supervisor = None
+            self._operator_bridge = None
             self._trace_id = None
         # Outside the lock: drain transports first (their stop() is async),
         # then the sync subsystem teardown, then close the sink.
@@ -422,6 +453,7 @@ class Kernel:
             dispatcher=dispatcher,
             metadata_writer=metadata_writer,
             supervisor=supervisor,
+            bridge=bridge,
         )
         self._sink.close()  # end any live event subscribers
 
@@ -430,15 +462,25 @@ class Kernel:
         dispatcher: Optional[CustomMessageDispatcher],
         metadata_writer: Optional[MetadataWriter],
         supervisor: Optional[AgentSupervisor],
+        bridge: Optional[OperatorBridgeServer] = None,
     ) -> None:
         """Best-effort teardown of whatever is wired. Caller holds the
         lifecycle lock. Each step is independently guarded so one failure
         does not strand later cleanup.
 
+        The operator bridge is detached first (transports are already
+        drained): no operator action may spawn, continue or fork an agent
+        while the supervisor is terminating them.
+
         Agents are stopped before the final snapshot so they stop emitting
         into the log first; this is the first teardown path to call
         ``terminate_all`` (no live path does today — see the wiring audit).
         """
+        if bridge is not None:
+            try:
+                bridge.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Kernel.shutdown: operator bridge close raised")
         if supervisor is not None:
             try:
                 supervisor.terminate_all(grace_seconds=self._shutdown_grace)

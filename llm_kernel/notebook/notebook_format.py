@@ -12,6 +12,8 @@ Public API:
 * :func:`magic_to_llmnb` — decode magic text → parsed .llmnb dict.
 * :func:`ipynb_to_llmnb` — Jupyter notebook → .llmnb (one-way; lossy).
 * :func:`llmnb_to_ipynb` — .llmnb → Jupyter notebook (one-way; lossy on provenance).
+* :func:`check_rts_integrity` — RFC-005 load-time integrity checks (F4/F5/F9-F12).
+* :func:`gc_blobs` — RFC-005 manual blob garbage collection.
 
 Rationale — kernel-speaks-magic (PLAN-S5.0.5 §1):
 
@@ -37,9 +39,10 @@ and synthesized fresh on import.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from llm_kernel.text.cell_text import (
     ParserContext,
@@ -56,6 +59,9 @@ __all__ = [
     "magic_to_llmnb",
     "ipynb_to_llmnb",
     "llmnb_to_ipynb",
+    "LlmnbIntegrityError",
+    "check_rts_integrity",
+    "gc_blobs",
 ]
 
 
@@ -447,3 +453,190 @@ def llmnb_to_ipynb(llmnb: dict) -> dict:
         "nbformat": 4,
         "nbformat_minor": 5,
     }
+
+
+# ---------------------------------------------------------------------------
+# metadata.rts integrity (RFC-005 §"Failure modes") and blob GC
+# ---------------------------------------------------------------------------
+
+
+#: ``$blob:`` sentinel prefix (RFC-005 §"metadata.rts.blobs").
+BLOB_SENTINEL_PREFIX = "$blob:"
+
+
+class LlmnbIntegrityError(ValueError):
+    """A ``.llmnb`` file violates an RFC-005 "Reject load" failure mode.
+
+    ``code`` is the RFC-005 failure-mode row (``"F5"``, ``"F9"``,
+    ``"F10"``, ``"F11"``); the message ends with ``(RFC-005 <code>)``.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{message} (RFC-005 {code})")
+        self.code = code
+
+
+def _blob_key(value: Any) -> str | None:
+    """Return ``sha256:<hex>`` for a ``$blob:`` sentinel string, else None."""
+    if isinstance(value, str) and value.startswith(BLOB_SENTINEL_PREFIX):
+        return value[len(BLOB_SENTINEL_PREFIX):]
+    return None
+
+
+def _iter_blob_refs(node: Any) -> Iterator[str]:
+    """Yield every ``$blob:`` sentinel key anywhere under ``node``."""
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from _iter_blob_refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _iter_blob_refs(value)
+    else:
+        key = _blob_key(node)
+        if key is not None:
+            yield key
+
+
+def _replace_missing_blobs(node: Any, blobs: dict, warnings: list[str]) -> None:
+    """F4: swap sentinels whose blob is absent for the RFC placeholder."""
+    if isinstance(node, dict):
+        items = list(node.items())
+    elif isinstance(node, list):
+        items = list(enumerate(node))
+    else:
+        return
+    for k, value in items:
+        key = _blob_key(value)
+        if key is not None and key not in blobs:
+            node[k] = f"(blob missing: {key})"
+            warnings.append(
+                f"F4: file corruption: {key} is missing from "
+                f"metadata.rts.blobs; rendered {node[k]}"
+            )
+        else:
+            _replace_missing_blobs(value, blobs, warnings)
+
+
+def _check_otlp_attributes(attrs: Any, where: str) -> None:
+    """F11: attributes MUST be ``[{key, value: {<AnyValue>}}]``."""
+    if attrs is None:
+        return
+    if not isinstance(attrs, list) or not all(
+        isinstance(a, dict) and isinstance(a.get("key"), str)
+        and isinstance(a.get("value"), dict)
+        for a in attrs
+    ):
+        raise LlmnbIntegrityError(
+            "F11", f"non-conformant OTLP encoding in {where}.attributes",
+        )
+
+
+def check_rts_integrity(rts: dict) -> list[str]:
+    """Apply the RFC-005 load-time integrity checks to ``metadata.rts``.
+
+    Rejections raise :class:`LlmnbIntegrityError`:
+
+    * F5 -- a ``blobs[<key>]`` body is null or its SHA-256 is not ``<key>``.
+    * F9 -- the layout tree carries a duplicate ``id``.
+    * F10 -- an agent-graph edge references a nonexistent node.
+    * F11 -- a run (or run event) uses flat-object attribute encoding.
+
+    Tolerated conditions mutate ``rts`` in place and come back as
+    warning strings:
+
+    * F4 -- a ``$blob:`` sentinel whose key is absent from ``blobs`` is
+      replaced by ``"(blob missing: sha256:<hex>)"``.
+    * F12 -- a numeric ``startTimeUnixNano`` / ``endTimeUnixNano`` is
+      converted to its decimal string.
+    """
+    warnings: list[str] = []
+    blobs = rts.get("blobs")
+    if not isinstance(blobs, dict):
+        blobs = {}
+    for key, entry in blobs.items():
+        # RFC-005 ArtifactRef rows carry ``body``; the metadata writer's
+        # extract_blobs rows carry ``data``.
+        body = entry.get("body", entry.get("data")) if isinstance(entry, dict) else None
+        if not isinstance(body, str):
+            raise LlmnbIntegrityError("F5", f"blob {key} has no body")
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if key != f"sha256:{digest}":
+            raise LlmnbIntegrityError(
+                "F5", f"blob integrity violation: body of {key} hashes to sha256:{digest}",
+            )
+
+    layout = rts.get("layout")
+    tree = layout.get("tree") if isinstance(layout, dict) else None
+    seen: set[Any] = set()
+    stack: list[Any] = [tree]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        nid = node.get("id")
+        if nid in seen:
+            raise LlmnbIntegrityError(
+                "F9", f"tree integrity violation: duplicate layout id {nid!r}",
+            )
+        seen.add(nid)
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(children)
+
+    agents = rts.get("agents")
+    if isinstance(agents, dict):
+        node_ids = {
+            n.get("id") for n in agents.get("nodes") or [] if isinstance(n, dict)
+        }
+        for edge in agents.get("edges") or []:
+            if not isinstance(edge, dict):
+                continue
+            source, target = edge.get("source"), edge.get("target")
+            if source not in node_ids or target not in node_ids:
+                raise LlmnbIntegrityError(
+                    "F10",
+                    f"graph integrity violation: edge {source}→{target} "
+                    f"kind={edge.get('kind')}",
+                )
+
+    event_log = rts.get("event_log")
+    runs = event_log.get("runs") if isinstance(event_log, dict) else None
+    for index, run in enumerate(runs if isinstance(runs, list) else []):
+        if not isinstance(run, dict):
+            continue
+        where = f"event_log.runs[{index}]"
+        _check_otlp_attributes(run.get("attributes"), where)
+        for e_index, event in enumerate(run.get("events") or []):
+            if isinstance(event, dict):
+                _check_otlp_attributes(
+                    event.get("attributes"), f"{where}.events[{e_index}]",
+                )
+        for name in ("startTimeUnixNano", "endTimeUnixNano"):
+            value = run.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                run[name] = str(int(value))
+                warnings.append(
+                    f"F12: {where}.{name} was a JSON number; converted to a string"
+                )
+        _replace_missing_blobs(run, blobs, warnings)
+    return warnings
+
+
+def gc_blobs(llmnb: dict) -> list[str]:
+    """Drop unreferenced entries from ``metadata.rts.blobs`` in place.
+
+    RFC-005 §"Blob garbage collection": mark every ``$blob:`` sentinel
+    reachable from the notebook (``event_log.runs[*]`` and, so a cell
+    output's copy of a span keeps its blob alive, everything else outside
+    the blob table), then sweep the rest. Returns the removed keys, sorted.
+    """
+    rts = _rts_namespace(llmnb)
+    blobs = rts.get("blobs")
+    if not isinstance(blobs, dict) or not blobs:
+        return []
+    reachable = set(_iter_blob_refs({k: v for k, v in rts.items() if k != "blobs"}))
+    reachable.update(_iter_blob_refs(llmnb.get("cells")))
+    removed = sorted(k for k in blobs if k not in reachable)
+    for key in removed:
+        del blobs[key]
+    return removed

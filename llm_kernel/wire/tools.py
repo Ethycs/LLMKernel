@@ -488,15 +488,19 @@ def validate_tool_output(tool_name: str, result: Dict[str, Any]) -> Optional[str
 # meaning before it appears in a marker.
 
 K_CLASS_REGISTRY: Dict[str, Dict[str, str]] = {
-    # S5a -- branch-agent: new_agent_id already exists in supervisor.
+    # S5a -- branch-agent: source has no head, or new_agent_id taken.
     "K21": {
         "name": "cell_directive_invalid_branch_target",
         "fires_in": "agent_supervisor.fork",
         "description": (
-            "The ``new_agent_id`` supplied to ``AgentSupervisor.fork`` "
+            "The branch cannot be created: either the source agent has "
+            "no head turn to branch from (BSP-002 §7 "
+            "``cell_directive_invalid_branch_source``), or the "
+            "``new_agent_id`` supplied to ``AgentSupervisor.fork`` "
             "already exists in the supervisor's agent registry.  Agent "
             "IDs must be unique within a zone.  The operator should "
-            "choose a different ``new_agent_id``."
+            "continue the source agent first or choose a different "
+            "``new_agent_id``."
         ),
     },
     # S5b -- revert-agent.

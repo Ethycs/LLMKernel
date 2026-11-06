@@ -220,6 +220,33 @@ class OperatorBridgeServer:
         else:
             self._dispose_handler = None
 
+    def close(self) -> None:
+        """Detach from the dispatcher and abandon pending round-trips.
+
+        Removes this server's ``operator.action`` route so a stopped
+        kernel no longer acts on operator envelopes, and cancels every
+        ``ask`` / ``clarify`` / ``propose`` / ``request_approval`` still
+        awaiting an ``approval_response`` (their tool calls end instead of
+        waiting out the timeout). Owns no threads. Idempotent.
+        """
+        dispose = self._dispose_handler
+        self._dispose_handler = None
+        if dispose is not None:
+            try:
+                dispose()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("operator bridge: handler dispose raised")
+        with self._pending_lock:
+            pending = list(self._pending_responses.values())
+            self._pending_responses.clear()
+        for future in pending:
+            if future.done():
+                continue
+            try:
+                future.get_loop().call_soon_threadsafe(future.cancel)
+            except RuntimeError:  # loop already closed
+                pass
+
     def _register_mcp_handlers(self) -> None:
         """Register ``list_tools`` and ``call_tool`` handlers.
 
@@ -495,6 +522,9 @@ class OperatorBridgeServer:
           span as ``llmnb.dismissed`` if traceable via correlation_id.
         * ``drift_acknowledged`` — call
           :meth:`MetadataWriter.acknowledge_drift`.
+        * ``agent_branch`` / ``agent_revert`` / ``agent_stop`` — call
+          :meth:`AgentSupervisor.fork` / ``revert`` / ``stop``; a K-class
+          failure is answered with an error ``operator.action`` envelope.
         * Unknown action types — log warning, do not raise (V1.5+
           forward-compat).
         """
@@ -818,6 +848,16 @@ class OperatorBridgeServer:
                     "llmnb.zone_id": self.zone_id,
                 },
             )
+            return
+
+        if action_type in ("agent_branch", "agent_revert", "agent_stop"):
+            # PLAN-S5 §3 step 6 / atoms/protocols/operator-action.md —
+            # the @branch / @revert / @stop line magics. Effects are
+            # acknowledged by the writer's Family F snapshots (fork_agent,
+            # move_agent_head, update_agent_session + the agent_ref_move
+            # event); BSP-002 §7 K20 / K21 / K22 and K42 (malformed
+            # parameters) come back as an error envelope for the cell.
+            self._route_agent_ref_action(action_type, payload, params)
             return
 
         if action_type == "branch_switch":
@@ -1285,6 +1325,149 @@ class OperatorBridgeServer:
                 "failed to emit synthetic agent_spawn error span; agent_id=%s",
                 agent_id,
             )
+
+    #: action_type -> AgentSupervisor method for the S5 ref operations.
+    _AGENT_REF_ACTIONS: Dict[str, str] = {
+        "agent_branch": "fork",
+        "agent_revert": "revert",
+        "agent_stop": "stop",
+    }
+
+    def _route_agent_ref_action(
+        self, action_type: str, payload: Dict[str, Any],
+        params: Dict[str, Any],
+    ) -> None:
+        """Route ``agent_branch`` / ``agent_revert`` / ``agent_stop``.
+
+        Wire shapes per atoms/protocols/operator-action.md:
+
+        * ``agent_branch`` ``{source_agent, at_turn_id?, new_agent_id,
+          cell_id}``. ``source_agent_id`` (the PLAN-S5 §4 /
+          branch-agent atom spelling) is accepted as an alias when
+          ``source_agent`` is absent.
+        * ``agent_revert`` ``{agent_id, target_turn_id, cell_id}``.
+        * ``agent_stop`` ``{agent_id, cell_id}``.
+        """
+        from llm_kernel._internal import _diagnostics
+        cell_id = params.get("cell_id") or payload.get("originating_cell_id")
+        _diagnostics.mark(
+            f"{action_type}_received", cell_id=cell_id,
+        )
+        at_turn_id: Optional[str] = None
+        if action_type == "agent_branch":
+            source = params.get("source_agent")
+            if source is None:
+                source = params.get("source_agent_id")
+            required = {
+                "source_agent": source,
+                "new_agent_id": params.get("new_agent_id"),
+            }
+            at_turn_id = params.get("at_turn_id") or None
+            if at_turn_id is not None and not isinstance(at_turn_id, str):
+                required["at_turn_id"] = None  # reported as invalid below
+        elif action_type == "agent_revert":
+            required = {
+                "agent_id": params.get("agent_id"),
+                "target_turn_id": params.get("target_turn_id"),
+            }
+        else:
+            required = {"agent_id": params.get("agent_id")}
+        invalid = [
+            k for k, v in required.items() if not isinstance(v, str) or not v
+        ]
+        if invalid:
+            # BSP-003 K42: validator-rejected envelope.
+            self._emit_operator_action_error(
+                action_type, cell_id, params, "K42",
+                f"{action_type}: missing or invalid {', '.join(invalid)}",
+            )
+            return
+        supervisor = self._resolve_agent_supervisor()
+        method_name = self._AGENT_REF_ACTIONS[action_type]
+        method = getattr(supervisor, method_name, None)
+        if supervisor is None or not callable(method):
+            logger.warning(
+                "%s received but no AgentSupervisor implementing %s is "
+                "attached", action_type, method_name,
+            )
+            _diagnostics.mark(f"{action_type}_no_supervisor")
+            return
+        try:
+            if action_type == "agent_branch":
+                method(
+                    required["source_agent"], at_turn_id,
+                    required["new_agent_id"],
+                )
+            elif action_type == "agent_revert":
+                method(required["agent_id"], required["target_turn_id"])
+            else:
+                method(required["agent_id"])
+        except Exception as exc:
+            k_code = getattr(exc, "k_code", None)
+            if not isinstance(k_code, str) or not k_code:
+                logger.exception(
+                    "%s: supervisor.%s raised", action_type, method_name,
+                )
+                _diagnostics.mark(f"{action_type}_raised", error=str(exc))
+                return
+            self._emit_operator_action_error(
+                action_type, cell_id, params, k_code, str(exc),
+            )
+            return
+        logger.info(
+            "operator.%s", action_type,
+            extra={
+                "event.name": f"operator.{action_type}",
+                "rfc": "RFC-006",
+                "bsp": "BSP-002",
+                "parameters": params,
+                "llmnb.cell_id": cell_id,
+                "llmnb.agent_id": self.agent_id,
+                "llmnb.zone_id": self.zone_id,
+            },
+        )
+        _diagnostics.mark(f"{action_type}_dispatched", cell_id=cell_id)
+
+    def _emit_operator_action_error(
+        self, action_type: str, cell_id: Optional[str],
+        params: Dict[str, Any], k_code: str, message: str,
+    ) -> None:
+        """Answer a rejected operator action with a K-class envelope.
+
+        Emits ``operator.action`` (kernel→extension) whose payload is
+        ``{action_type, status: "error", k_code, message, cell_id,
+        parameters}`` so the issuing cell's driver can fail that cell
+        with the code. Also logs the K-code like the other handlers.
+        """
+        logger.warning(
+            "%s: %s rejected: %s", action_type, k_code, message,
+            extra={
+                "event.name": f"{action_type}_rejected",
+                "llmnb.k_code": k_code,
+                "llmnb.cell_id": cell_id,
+            },
+        )
+        if self.dispatcher is None:
+            return
+        try:
+            from llm_kernel.capture.run_envelope import (
+                DIRECTION_KERNEL_TO_EXTENSION, make_envelope,
+            )
+            self.dispatcher.emit(make_envelope(
+                "operator.action",
+                {
+                    "action_type": action_type,
+                    "status": "error",
+                    "k_code": k_code,
+                    "message": message,
+                    "cell_id": cell_id,
+                    "parameters": dict(params),
+                },
+                correlation_id=str(uuid.uuid4()),
+                direction=DIRECTION_KERNEL_TO_EXTENSION,
+            ))
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("%s: K-class reply emit raised", action_type)
 
     def _resolve_agent_supervisor(self) -> Optional[Any]:
         """Locate the kernel's AgentSupervisor via the documented surfaces.

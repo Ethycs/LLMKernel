@@ -794,11 +794,28 @@ def test_dual_rep_invariant_atomic_rollback_preserves_pre_state() -> None:
 # ---------------------------------------------------------------------
 
 
+def _seed_turn_with_spans(
+    writer: MetadataWriter,
+    spans: List[Dict[str, Any]],
+    *,
+    cell_id: Optional[str] = "c_src",
+    turn_id: str = "t_1",
+) -> None:
+    """Persist one agent turn carrying ``spans`` (promote_span sources)."""
+    res = writer.submit_intent(_envelope("append_turn", {
+        "id": turn_id, "agent_id": "alpha", "role": "agent",
+        "parent_id": None, "body": "", "cell_id": cell_id, "spans": spans,
+    }, f"seed-turn-{turn_id}"))
+    assert res["applied"], res
+
+
 def test_promote_span_creates_new_cell() -> None:
     """§9 — promote a span; new cell exists with the span as a binding;
     turn list is empty.
     """
     writer = _new_writer()
+    _seed_turn_with_spans(writer, [{"spanId": "sp_42", "name": "agent_emit"}],
+                          cell_id=None)
     result = _apply_commit(writer, [
         {
             "kind": "promote_span",
@@ -814,6 +831,107 @@ def test_promote_span_creates_new_cell() -> None:
     assert rec["bound_span_id"] == "sp_42"
     assert rec["turns"] == []
     assert rec["bound_agent_id"] is None
+
+
+def test_promote_span_rejects_unknown_span() -> None:
+    writer = _new_writer()
+    result = _apply_commit(writer, [
+        {"kind": "promote_span", "span_id": "sp_missing"},
+    ], intent_id="i-prom-unknown")
+    assert result["applied"] is False
+    assert result["error_code"] == "K90"
+    assert result["response"]["details"]["reason"] == "unknown_span"
+
+
+def test_promote_span_infers_kind_per_d7() -> None:
+    writer = _new_writer()
+    _seed_turn_with_spans(writer, [
+        {"spanId": "sp_rc", "name": "report_completion"},
+        {"spanId": "sp_pe", "name": "propose_edit"},
+        {"spanId": "sp_tc", "name": "read_file",
+         "attributes": {"llmnb.run_type": "tool_call"}},
+    ])
+    result = _apply_commit(writer, [
+        {"kind": "promote_span", "span_id": sid, "new_cell_id": f"p_{sid}"}
+        for sid in ("sp_rc", "sp_pe", "sp_tc")
+    ], intent_id="i-prom-d7")
+    assert result["applied"] is True, result
+    cells = writer.snapshot()["cells"]
+    assert cells["p_sp_rc"]["kind"] == "checkpoint"
+    assert cells["p_sp_pe"]["kind"] == "artifact"
+    assert cells["p_sp_tc"]["kind"] == "artifact"
+
+
+def test_promote_span_rejects_half_tool_call() -> None:
+    writer = _new_writer()
+    _seed_turn_with_spans(writer, [
+        {"spanId": "sp_use", "name": "tool_use"},
+        {"spanId": "sp_res", "name": "tool_result"},
+    ])
+    for sid in ("sp_use", "sp_res"):
+        result = _apply_commit(writer, [
+            {"kind": "promote_span", "span_id": sid},
+        ], intent_id=f"i-prom-half-{sid}")
+        assert result["applied"] is False, sid
+        assert result["error_code"] == "K90"
+        assert result["response"]["details"]["reason"] == "tool_call_half"
+
+
+def test_promote_span_defaults_to_source_section_end() -> None:
+    writer = _new_writer()
+    _create_section_with_status(writer, "sec_p", intent_id="i-sec-p")
+    for cid in ("c_src", "c_other"):
+        _seed_cell(writer, cid)
+    _apply_commit(writer, [
+        {"kind": "move_cell", "cell_id": "c_src",
+         "target_section_id": "sec_p", "position": 0},
+        {"kind": "move_cell", "cell_id": "c_other",
+         "target_section_id": "sec_p", "position": 1},
+    ], intent_id="i-sec-p-fill")
+    _seed_turn_with_spans(writer, [{"spanId": "sp_a", "name": "agent_emit"}])
+    result = _apply_commit(writer, [
+        {"kind": "promote_span", "span_id": "sp_a", "new_cell_id": "p_a"},
+    ], intent_id="i-prom-sec")
+    assert result["applied"] is True, result
+    snap = writer.snapshot()
+    assert snap["cells"]["p_a"]["section_id"] == "sec_p"
+    assert snap["zone"]["sections"]["sec_p"]["cell_range"] == [
+        "c_src", "c_other", "p_a",
+    ]
+
+
+def test_promote_span_blocked_while_source_cell_executing() -> None:
+    writer = _new_writer()
+    _seed_cell(writer, "c_src")
+    _seed_turn_with_spans(writer, [{"spanId": "sp_x", "name": "agent_emit"}])
+    writer.set_cell_execution_state("c_src", True)
+    result = _apply_commit(writer, [
+        {"kind": "promote_span", "span_id": "sp_x"},
+    ], intent_id="i-prom-exec")
+    assert result["applied"] is False
+    assert result["error_code"] == "K95"
+    assert result["response"]["details"]["reason"] == "cell_executing"
+
+
+def test_promote_span_section_status_gate() -> None:
+    for status, confirmed, ok in (
+        ("frozen", False, False), ("in_progress", False, False),
+        ("complete", False, False), ("complete", True, True),
+    ):
+        writer = _new_writer()
+        _create_section_with_status(writer, "sec_g", status=status,
+                                    intent_id=f"i-g-{status}")
+        _seed_turn_with_spans(writer, [{"spanId": "sp_g", "name": "agent_emit"}])
+        op = {"kind": "promote_span", "span_id": "sp_g", "section_id": "sec_g"}
+        if confirmed:
+            op["operator_confirmed"] = True
+        result = _apply_commit(writer, [op], intent_id=f"i-prom-g-{status}")
+        assert result["applied"] is ok, (status, confirmed, result)
+        if not ok:
+            assert result["error_code"] == "K95"
+            details = result["response"]["details"]
+            assert details["reason"] == "overlay_section_status_blocks"
+            assert details["current_status"] == status
 
 
 # ---------------------------------------------------------------------

@@ -211,6 +211,9 @@ def apply_commit(
         # The execution-in-flight predicate inspects writer-level
         # state; passing it through is safe because it is read-only.
         "is_cell_executing": state.get("is_cell_executing"),
+        # Read-only span lookup (promote_span) + commit-level confirm.
+        "resolve_span":      state.get("resolve_span"),
+        "operator_confirmed": state.get("operator_confirmed"),
     }
 
     # Validate + apply every op. On the first failure, raise without

@@ -70,6 +70,19 @@ K3L_PRIVILEGED_AGENT_STREAM_MAGIC: str = "K3L"
 AgentState = str  # starting | running | restarting | failed | terminated
 
 
+class AgentOperationError(RuntimeError):
+    """Raised by fork / revert / stop with a BSP-002 §7 K-class code.
+
+    ``k_code`` carries the code (``K20`` / ``K21`` / ``K22``) so the
+    operator-action router can surface it without parsing the message;
+    the message keeps its ``"<code>: ..."`` prefix for log readers.
+    """
+
+    def __init__(self, k_code: str, message: str) -> None:
+        super().__init__(f"{k_code}: {message}")
+        self.k_code: str = k_code
+
+
 class _HandoffCycleError(Exception):
     """Raised when the turn-DAG walker detects a cycle.
 
@@ -225,8 +238,15 @@ class AgentSupervisor:
     # Callers submit append_turn intents to the writer; the missed-turn
     # walk reads the persisted turn arrays directly.
 
-    def _read_persisted_turns(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    def _read_persisted_turns(
+        self, agent_id: Optional[str] = None,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
         """Return (turn_index, notebook_head_id) from the writer snapshot.
+
+        When ``agent_id`` is given the second element is that agent's own
+        head instead: its ``session.head_turn_id`` if set, else its last
+        persisted turn, else None. This is the head the writer's
+        ``move_agent_head`` / ``fork_agent`` validators walk from.
 
         turn_index is keyed on turn-id and carries each persisted turn
         dict, with a content field mirrored from body.
@@ -250,13 +270,23 @@ class AgentSupervisor:
         agents = zone.get("agents") or {}
         index: Dict[str, Dict[str, Any]] = {}
         session_heads: List[str] = []
-        for agent_state in agents.values():
+        agent_head: Optional[str] = None
+        for name, agent_state in agents.items():
             if not isinstance(agent_state, dict):
                 continue
             session = agent_state.get("session") or {}
             sh = session.get("head_turn_id")
             if isinstance(sh, str) and sh:
                 session_heads.append(sh)
+            if agent_id is not None and name == agent_id:
+                own = [
+                    t.get("id") for t in agent_state.get("turns", []) or []
+                    if isinstance(t, dict) and isinstance(t.get("id"), str)
+                ]
+                if isinstance(sh, str) and sh:
+                    agent_head = sh
+                elif own:
+                    agent_head = own[-1]
             for t in agent_state.get("turns", []) or []:
                 if not isinstance(t, dict):
                     continue
@@ -270,6 +300,9 @@ class AgentSupervisor:
                 if "content" not in norm and "body" in norm:
                     norm["content"] = norm["body"]
                 index[tid] = norm
+
+        if agent_id is not None:
+            return index, agent_head
 
         def _key_for(tid: str) -> Tuple[str, str]:
             t = index.get(tid)
@@ -939,6 +972,21 @@ class AgentSupervisor:
             )
             return None, None
 
+        # The writer rejects RunFrames whose executor is not a registered
+        # agent (K42 unknown_executor); register this one in the agent
+        # graph if the graph does not list it yet.
+        try:
+            nodes = writer.apply_agent_graph_command("full_snapshot", {})["nodes"]
+            if not any(n.get("id") == agent_id for n in nodes):
+                writer.apply_agent_graph_command("upsert_node", {
+                    "node": {"id": agent_id, "type": "agent", "properties": {}},
+                })
+        except Exception:  # pragma: no cover — writer errors are best-effort
+            _diagnostics.mark(
+                "send_user_turn_register_executor_failed",
+                agent_id=agent_id, cell_id=cell_id,
+            )
+
         run_id = uuid.uuid4().hex
         started_at = self._runframe_now_iso()
         try:
@@ -1393,16 +1441,17 @@ class AgentSupervisor:
         with self._lock:
             handle = self._agents.get(agent_id)
             if handle is None:
-                raise RuntimeError(
-                    f"K20: agent {agent_id!r} not found in supervisor. "
-                    "Spawn or respawn the agent before calling revert."
+                raise AgentOperationError(
+                    "K20",
+                    f"agent {agent_id!r} not found in supervisor. "
+                    "Spawn or respawn the agent before calling revert.",
                 )
 
             # --- ancestry walk -----------------------------------------
             # Read the persisted turn graph and walk parent_id from the
-            # notebook head back through the union of all agents' chains
-            # looking for target_turn_id.
-            turn_index, current_head = self._read_persisted_turns()
+            # agent's own head back through the union of all agents'
+            # chains looking for target_turn_id.
+            turn_index, current_head = self._read_persisted_turns(agent_id)
             found = False
             visited: set = set()
             cursor = current_head
@@ -1421,11 +1470,11 @@ class AgentSupervisor:
                 depth += 1
 
             if not found:
-                raise RuntimeError(
-                    f"{self.K22_INVALID_REVERT_TARGET}: "
+                raise AgentOperationError(
+                    self.K22_INVALID_REVERT_TARGET,
                     f"turn {target_turn_id!r} is not in agent "
                     f"{agent_id!r}'s ancestry.  Use @branch to reach a "
-                    "turn outside this agent's lineage."
+                    "turn outside this agent's lineage.",
                 )
 
             prior_head = current_head
@@ -1526,9 +1575,10 @@ class AgentSupervisor:
         with self._lock:
             handle = self._agents.get(agent_id)
             if handle is None:
-                raise RuntimeError(
-                    f"K20: agent {agent_id!r} not found in supervisor. "
-                    "Spawn or respawn the agent before calling stop."
+                raise AgentOperationError(
+                    "K20",
+                    f"agent {agent_id!r} not found in supervisor. "
+                    "Spawn or respawn the agent before calling stop.",
                 )
 
             # --- idempotency guard: already idle / exited ---------------
@@ -1586,7 +1636,8 @@ class AgentSupervisor:
     # Branch / fork operation
     # ------------------------------------------------------------------
 
-    # Error code for an invalid branch target (new_agent_id already exists).
+    # Error code for an invalid branch: new_agent_id already exists, or
+    # the source agent has no head turn to branch from.
     K21_INVALID_BRANCH_TARGET: str = "K21"
 
     def fork(
@@ -1640,21 +1691,31 @@ class AgentSupervisor:
             # --- validate source exists --------------------------------
             source_handle = self._agents.get(source_agent_id)
             if source_handle is None:
-                raise RuntimeError(
-                    f"K20: source agent {source_agent_id!r} not found in "
-                    "supervisor.  Spawn the source agent before branching."
+                raise AgentOperationError(
+                    "K20",
+                    f"source agent {source_agent_id!r} not found in "
+                    "supervisor.  Spawn the source agent before branching.",
                 )
 
             # --- validate new_agent_id is unique -----------------------
             if new_agent_id in self._agents:
-                raise RuntimeError(
-                    f"{self.K21_INVALID_BRANCH_TARGET}: "
+                raise AgentOperationError(
+                    self.K21_INVALID_BRANCH_TARGET,
                     f"new_agent_id {new_agent_id!r} already exists in "
-                    "supervisor.  Choose a different new_agent_id."
+                    "supervisor.  Choose a different new_agent_id.",
                 )
 
             # --- resolve effective branch point ------------------------
-            turn_index, source_head = self._read_persisted_turns()
+            # Ancestry is the source agent's own lineage, walked from its
+            # head (not the notebook head, which may be another agent's).
+            turn_index, source_head = self._read_persisted_turns(source_agent_id)
+            if source_head is None:
+                # BSP-002 §7 K21 cell_directive_invalid_branch_source.
+                raise AgentOperationError(
+                    self.K21_INVALID_BRANCH_TARGET,
+                    f"source agent {source_agent_id!r} has no head turn "
+                    "to branch from.  Continue the source agent first.",
+                )
 
             # Determine Case A vs Case B.
             # Case A: at_turn_id is None OR equals the source's current head.
@@ -1681,11 +1742,11 @@ class AgentSupervisor:
                     depth += 1
 
                 if not found:
-                    raise RuntimeError(
-                        f"{self.K22_INVALID_REVERT_TARGET}: "
+                    raise AgentOperationError(
+                        self.K22_INVALID_REVERT_TARGET,
                         f"turn {at_turn_id!r} is not in agent "
                         f"{source_agent_id!r}'s ancestry.  Use a turn "
-                        "reachable via parent_id walk from the source head."
+                        "reachable via parent_id walk from the source head.",
                     )
                 branch_turn_id = at_turn_id
                 case = "B"
