@@ -311,10 +311,15 @@ class Kernel:
                 dispatcher = CustomMessageDispatcher(kernel)
                 dispatcher.start()
 
-                trace_id = uuid.uuid4().hex
+                trace_id = (
+                    self._config.get("trace_id")
+                    or os.environ.get("LLMKERNEL_RUN_TRACE_ID")
+                    or uuid.uuid4().hex
+                )
                 run_tracker = RunTracker(
                     trace_id=trace_id, sink=dispatcher,
-                    agent_id=_DEFAULT_AGENT_ID, zone_id=_DEFAULT_ZONE_ID,
+                    agent_id=os.environ.get("LLMKERNEL_AGENT_ID", _DEFAULT_AGENT_ID),
+                    zone_id=os.environ.get("LLMKERNEL_ZONE_ID", _DEFAULT_ZONE_ID),
                 )
                 metadata_writer = MetadataWriter(
                     dispatcher=dispatcher, run_tracker=run_tracker,
@@ -433,6 +438,52 @@ class Kernel:
 
     async def __aexit__(self, *_exc: Any) -> None:
         await self.shutdown()
+
+    # -- transport-adapter surface (facade commits 6-8) -----------------
+    #
+    # The process entry points (pty-mode, serve, the uvicorn app) are
+    # consumers of the facade: they create one Kernel, hand it their
+    # transport-supplied egress and bind their transport. Their adapters
+    # need the wired subsystems to attach transport-specific collaborators
+    # (shutdown events, volatile-state providers, proxy run-trackers).
+    # These accessors are read-only and raise until start() has run; they
+    # are not a license to re-wire the subsystems from outside.
+
+    @property
+    def started(self) -> bool:
+        """True between a successful :meth:`start` and :meth:`shutdown`."""
+        return self._started
+
+    @property
+    def workdir(self) -> Path:
+        return self._workdir
+
+    @property
+    def trace_id(self) -> Optional[str]:
+        """The run-tracker trace id of the current run (None when stopped)."""
+        return self._trace_id
+
+    @property
+    def dispatcher(self) -> CustomMessageDispatcher:
+        self._require_started()
+        assert self._dispatcher is not None
+        return self._dispatcher
+
+    @property
+    def run_tracker(self) -> RunTracker:
+        self._require_started()
+        assert self._run_tracker is not None
+        return self._run_tracker
+
+    @property
+    def metadata_writer(self) -> MetadataWriter:
+        self._require_started()
+        assert self._metadata_writer is not None
+        return self._metadata_writer
+
+    @property
+    def supervisor(self) -> AgentSupervisor:
+        return self._require_started()
 
     # -- public delegators (facade commit 3) ----------------------------
 
