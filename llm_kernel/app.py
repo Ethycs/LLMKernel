@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request
 from llm_kernel._internal import _diagnostics
 from llm_kernel.kernel_facade import Kernel
 from llm_kernel.transports import pty_mode
+from llm_kernel.wire import versions as _versions
 
 
 @asynccontextmanager
@@ -74,7 +75,7 @@ async def lifespan(app: FastAPI):
         _diagnostics.mark("app_lifespan_shutdown_done")
 
 
-app = FastAPI(lifespan=lifespan, title="LLMKernel", version="1.0.0")
+app = FastAPI(lifespan=lifespan, title="LLMKernel", version=_versions.KERNEL_VERSION)
 
 
 @app.get("/health")
@@ -90,5 +91,5 @@ def health(request: Request) -> Dict[str, Any]:
         "kernel_session_id": (
             getattr(request.app.state, "session_id", None) if attached else None
         ),
-        "kernel_version": getattr(pty_mode, "KERNEL_VERSION", "unknown"),
+        "kernel_version": _versions.KERNEL_VERSION,
     }

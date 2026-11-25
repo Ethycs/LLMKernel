@@ -48,18 +48,31 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from llm_kernel.wire import WIRE_MAJOR, WIRE_VERSION
+from llm_kernel.wire import versions as _versions
 
 logger: logging.Logger = logging.getLogger("llm_kernel.transports.serve_mode")
 
 
-#: Kernel package version emitted in handshake responses.
-KERNEL_VERSION: str = "1.0.0"
+#: ``KERNEL_VERSION``, ``KERNEL_CAPABILITIES``, ``WIRE_VERSION`` and
+#: ``WIRE_MAJOR`` are forwarded from the single source
+#: :mod:`llm_kernel.wire.versions` via ``__getattr__`` below, so they
+#: stay importable from here and always reflect the live source.  The
+#: handshake builders and the validator read ``_versions.*`` at call
+#: time; this module holds no copy of any version value.
+_FORWARDED_VERSION_NAMES: Dict[str, Callable[[], Any]] = {
+    "KERNEL_VERSION": lambda: _versions.KERNEL_VERSION,
+    "KERNEL_CAPABILITIES": lambda: _versions.KERNEL_CAPABILITIES,
+    "WIRE_VERSION": lambda: _versions.WIRE_VERSION,
+    "WIRE_MAJOR": lambda: _versions.semver_major(_versions.WIRE_VERSION),
+}
 
-#: Capabilities the V1 kernel advertises in handshake responses.
-KERNEL_CAPABILITIES: List[str] = [
-    "family_a", "family_b", "family_c", "family_f", "family_g",
-]
+
+def __getattr__(name: str) -> Any:
+    try:
+        getter = _FORWARDED_VERSION_NAMES[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    return getter()
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +198,8 @@ def _handshake_error(
 ) -> None:
     """Send a handshake response carrying an error code and close the socket."""
     payload: Dict[str, Any] = {
-        "wire_version": WIRE_VERSION,
-        "kernel_version": KERNEL_VERSION,
+        "wire_version": _versions.WIRE_VERSION,
+        "kernel_version": _versions.KERNEL_VERSION,
         "error": error_code,
     }
     if extra:
@@ -199,10 +212,10 @@ def _handshake_response(
 ) -> Dict[str, Any]:
     """Build a successful handshake response envelope."""
     payload: Dict[str, Any] = {
-        "kernel_version": KERNEL_VERSION,
-        "wire_version": WIRE_VERSION,
+        "kernel_version": _versions.KERNEL_VERSION,
+        "wire_version": _versions.WIRE_VERSION,
         "session_id": session_id,
-        "accepted_capabilities": list(KERNEL_CAPABILITIES),
+        "accepted_capabilities": _versions.kernel_capabilities(),
     }
     if warnings:
         payload["warnings"] = warnings
@@ -233,10 +246,10 @@ def _validate_handshake(
         client_major = int(client_wire.split(".", 1)[0])
     except (ValueError, IndexError):
         return ("wire-failure", [])
-    if client_major != WIRE_MAJOR:
+    if client_major != _versions.semver_major(_versions.WIRE_VERSION):
         return ("version_mismatch_major", [])
     warnings: List[str] = []
-    if client_wire != WIRE_VERSION:
+    if client_wire != _versions.WIRE_VERSION:
         warnings.append("minor_version_skew")
 
     # Auth check (TCP only -- this serve mode is TCP-exclusive).
@@ -318,9 +331,21 @@ def _boot_kernel_for_serve(
         loop.call_soon_threadsafe(loop.stop)
         loop_thread.join(timeout=5.0)
         raise
+    # The facade's start() wired and started the dispatcher, the metadata
+    # writer, the agent supervisor and the drift detector; the hydrate
+    # handler (RFC-006 §8/§9) therefore runs over TCP exactly as it does
+    # in pty-mode. The connection handler and the teardown reach them
+    # through the facade's read-only accessors.
     dispatcher = kernel.dispatcher
     tracker = kernel.run_tracker
+    metadata_writer = kernel.metadata_writer
+    supervisor = kernel.supervisor
     session_id = kernel.trace_id or str(uuid.uuid4())
+    # Drift is measured against the single source's provider in every
+    # start path; serve registers the same function object the facade,
+    # pty-mode, the app and the legacy kernel register.
+    if hasattr(dispatcher, "set_current_volatile_provider"):
+        dispatcher.set_current_volatile_provider(_versions.current_volatile)
     # Optional proxy lifecycle. Most external-driver use cases supply
     # their own proxy out-of-band; default 'none' keeps the serve
     # surface minimal.
@@ -342,6 +367,8 @@ def _boot_kernel_for_serve(
         "kernel": kernel,
         "dispatcher": dispatcher,
         "tracker": tracker,
+        "metadata_writer": metadata_writer,
+        "supervisor": supervisor,
         "server": server,
         "session_id": session_id,
         "loop": loop,
@@ -351,7 +378,8 @@ def _boot_kernel_for_serve(
 
 def _teardown_serve_kernel(state: Dict[str, Any]) -> None:
     """Stop what :func:`_boot_kernel_for_serve` started: proxy first (it
-    emits into the run tracker), then the facade, then its loop."""
+    emits into the run tracker), then the facade (whose shutdown stops the
+    metadata writer, the supervisor and the dispatcher), then its loop."""
     server = state.get("server")
     if server is not None:
         try:
@@ -617,9 +645,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     actual_host, actual_port = listener.getsockname()[:2]
     sys.stderr.write(
-        f"llm_kernel serve v{KERNEL_VERSION}; "
+        f"llm_kernel serve v{_versions.KERNEL_VERSION}; "
         f"listening on {actual_host}:{actual_port}; "
-        f"wire_version={WIRE_VERSION}\n"
+        f"wire_version={_versions.WIRE_VERSION}\n"
     )
     sys.stderr.flush()
 

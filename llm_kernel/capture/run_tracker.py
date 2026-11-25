@@ -35,7 +35,8 @@ from typing import Any, Dict, Iterator, List, Literal, Optional, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from llm_kernel._internal._attrs import decode_attrs, encode_attrs
-from llm_kernel.capture.run_envelope import RFC003_VERSION, make_envelope, validate_envelope
+from llm_kernel.capture import run_envelope as _run_envelope
+from llm_kernel.capture.run_envelope import make_envelope, validate_envelope
 
 logger: logging.Logger = logging.getLogger("llm_kernel.capture.run_tracker")
 
@@ -458,8 +459,17 @@ class RunTracker:
                 "run-tracker sink raised; envelope dropped",
                 extra={"message_type": envelope.get("message_type"),
                     "correlation_id": envelope.get("correlation_id"),
-                    "rfc_version": RFC003_VERSION},
+                    "rfc_version": _run_envelope.RFC003_VERSION},
             )
+
+
+def __getattr__(name: str) -> Any:
+    # ``RFC003_VERSION`` used to be re-exported from here; keep it
+    # importable, forwarded live from ``run_envelope`` (and thus from the
+    # single source ``llm_kernel.wire.versions``).
+    if name == "RFC003_VERSION":
+        return _run_envelope.RFC003_VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

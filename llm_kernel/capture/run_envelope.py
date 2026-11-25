@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Optional
 
+from llm_kernel.wire import versions as _versions
+
 #: Lowercase-hex regex used to recognize OTLP span ids (16 hex chars,
 #: 8 bytes) and trace ids (32 hex chars, 16 bytes).  ``correlation_id``
 #: accepts either of these or a UUIDv4 string for backward-compat with
@@ -20,8 +22,16 @@ from typing import Any, Dict, FrozenSet, Optional
 _HEX_ID_RE: re.Pattern[str] = re.compile(r"^[0-9a-f]{16}$|^[0-9a-f]{32}$")
 
 #: RFC-003 semver this module emits and accepts; receivers MUST reject
-#: envelopes whose major version differs.
-RFC003_VERSION: str = "1.0.0"
+#: envelopes whose major version differs.  ``RFC003_VERSION`` is forwarded
+#: from the single source (``llm_kernel.wire.versions.rfc_version(3)``)
+#: via ``__getattr__`` below; :func:`make_envelope` resolves it at call
+#: time rather than freezing it into a default argument.
+
+
+def __getattr__(name: str) -> Any:
+    if name == "RFC003_VERSION":
+        return _versions.rfc_version(3)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 #: Direction string for kernel-emitted envelopes.
 DIRECTION_KERNEL_TO_EXTENSION: str = "kernel→extension"
@@ -77,14 +87,17 @@ def make_envelope(
     correlation_id: str,
     direction: str = DIRECTION_KERNEL_TO_EXTENSION,
     timestamp: Optional[str] = None,
-    rfc_version: str = RFC003_VERSION,
+    rfc_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build an RFC-003 envelope with the canonical defaults.
 
     ``message_type`` MUST be one of :data:`RFC003_MESSAGE_TYPES`.
     ``correlation_id`` is a UUIDv4 string (the ``run_id`` for Family A).
+    ``rfc_version`` defaults (``None``) to the live :data:`RFC003_VERSION`.
     Payload validity is the caller's responsibility.
     """
+    if rfc_version is None:
+        rfc_version = _versions.rfc_version(3)
     return {
         "message_type": message_type,
         "direction": direction,

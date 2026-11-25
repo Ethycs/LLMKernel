@@ -1,4 +1,4 @@
-"""RFC-001 v1.0.0 tool input/output JSON Schemas — public wire surface.
+"""RFC-001 tool input/output JSON Schemas — public wire surface.
 
 Promoted from ``llm_kernel._internal._rfc_schemas`` (private) to
 ``llm_kernel.wire.tools`` (public) in S5.0.3a.  All content is
@@ -15,7 +15,8 @@ in :mod:`llm_kernel.mcp.mcp_server` registers these as the ``inputSchema`` /
 Per RFC-001 common conventions, every schema sets
 ``$schema = "https://json-schema.org/draft/2020-12/schema"``,
 ``additionalProperties = False``, and includes the optional
-``_rfc_version`` field defaulting to ``"1.0.0"``.  Section anchors below
+``_rfc_version`` field defaulting to the RFC-001 version in
+:mod:`llm_kernel.wire.versions`.  Section anchors below
 (``# RFC-001 §...``) point at the headings in the RFC where each schema
 was lifted from.
 """
@@ -25,10 +26,13 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, Optional, Tuple
 
+from llm_kernel.wire import versions as _versions
+
 JSONSchema = Dict[str, Any]
 
 _DRAFT: str = "https://json-schema.org/draft/2020-12/schema"
-_VER: Dict[str, Any] = {"type": "string", "default": "1.0.0"}
+# ``default`` is the RFC-001 implementation version from the single source.
+_VER: Dict[str, Any] = {"type": "string", "default": _versions.rfc_version(1)}
 _RID: Dict[str, str] = {"type": "string", "format": "uuid"}
 _VS: Dict[str, str] = {"type": "string"}
 

@@ -13,13 +13,14 @@ def read_readme():
             return f.read()
     return "LLM Jupyter Kernel with Context Management"
 
-# Read version from __init__.py
+# Read the package version from its single source, llm_kernel/wire/versions.py
+# (llm_kernel.__version__ derives from it at import time).
 def get_version():
-    init_path = os.path.join('llm_kernel', '__init__.py')
-    with open(init_path, 'r') as f:
+    versions_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'llm_kernel', 'wire', 'versions.py')
+    with open(versions_path, 'r', encoding='utf-8') as f:
         for line in f:
-            if line.startswith('__version__'):
-                return line.split('=')[1].strip().strip('"\'')
+            if line.startswith('PACKAGE_VERSION'):
+                return line.split('=', 1)[1].strip().strip('"\'')
     return '0.1.0'
 
 setup(

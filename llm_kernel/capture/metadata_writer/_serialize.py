@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Iterable, List, Optional
 
 from llm_kernel.capture import overlay_applier as _overlay_applier
 from llm_kernel.capture.overlay_applier import OverlayRejected as _OverlayRejected
+from llm_kernel.wire import versions as _versions
 
 if TYPE_CHECKING:  # pragma: no cover
     from llm_kernel.capture.custom_messages import CustomMessageDispatcher
@@ -24,8 +25,17 @@ logger: logging.Logger = logging.getLogger("llm_kernel.capture.metadata_writer")
 
 #: RFC-005 schema version this writer emits.  Receivers MUST reject any
 #: snapshot whose major differs (RFC-005 §"Top-level structure" /
-#: RFC-006 W7).
-SCHEMA_VERSION: str = "1.0.0"
+#: RFC-006 W7).  ``SCHEMA_VERSION`` is forwarded from the single source
+#: :mod:`llm_kernel.wire.versions` via ``__getattr__`` below (and again
+#: by the ``metadata_writer`` package), so it stays importable from both
+#: places while always reflecting the live source.  It is deliberately
+#: absent from ``__all__`` so the star-imports do not snapshot a copy.
+
+
+def __getattr__(name: str) -> Any:
+    if name == "SCHEMA_VERSION":
+        return _versions.SCHEMA_VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 #: Schema URI per RFC-005 §"Top-level structure"; SHOULD point at the
 #: published JSON-Schema for this version.
@@ -461,7 +471,6 @@ def _utc_now_iso() -> str:
 
 __all__ = [
     "logger",
-    "SCHEMA_VERSION",
     "SCHEMA_URI",
     "DEFAULT_BLOB_THRESHOLD_BYTES",
     "DEFAULT_EVENT_LOG_QUEUE_CAP",

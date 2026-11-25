@@ -5,7 +5,9 @@ A Jupyter kernel that uses LiteLLM for multi-provider LLM access with intelligen
 context window management based on cell execution order and dependencies.
 """
 
-__version__ = "0.1.0"
+from llm_kernel.wire import versions as _versions
+
+__version__ = _versions.PACKAGE_VERSION
 __author__ = "LLM Kernel Team"
 
 # Embeddable facade — the public library entry point.

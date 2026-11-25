@@ -24,6 +24,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from llm_kernel.wire import versions as _versions
+
 if TYPE_CHECKING:  # pragma: no cover
     from llm_kernel.capture.run_tracker import RunTracker  # type: ignore[import-not-found]
 
@@ -91,7 +93,10 @@ class LiteLLMProxyServer:
 
     def _build_app(self) -> FastAPI:
         """Construct the FastAPI app with the two RFC-002 routes."""
-        app = FastAPI(title="llm_kernel.providers.litellm_proxy", version="1.0.0")
+        app = FastAPI(
+            title="llm_kernel.providers.litellm_proxy",
+            version=_versions.KERNEL_VERSION,
+        )
 
         @app.on_event("startup")
         async def _on_startup() -> None:  # pragma: no cover

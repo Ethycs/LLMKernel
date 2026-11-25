@@ -42,6 +42,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
 
+from llm_kernel.wire import versions as _versions
+
 from llm_kernel.capture.run_envelope import (
     DIRECTION_KERNEL_TO_EXTENSION, RFC003_MESSAGE_TYPES, make_envelope,
     validate_envelope,
@@ -56,7 +58,7 @@ logger: logging.Logger = logging.getLogger("llm_kernel.capture.custom_messages")
 #: ``MessageRouter``) MUST attach a Comm with this exact ``target_name``
 #: per RFC-006 §2; mismatched majors fail at Comm-open time, which is
 #: the version-rejection mechanism the v2 supersession promises.
-DEFAULT_COMM_TARGET: str = "llmnb.rts.v2"
+DEFAULT_COMM_TARGET: str = _versions.COMM_TARGET
 #: MIME for the OTLP run payload (RFC-006 §1).
 MIME_RUN: str = "application/vnd.rts.run+json"
 #: Legacy v1 envelope MIME.  RFC-006 §1 "Conformance during transition"

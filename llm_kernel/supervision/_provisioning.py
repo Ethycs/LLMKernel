@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
+from llm_kernel.wire import versions as _versions
+
 logger: logging.Logger = logging.getLogger("llm_kernel.supervision._provisioning")
 
 #: Canonical embedded marker on the system-prompt template. Format:
@@ -31,7 +33,7 @@ SYSTEM_PROMPT_TEMPLATE_VERSION_RE: re.Pattern[str] = re.compile(
 #:   - major differs -> refuse spawn (``provisioning.template.version_mismatch``)
 #:   - minor differs -> warn-and-proceed
 #:   - patch differs -> proceed silently
-EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION: str = "1.0.0"
+EXPECTED_SYSTEM_PROMPT_TEMPLATE_VERSION: str = _versions.SYSTEM_PROMPT_TEMPLATE_VERSION
 
 #: RFC-001 v1.0.0 13-tool catalog in the canonical order RFC-002
 #: §"MCP config JSON layout" mandates.

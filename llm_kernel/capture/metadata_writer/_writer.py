@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from llm_kernel.capture.run_tracker import RunTracker
 
 from llm_kernel.capture.metadata_writer._serialize import *  # noqa: F401,F403
+from llm_kernel.wire import versions as _versions
 
 
 # MetadataWriter
@@ -3671,7 +3672,7 @@ class MetadataWriter:
                 "hydrate: schema_version must be a string"
             )
         major = sv.split(".", 1)[0] if sv else ""
-        expected_major = SCHEMA_VERSION.split(".", 1)[0]
+        expected_major = _versions.SCHEMA_VERSION.split(".", 1)[0]
         if major != expected_major:
             raise ValueError(
                 f"hydrate: schema_version major {major!r} does not match "
@@ -3948,7 +3949,7 @@ class MetadataWriter:
             self._snapshot_version += 1
 
             snapshot_out: Dict[str, Any] = {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": _versions.SCHEMA_VERSION,
                 "schema_uri": SCHEMA_URI,
                 "session_id": self._session_id,
                 "created_at": self._created_at,
