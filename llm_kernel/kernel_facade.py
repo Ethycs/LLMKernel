@@ -39,12 +39,13 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
-from llm_kernel._kernel_hooks import _DEFAULT_LITELLM_ENDPOINT
+from llm_kernel._kernel_hooks import _DEFAULT_LITELLM_ENDPOINT, wire_magic_defense
 from llm_kernel.capture.custom_messages import CustomMessageDispatcher
 from llm_kernel.wire import versions as _versions
 from llm_kernel.capture.drift_detector import DriftDetector
 from llm_kernel.capture.metadata_writer import MetadataWriter
 from llm_kernel.capture.run_tracker import RunTracker
+from llm_kernel.mcp.mcp_server import OperatorBridgeServer
 from llm_kernel.supervision.agent_supervisor import AgentSupervisor
 
 logger: logging.Logger = logging.getLogger("llm_kernel.kernel_facade")
@@ -228,6 +229,24 @@ class _EmbeddedKernel:
 # ---------------------------------------------------------------------------
 
 
+def _socket_writer_of(shell: Any) -> Optional[Any]:
+    """Return the transport ``SocketWriter`` behind a kernel-shaped shell.
+
+    The pty transport's ``_PtyKernel`` keeps its writer on the session
+    (``shell.session._writer``); a transport may also expose it directly.
+    Only an object with ``set_hash_mode_provider`` qualifies, so the
+    embedded sink (no wire) yields ``None`` and no sanitizer is wired.
+    """
+    for holder in (shell, getattr(shell, "session", None)):
+        for attr in ("_writer", "writer", "socket_writer"):
+            candidate = getattr(holder, attr, None)
+            if candidate is not None and callable(
+                getattr(candidate, "set_hash_mode_provider", None)
+            ):
+                return candidate
+    return None
+
+
 class Kernel:
     """Embeddable LLMKernel facade.
 
@@ -277,6 +296,7 @@ class Kernel:
         self._run_tracker: Optional[RunTracker] = None
         self._metadata_writer: Optional[MetadataWriter] = None
         self._supervisor: Optional[AgentSupervisor] = None
+        self._bridge: Optional[OperatorBridgeServer] = None
         self._transports: List[Any] = []
         self._trace_id: Optional[str] = None
         self._started: bool = False
@@ -317,10 +337,11 @@ class Kernel:
                     or os.environ.get("LLMKERNEL_RUN_TRACE_ID")
                     or uuid.uuid4().hex
                 )
+                agent_id = os.environ.get("LLMKERNEL_AGENT_ID", _DEFAULT_AGENT_ID)
+                zone_id = os.environ.get("LLMKERNEL_ZONE_ID", _DEFAULT_ZONE_ID)
                 run_tracker = RunTracker(
                     trace_id=trace_id, sink=dispatcher,
-                    agent_id=os.environ.get("LLMKERNEL_AGENT_ID", _DEFAULT_AGENT_ID),
-                    zone_id=os.environ.get("LLMKERNEL_ZONE_ID", _DEFAULT_ZONE_ID),
+                    agent_id=agent_id, zone_id=zone_id,
                 )
                 metadata_writer = MetadataWriter(
                     dispatcher=dispatcher, run_tracker=run_tracker,
@@ -344,6 +365,29 @@ class Kernel:
                 dispatcher.set_agent_supervisor(supervisor)
                 dispatcher.set_drift_detector(DriftDetector())
                 dispatcher.set_current_volatile_provider(_versions.current_volatile)
+                # PLAN-S5.0.1: the contamination detector flags cells
+                # through the writer, and a transport-supplied socket
+                # writer sanitizes hashed magics on the wire.
+                wire_magic_defense(
+                    supervisor=supervisor, metadata_writer=metadata_writer,
+                    socket_writer=_socket_writer_of(self._kernel_shell),
+                )
+                # RFC-006 §6 Family D: the kernel consumes ``operator.action``
+                # (agent_spawn, approval_response, drift_acknowledged and the
+                # PLAN-S5.0.4 grant / revoke / promote intents) through the
+                # OperatorBridgeServer, which registers that handler on the
+                # dispatcher. Built and cross-wired exactly as
+                # ``attach_kernel_subsystems`` does, so the entry points that
+                # consume the facade keep the operator's in-session intents
+                # -- the only way a hydrated notebook's quarantined grants
+                # become effective again.
+                bridge = OperatorBridgeServer(
+                    agent_id=agent_id, zone_id=zone_id, trace_id=trace_id,
+                    run_tracker=run_tracker, dispatcher=dispatcher,
+                )
+                bridge.kernel = kernel
+                bridge.agent_supervisor = supervisor
+                bridge.metadata_writer = metadata_writer
             except Exception as exc:
                 # Best-effort partial teardown so a failed start leaves no
                 # autosave / heartbeat threads running.
@@ -359,6 +403,7 @@ class Kernel:
             self._run_tracker = run_tracker
             self._metadata_writer = metadata_writer
             self._supervisor = supervisor
+            self._bridge = bridge
             self._trace_id = trace_id
             self._started = True
 
@@ -380,6 +425,8 @@ class Kernel:
             dispatcher = self._dispatcher
             metadata_writer = self._metadata_writer
             supervisor = self._supervisor
+            bridge = self._bridge
+            self._bridge = None
             self._embedded_kernel = None
             self._dispatcher = None
             self._run_tracker = None
@@ -393,6 +440,12 @@ class Kernel:
                 await transport.stop()
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Kernel.shutdown: transport stop raised")
+        dispose = getattr(bridge, "_dispose_handler", None)
+        if callable(dispose):
+            try:
+                dispose()  # stop routing operator.action to this run's bridge
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Kernel.shutdown: bridge handler dispose raised")
         self._teardown_locked(
             dispatcher=dispatcher,
             metadata_writer=metadata_writer,

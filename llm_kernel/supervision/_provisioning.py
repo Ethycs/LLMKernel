@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
+from llm_kernel.text.magic_hash import OPERATOR_PIN_ENV_VAR
 from llm_kernel.wire import versions as _versions
 
 logger: logging.Logger = logging.getLogger("llm_kernel.supervision._provisioning")
@@ -358,6 +359,9 @@ def build_env(
         env: Dict[str, str] = dict(parent_env)
     else:
         env = {k: v for k, v in parent_env.items() if not is_secret_var(k)}
+    # The operator pin is kernel-process-local in EVERY mode: an agent
+    # holding it could forge hashed magics (PLAN-S5.0.1 §3.1).
+    env.pop(OPERATOR_PIN_ENV_VAR, None)
     env.update({
         "ANTHROPIC_API_KEY": api_key,
         "CLAUDE_CODE_MCP_CONFIG": str(mcp_config_path),

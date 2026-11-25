@@ -40,16 +40,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import re
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Mapping, Optional, Tuple
 
 
 __all__ = (
     "HASHED_MAGIC_LINE",
     "PLAIN_MAGIC_LINE",
     "FINGERPRINT_SALT",
+    "OPERATOR_PIN_ENV_VAR",
     "magic_hash",
     "magic_pin_fingerprint",
+    "resolve_operator_pin",
     "looks_like_hashed_magic",
     "looks_like_plain_magic",
     "validate_hashed_magic",
@@ -66,6 +69,12 @@ __all__ = (
 #: so any operator who re-enters the same pin reproduces the same
 #: fingerprint without leaking the pin.
 FINGERPRINT_SALT: bytes = b"llmnb-v1-pin"
+
+#: Environment variable carrying the operator pin in V1 (``@auth set``
+#: writes it; ``resolve_operator_pin`` reads it). The pin is process-
+#: local to the kernel: ``build_env`` / ``run_command`` strip it before
+#: any agent or proxied child inherits the environment.
+OPERATOR_PIN_ENV_VAR: str = "LLMNB_OPERATOR_PIN"
 
 
 #: Canonical hashed-magic line shape per PLAN §3.1. Matches both the
@@ -125,6 +134,32 @@ def magic_pin_fingerprint(pin: str) -> str:
     if not isinstance(pin, str):
         raise TypeError(f"pin must be a str; got {type(pin).__name__}")
     return hashlib.sha256(FINGERPRINT_SALT + pin.encode("utf-8")).hexdigest()[:16]
+
+
+def resolve_operator_pin(
+    fingerprint: Optional[str],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Return the env pin iff its fingerprint equals ``fingerprint``.
+
+    The notebook never stores the pin, only ``magic_pin_fingerprint``;
+    the live pin arrives via :data:`OPERATOR_PIN_ENV_VAR`. A pin that
+    does not reproduce the stored fingerprint is NOT the operator's pin
+    for this notebook (stale shell export, wrong session, or an
+    attacker-seeded fingerprint) and must never validate a hashed
+    magic, so this returns ``None`` for it. Also ``None`` when either
+    side is missing/empty. ``env`` defaults to ``os.environ``.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    pin = source.get(OPERATOR_PIN_ENV_VAR)
+    if not isinstance(pin, str) or not pin:
+        return None
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None
+    if not hmac.compare_digest(magic_pin_fingerprint(pin), fingerprint):
+        return None
+    return pin
 
 
 def looks_like_hashed_magic(line: str) -> bool:

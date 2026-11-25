@@ -420,13 +420,16 @@ class CellManager:
         op_name: str,
         *,
         running_code: str = K3C_RUNNING_CELL_STRUCTURAL_OP_BLOCKED,
+        contamination_gate: bool = True,
     ) -> None:
         """Raise ``CellManagerPreconditionError`` on a blocked op.
 
         PLAN-S5.0.1c §3.10. Order of checks:
 
           1. Running-cell freeze (K3C / K3D depending on op).
-          2. Contaminated-cell freeze (K3E).
+          2. Contaminated-cell freeze (K3E) -- skipped when
+             ``contamination_gate`` is False (stream-magic promotion,
+             whose anchor is contaminated by definition).
 
         Running takes precedence so a cell that is BOTH running and
         contaminated surfaces the running diagnostic first — operator
@@ -439,7 +442,7 @@ class CellManager:
                 f"cell_running_cannot_{op_name} (cell_id={cell_id!r})",
                 cell_id=cell_id,
             )
-        if self._is_cell_contaminated(cell_id):
+        if contamination_gate and self._is_cell_contaminated(cell_id):
             raise CellManagerPreconditionError(
                 K3E_CONTAMINATED_CELL_STRUCTURAL_OP_BLOCKED,
                 f"contaminated_cell_cannot_{op_name} "
@@ -632,9 +635,13 @@ class CellManager:
                 "insert_cells_with_provenance: generated_at required",
                 cell_id=after_cell_id,
             )
-        # Precondition gates on the generator cell itself.
+        # Precondition gates on the generator cell itself. A promotion
+        # (``promoted_from_stream``) is anchored to a contaminated cell
+        # by construction -- its ``contamination_log`` is the evidence
+        # the operator clicked on -- so only the running gate applies.
         self._check_structural_op_preconditions(
             after_cell_id, "insert_generated_cells",
+            contamination_gate=not promoted_from_stream,
         )
         if not isinstance(magic_texts, list):
             raise ValueError(
@@ -642,10 +649,11 @@ class CellManager:
             )
         # Pre-flight: parse every fragment FIRST so a bad fragment in
         # the middle of the list rejects the entire invocation
-        # atomically. We use the legacy/permissive parse — generator
-        # output emits canonical magic, the hash-mode validation is the
-        # dispatcher's _validate_fragment_hashes step.
+        # atomically. The parse runs under the writer's live hash-mode
+        # context so a plain magic smuggled into a hash-mode notebook is
+        # classified exactly as the dispatcher will classify it.
         from llm_kernel.text.cell_text import CellParseError
+        parser_context = self._parser_context()
         for idx, frag in enumerate(magic_texts):
             if not isinstance(frag, str) or not frag.strip():
                 # Empty fragments wouldn't survive the splitter; treat
@@ -656,10 +664,8 @@ class CellManager:
                     K30_MULTIPLE_KINDS,
                     f"insert_cells_with_provenance: fragment {idx} empty",
                 )
-            # Parse for syntax check. Use the permissive (non-hash-mode)
-            # parser — handler output is canonical text; hash-mode
-            # validation is the dispatcher's separate sweep.
-            parse_cell(frag)
+            # Parse for syntax check under the live hash-mode context.
+            parse_cell(frag, parser_context=parser_context)
         # Atomic insert. Mint fresh cell ids; minting is local to this
         # call so two concurrent generator dispatches don't collide.
         import time
@@ -714,12 +720,24 @@ class CellManager:
         for cid in cell_ids:
             children.append({"id": cid, "type": "cell"})
 
+    def _parser_context(self) -> Optional[object]:
+        """Return the writer's live hash-mode :class:`ParserContext`.
+
+        PLAN-S5.0.1b §3.5 -- every parse the Cell Manager performs runs
+        under the same context ``MetadataWriter.cell_view`` uses. Writers
+        without the accessor (stubs) get the permissive parse.
+        """
+        getter = getattr(self._writer, "parser_context", None)
+        if not callable(getter):
+            return None
+        return getter()
+
     def view(self, cell_id: str) -> Optional[object]:
         """Return the parsed view for ``cell_id`` (or None if absent)."""
         text = self._writer.get_cell_text(cell_id)
         if text is None:
             return None
-        return parse_cell(text)
+        return parse_cell(text, parser_context=self._parser_context())
 
     def restamp_magics(
         self,

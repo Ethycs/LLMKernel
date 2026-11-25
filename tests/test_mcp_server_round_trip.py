@@ -83,21 +83,22 @@ def test_server_identity(bridge: OperatorBridgeServer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_catalog_lists_fifteen_tools(bridge: OperatorBridgeServer) -> None:
-    """All fifteen registered tools MUST be exposed.
+async def test_catalog_lists_fifteen_tools(bridge: OperatorBridgeServer, tmp_path) -> None:
+    """All fifteen registered tools MUST be exposed -- to a granted agent.
 
     Thirteen RFC-001 tools (ask, clarify, propose, request_approval,
     report_progress, report_completion, report_problem, present,
     notify, escalate, read_file, write_file, run_command) plus the
     PLAN-S5.0.4 ``emit_magic_cell`` privileged-emit tool and the
     PLAN-substrate-gap-closure G13 ``validate_tool_input`` meta-tool.
+
+    ``emit_magic_cell`` is privileged (certified-magic-emitter clause
+    1): an agent without an operator grant sees the other fourteen only.
     """
+    from llm_kernel.capture.metadata_writer import MetadataWriter
+
     handler = bridge.server.request_handlers[types.ListToolsRequest]
     request = types.ListToolsRequest(method="tools/list")
-    server_result = await handler(request)
-    tools = server_result.root.tools
-    assert len(tools) == 15
-    names = {tool.name for tool in tools}
     expected = {
         "ask", "clarify", "propose", "request_approval",
         "report_progress", "report_completion", "report_problem",
@@ -106,7 +107,23 @@ async def test_catalog_lists_fifteen_tools(bridge: OperatorBridgeServer) -> None
         "emit_magic_cell",
         "validate_tool_input",
     }
-    assert names == expected
+
+    # No grant (no writer at all): the privileged tool is not advertised.
+    server_result = await handler(request)
+    tools = server_result.root.tools
+    assert len(tools) == 14
+    assert {tool.name for tool in tools} == expected - {"emit_magic_cell"}
+
+    # Operator grant for this agent/zone: the full catalog of fifteen.
+    writer = MetadataWriter(workspace_root=tmp_path)
+    writer.grant_magic_emit_privilege(
+        agent_id="test-agent", zone_id="test-zone", scope={"magics": ["scratch"]},
+    )
+    bridge.metadata_writer = writer
+    server_result = await handler(request)
+    tools = server_result.root.tools
+    assert len(tools) == 15
+    assert {tool.name for tool in tools} == expected
 
 
 # ---------------------------------------------------------------------------

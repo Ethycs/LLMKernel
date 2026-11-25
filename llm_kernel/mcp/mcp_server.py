@@ -80,6 +80,10 @@ JSONRPC_OPERATOR_DENIED: int = -32003
 JSONRPC_EXTENSION_UNREACHABLE: int = -32004
 JSONRPC_PROXIED_REFUSED: int = -32005
 JSONRPC_PROXIED_IO_FAILURE: int = -32006
+#: PLAN-S5.0.4 -- ``emit_magic_cell`` called without an operator grant
+#: covering the agent / zone / magic (K3K). Distinct from -32601 so the
+#: agent learns the tool exists but is privileged, not that it is unknown.
+JSONRPC_PRIVILEGE_REQUIRED: int = -32007
 
 #: RFC-001 §escalate flood threshold; >5 critical/60s rate-limits.
 ESCALATE_FLOOD_MAX: int = 5
@@ -205,6 +209,7 @@ class OperatorBridgeServer:
             "read_file": self._handle_read_file,
             "write_file": self._handle_write_file,
             "run_command": self._handle_run_command,
+            "emit_magic_cell": self._handle_emit_magic_cell,
             "validate_tool_input": self._handle_validate_tool_input,
         }
         self._register_mcp_handlers()
@@ -227,6 +232,9 @@ class OperatorBridgeServer:
 
         @self.server.list_tools()
         async def _list_tools() -> List[types.Tool]:
+            # PLAN-S5.0.4 clause 1: ``emit_magic_cell`` is advertised
+            # only to an agent the operator granted a non-empty scope.
+            privileged = self._agent_has_magic_emit_grant()
             return [
                 types.Tool(
                     name=name,
@@ -235,6 +243,7 @@ class OperatorBridgeServer:
                     outputSchema=output_schema,
                 )
                 for name, (input_schema, output_schema, description) in TOOL_CATALOG.items()
+                if name != "emit_magic_cell" or privileged
             ]
 
         async def _call_tool_handler(
@@ -881,7 +890,9 @@ class OperatorBridgeServer:
             from llm_kernel._internal import _diagnostics
             agent_id = params.get("agent_id")
             grant_zone_id = params.get("zone_id") or self.zone_id
-            scope = params.get("scope") or {"magics": "all"}
+            # No scope means NO magics: widening to "all" is an explicit
+            # operator choice, never a default the wire fills in.
+            scope = params.get("scope") or {"magics": []}
             writer = self._resolve_metadata_writer()
             if writer is None:
                 logger.warning(
@@ -1100,6 +1111,117 @@ class OperatorBridgeServer:
             return CellManager(writer)
         except Exception:  # pragma: no cover - defensive
             return None
+
+    # -- PLAN-S5.0.4 -- privileged ``emit_magic_cell`` -----------------
+
+    def _agent_has_magic_emit_grant(self) -> bool:
+        """True iff this agent holds an in-session grant with a non-empty scope.
+
+        Consults the live writer's privilege table for ``(agent_id,
+        zone_id)``. No writer, no grant, or an empty ``magics`` list all
+        mean the tool is neither listed nor callable.
+        """
+        writer = self._resolve_metadata_writer()
+        if writer is None:
+            return False
+        getter = getattr(writer, "get_magic_emit_privileges", None)
+        if not callable(getter):
+            return False
+        try:
+            records = getter(agent_id=self.agent_id, zone_id=self.zone_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("emit_magic_cell: privilege lookup raised")
+            return False
+        for record in records or ():
+            scope = record.get("scope") if isinstance(record, dict) else None
+            magics = scope.get("magics") if isinstance(scope, dict) else None
+            if magics == "all" or (isinstance(magics, list) and magics):
+                return True
+        return False
+
+    async def _handle_emit_magic_cell(
+        self, arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """``emit_magic_cell`` -- privileged structural emission (PLAN-S5.0.4).
+
+        The grant is checked here (-32007 ``JSONRPC_PRIVILEGE_REQUIRED``)
+        before :func:`magic_emit_tool.emit_magic_cell` re-checks it and
+        composes / inserts the cell through the Cell Manager. K3K
+        rejections from the tool (smuggled magic, bad name) and Cell
+        Manager precondition errors surface as typed JSON-RPC errors.
+        """
+        from llm_kernel.magics.magic_emit_tool import (
+            MagicEmitError, emit_magic_cell,
+        )
+        from llm_kernel.notebook.cell_manager import (
+            CellManagerPreconditionError,
+        )
+
+        name = arguments.get("name")
+        writer = self._resolve_metadata_writer()
+        checker = getattr(writer, "has_magic_emit_privilege", None)
+        granted = bool(
+            callable(checker)
+            and isinstance(name, str)
+            and checker(
+                agent_id=self.agent_id, zone_id=self.zone_id,
+                magic_name=name,
+            )
+        )
+        if not granted:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PRIVILEGE_REQUIRED,
+                    message=(
+                        f"emit_magic_cell requires an operator-granted "
+                        f"magic-emit privilege covering {name!r} for agent "
+                        f"{self.agent_id!r} in zone {self.zone_id!r}"
+                    ),
+                    data={
+                        "tool_name": "emit_magic_cell",
+                        "agent_id": self.agent_id,
+                        "zone_id": self.zone_id,
+                        "magic_name": name,
+                        "k_code": "K3K",
+                    },
+                )
+            )
+        cell_manager = self._resolve_cell_manager()
+        try:
+            return dict(emit_magic_cell(
+                agent_id=self.agent_id,
+                zone_id=self.zone_id,
+                name=name,
+                args=arguments.get("args") or {},
+                body=arguments.get("body"),
+                position=arguments.get("position") or {},
+                writer=writer,
+                cell_manager=cell_manager,
+            ))
+        except MagicEmitError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PRIVILEGE_REQUIRED,
+                    message=f"emit_magic_cell rejected: {exc}",
+                    data={
+                        "tool_name": "emit_magic_cell",
+                        "agent_id": self.agent_id,
+                        "k_code": exc.code,
+                    },
+                )
+            ) from exc
+        except CellManagerPreconditionError as exc:
+            raise McpError(
+                types.ErrorData(
+                    code=JSONRPC_PROXIED_REFUSED,
+                    message=f"emit_magic_cell refused: {exc}",
+                    data={
+                        "tool_name": "emit_magic_cell",
+                        "agent_id": self.agent_id,
+                        "k_code": exc.k_code,
+                    },
+                )
+            ) from exc
 
     def _resolve_metadata_writer(self) -> Optional[Any]:
         """Locate the kernel's MetadataWriter via the documented surfaces.
@@ -1586,10 +1708,15 @@ class OperatorBridgeServer:
 
         argv: List[str] = [command, *args_list]
         cwd = self._workspace_root()
-        env_for_subprocess: Optional[Dict[str, str]] = None
+        # Always pass an explicit env: the child must never inherit the
+        # operator pin (PLAN-S5.0.1 -- the pin is kernel-process-local).
+        from llm_kernel.text.magic_hash import OPERATOR_PIN_ENV_VAR
+        env_for_subprocess: Dict[str, str] = {
+            k: v for k, v in os.environ.items() if k != OPERATOR_PIN_ENV_VAR
+        }
         if env_override:
-            env_for_subprocess = dict(os.environ)
             env_for_subprocess.update({str(k): str(v) for k, v in env_override.items()})
+            env_for_subprocess.pop(OPERATOR_PIN_ENV_VAR, None)
 
         start_ns = time.monotonic_ns()
         try:
