@@ -1953,6 +1953,100 @@ class MetadataWriter:
             self._config["templates"] = templates
             self._dirty = True
 
+    def read_config_endpoints(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            value = self._config.get("endpoints")
+        if isinstance(value, dict):
+            return {
+                k: dict(v)
+                for k, v in value.items()
+                if isinstance(k, str) and isinstance(v, dict)
+            }
+        return {}
+
+    def set_config_endpoint(self, name: str, spec: Dict[str, Any]) -> None:
+        if not isinstance(name, str) or not name:
+            raise ValueError("set_config_endpoint: name must be a non-empty str")
+        if not isinstance(spec, dict):
+            raise ValueError("set_config_endpoint: spec must be a dict")
+        reject_secrets(spec, path=f"config.endpoints.{name}")
+        cleaned = {k: v for k, v in spec.items() if isinstance(k, str)}
+        with self._lock:
+            endpoints = self._config.get("endpoints")
+            if not isinstance(endpoints, dict):
+                endpoints = {}
+            endpoints[name] = cleaned
+            self._config["endpoints"] = endpoints
+            self._dirty = True
+
+    def ensure_cell_in_layout(self, cell_id: str) -> None:
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("ensure_cell_in_layout: cell_id must be a non-empty str")
+        with self._lock:
+            tree = self._layout.get("tree")
+            if not isinstance(tree, dict):
+                tree = {"id": "root", "type": "workspace", "render_hints": {}, "children": []}
+                self._layout["tree"] = tree
+            children = tree.get("children")
+            if not isinstance(children, list):
+                children = []
+                tree["children"] = children
+            if not any(isinstance(n, dict) and n.get("id") == cell_id for n in children):
+                children.append({"id": cell_id, "kind": "cell"})
+                self._dirty = True
+
+    def update_cell_record(
+        self,
+        cell_id: str,
+        *,
+        text: Optional[str] = None,
+        kind: Optional[str] = None,
+        bound_agent_id: Any = ...,
+        outputs: Optional[List[Dict[str, Any]]] = None,
+        flags: Optional[Iterable[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        append_to_layout: bool = True,
+    ) -> Dict[str, Any]:
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("update_cell_record: cell_id must be a non-empty str")
+        with self._lock:
+            record = dict(self._cells.get(cell_id, {}))
+            if text is not None:
+                if not isinstance(text, str):
+                    raise ValueError("update_cell_record: text must be a str")
+                record["text"] = text
+                if hasattr(self, "_cell_view_cache"):
+                    self._cell_view_cache.pop(cell_id, None)
+            if kind is not None:
+                record["kind"] = kind
+            if bound_agent_id is not ...:
+                record["bound_agent_id"] = bound_agent_id
+            if outputs is not None:
+                record["outputs"] = list(outputs)
+            elif "outputs" not in record:
+                record["outputs"] = []
+            if flags is not None:
+                flag_set = set(flags)
+                record["pinned"] = "pinned" in flag_set
+                record["excluded"] = "excluded" in flag_set
+            if extra:
+                for key, val in extra.items():
+                    record[key] = val
+            self._cells[cell_id] = record
+            if append_to_layout:
+                tree = self._layout.get("tree")
+                if not isinstance(tree, dict):
+                    tree = {"id": "root", "type": "workspace", "render_hints": {}, "children": []}
+                    self._layout["tree"] = tree
+                children = tree.get("children")
+                if not isinstance(children, list):
+                    children = []
+                    tree["children"] = children
+                if not any(isinstance(n, dict) and n.get("id") == cell_id for n in children):
+                    children.append({"id": cell_id, "kind": "cell"})
+            self._dirty = True
+            return dict(record)
+
     def get_operator_pin(self) -> Optional[str]:
         """Return the operator pin when hash mode is on, else None.
 

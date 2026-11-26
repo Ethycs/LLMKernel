@@ -10,11 +10,40 @@ import json
 import shutil
 import argparse
 from pathlib import Path
+from typing import Any, Dict, Optional
 from jupyter_client.kernelspec import KernelSpecManager
 
+from llm_kernel.wire import versions as _versions
 
-def get_kernel_spec():
+
+def get_llmnb_kernel_spec(python_executable: Optional[str] = None) -> Dict[str, Any]:
+    exe = python_executable or sys.executable
+    return {
+        "argv": [
+            exe,
+            "-m",
+            "llm_kernel.jupyter_kernel",
+            "-f",
+            "{connection_file}",
+        ],
+        "display_name": "LLMNB",
+        "language": "llmnb",
+        "interrupt_mode": "message",
+        "metadata": {
+            "debugger": False,
+            "llmnb": {
+                "comm_target": _versions.COMM_TARGET,
+                "wire_version": _versions.WIRE_VERSION,
+                "schema_version": _versions.SCHEMA_VERSION,
+            },
+        },
+    }
+
+
+def get_kernel_spec(kernel_name: str = "llm_kernel") -> Dict[str, Any]:
     """Get the kernel specification."""
+    if kernel_name == "llmnb":
+        return get_llmnb_kernel_spec()
     return {
         "argv": [
             sys.executable,
@@ -31,51 +60,48 @@ def get_kernel_spec():
     }
 
 
-def install_kernel(user=True, prefix=None, kernel_name="llm_kernel"):
-    # If prefix is provided, don't use user flag
+def install_kernel(
+    user: bool = True,
+    prefix: Optional[str] = None,
+    kernel_name: str = "llm_kernel",
+    spec: Optional[Dict[str, Any]] = None,
+) -> str:
     if prefix:
         user = False
-    """Install the LLM kernel."""
-    print("Installing LLM Kernel...")
-    
-    # Create kernel spec
-    kernel_spec = get_kernel_spec()
-    
-    # Get kernel spec manager
+    kernel_spec = spec if spec is not None else get_kernel_spec(kernel_name)
     ksm = KernelSpecManager()
-    
-    # Create temporary directory for kernel spec
+
     import tempfile
     with tempfile.TemporaryDirectory() as temp_dir:
         kernel_dir = Path(temp_dir) / kernel_name
         kernel_dir.mkdir()
-        
-        # Write kernel.json
-        with open(kernel_dir / "kernel.json", "w") as f:
+
+        with open(kernel_dir / "kernel.json", "w", encoding="utf-8") as f:
             json.dump(kernel_spec, f, indent=2)
-        
-        # Copy logo if it exists
+
         logo_path = Path(__file__).parent / "logo-64x64.png"
         if logo_path.exists():
             shutil.copy(logo_path, kernel_dir / "logo-64x64.png")
-        
-        # Install the kernel
-        ksm.install_kernel_spec(
+
+        dest = ksm.install_kernel_spec(
             str(kernel_dir),
             kernel_name=kernel_name,
             user=user,
-            prefix=prefix
+            prefix=prefix,
         )
-    
-    print(f"✅ LLM Kernel installed successfully as '{kernel_name}'")
-    
-    # Show installation location
-    if user:
-        kernel_dir = ksm.user_kernel_dir
-    else:
-        kernel_dir = ksm.system_kernel_dir if prefix is None else os.path.join(prefix, 'share', 'jupyter', 'kernels')
-    
-    print(f"📁 Kernel installed to: {os.path.join(kernel_dir, kernel_name)}")
+
+    print(f"Installed kernel '{kernel_name}' to: {dest}")
+    return dest
+
+
+def install_llmnb_kernel(
+    user: bool = True,
+    prefix: Optional[str] = None,
+    kernel_name: str = "llmnb",
+    python_executable: Optional[str] = None,
+) -> str:
+    spec = get_llmnb_kernel_spec(python_executable=python_executable)
+    return install_kernel(user=user, prefix=prefix, kernel_name=kernel_name, spec=spec)
 
 
 def uninstall_kernel(kernel_name="llm_kernel"):
@@ -106,9 +132,9 @@ def list_kernels():
         language = spec.get('spec', {}).get('language', 'unknown')
         location = spec.get('resource_dir', 'unknown')
         
-        marker = "🤖" if name == "llm_kernel" else "📓"
+        marker = "🤖" if name in ("llm_kernel", "llmnb") else "📓"
         print(f"  {marker} {name}: {display_name} ({language})")
-        if name == "llm_kernel":
+        if name in ("llm_kernel", "llmnb"):
             print(f"    📁 {location}")
 
 
@@ -222,30 +248,40 @@ def main():
         help='Install system-wide'
     )
     parser.add_argument(
+        '--sys-prefix',
+        action='store_true',
+        help='Install into sys.prefix (active virtualenv / pixi env)'
+    )
+    parser.add_argument(
         '--prefix',
         help='Install to specific prefix'
     )
     parser.add_argument(
         '--name',
-        default='llm_kernel',
-        help='Kernel name (default: llm_kernel)'
+        default='llmnb',
+        help='Kernel name (default: llmnb; use llm_kernel for legacy IPython kernel)'
     )
-    
+    parser.add_argument(
+        '--no-setup',
+        action='store_true',
+        help='Skip interactive environment setup prompt'
+    )
+
     args = parser.parse_args()
-    
+
     if args.action == 'install':
-        # Check dependencies first
-        if not check_dependencies():
-            print("\n❌ Please install missing dependencies before proceeding")
+        if args.name != 'llmnb' and not check_dependencies():
+            print("\nPlease install missing dependencies before proceeding")
             return 1
-        
-        user = not args.system
-        install_kernel(user=user, prefix=args.prefix, kernel_name=args.name)
-        
-        # Offer to set up environment
-        response = input("\n🔧 Would you like to set up the environment? (y/N): ")
-        if response.lower() in ('y', 'yes'):
-            setup_environment()
+
+        prefix = sys.prefix if args.sys_prefix else args.prefix
+        user = not (args.system or bool(prefix))
+        install_kernel(user=user, prefix=prefix, kernel_name=args.name)
+
+        if not args.no_setup and sys.stdin is not None and sys.stdin.isatty():
+            response = input("\nWould you like to set up the environment? (y/N): ")
+            if response.lower() in ('y', 'yes'):
+                setup_environment()
     
     elif args.action == 'uninstall':
         uninstall_kernel(args.name)

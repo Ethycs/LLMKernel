@@ -540,6 +540,12 @@ class Kernel:
     def supervisor(self) -> AgentSupervisor:
         return self._require_started()
 
+    @property
+    def operator_bridge(self) -> OperatorBridgeServer:
+        self._require_started()
+        assert self._bridge is not None
+        return self._bridge
+
     # -- public delegators (facade commit 3) ----------------------------
 
     def _require_started(self) -> AgentSupervisor:

@@ -420,7 +420,17 @@ def _sanitize_outbound_dict(record: Dict[str, Any], *, text_field: bool) -> Dict
             text_field=(
                 text_field
                 or key in _OUTPUT_TEXT_FIELDS
-                or (key == "value" and attribute_key in _OUTPUT_TEXT_FIELDS)
+                or (
+                    key == "value"
+                    and isinstance(attribute_key, str)
+                    and (
+                        attribute_key in _OUTPUT_TEXT_FIELDS
+                        or (
+                            attribute_key.startswith("llmnb.")
+                            and attribute_key[6:] in _OUTPUT_TEXT_FIELDS
+                        )
+                    )
+                )
             ),
         )
         if new_value is not value:

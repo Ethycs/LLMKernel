@@ -1,0 +1,20 @@
+{
+  "argv": [
+    "python",
+    "-m",
+    "llm_kernel.jupyter_kernel",
+    "-f",
+    "{connection_file}"
+  ],
+  "display_name": "LLMNB",
+  "language": "llmnb",
+  "interrupt_mode": "message",
+  "metadata": {
+    "debugger": false,
+    "llmnb": {
+      "comm_target": "llmnb.rts.v2",
+      "wire_version": "1.0.0",
+      "schema_version": "1.0.0"
+    }
+  }
+}

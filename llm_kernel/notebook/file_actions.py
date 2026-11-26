@@ -111,7 +111,11 @@ def _serialize(
     # three formats see a consistent input shape.
     wrapped = {
         "cells": [],
-        "metadata": {"rts": notebook_state},
+        "metadata": {
+            "kernelspec": notebook_format.llmnb_kernelspec_metadata(),
+            "language_info": notebook_format.llmnb_language_info_metadata(),
+            "rts": notebook_state,
+        },
         "nbformat": 4,
         "nbformat_minor": 5,
     }

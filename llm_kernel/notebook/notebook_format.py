@@ -51,12 +51,45 @@ from llm_kernel.wire import versions as _versions
 
 
 __all__ = [
+    "LLMNB_DISPLAY_NAME",
+    "LLMNB_FILE_EXTENSION",
+    "LLMNB_KERNEL_NAME",
+    "LLMNB_LANGUAGE",
+    "LLMNB_MIMETYPE",
     "detect_format",
+    "llmnb_kernelspec_metadata",
+    "llmnb_language_info_metadata",
     "llmnb_to_magic",
     "magic_to_llmnb",
     "ipynb_to_llmnb",
     "llmnb_to_ipynb",
 ]
+
+
+LLMNB_KERNEL_NAME: str = "llmnb"
+LLMNB_DISPLAY_NAME: str = "LLMNB"
+LLMNB_LANGUAGE: str = "llmnb"
+LLMNB_MIMETYPE: str = "application/vnd.llmnb+json"
+LLMNB_FILE_EXTENSION: str = ".llmnb"
+
+
+def llmnb_kernelspec_metadata() -> dict[str, str]:
+    return {
+        "name": LLMNB_KERNEL_NAME,
+        "display_name": LLMNB_DISPLAY_NAME,
+        "language": LLMNB_LANGUAGE,
+    }
+
+
+def llmnb_language_info_metadata() -> dict[str, str]:
+    return {
+        "name": LLMNB_LANGUAGE,
+        "version": _versions.SCHEMA_VERSION,
+        "mimetype": LLMNB_MIMETYPE,
+        "file_extension": LLMNB_FILE_EXTENSION,
+        "pygments_lexer": "markdown",
+        "codemirror_mode": "markdown",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +343,11 @@ def magic_to_llmnb(
             }
             for cid in cells_dict
         ],
-        "metadata": {"rts": rts},
+        "metadata": {
+            "kernelspec": llmnb_kernelspec_metadata(),
+            "language_info": llmnb_language_info_metadata(),
+            "rts": rts,
+        },
         "nbformat": 4,
         "nbformat_minor": 5,
     }
@@ -353,6 +390,15 @@ def ipynb_to_llmnb(ipynb: dict) -> dict:
         source = source.rstrip("\n")
         if ctype == "markdown":
             fragments.append(f"@@markdown\n{source}" if source else "@@markdown")
+        elif source.lstrip().startswith("@@"):
+            try:
+                parsed_probe = parse_cell(source)
+                if not parsed_probe.kind_was_default:
+                    fragments.append(source)
+                else:
+                    fragments.append(f"@@scratch\n{source}")
+            except Exception:
+                fragments.append(f"@@scratch\n{source}")
         elif ctype in ("code", "raw"):
             fragments.append(f"@@scratch\n{source}" if source else "@@scratch")
         else:
@@ -443,7 +489,10 @@ def llmnb_to_ipynb(llmnb: dict) -> dict:
 
     return {
         "cells": ipynb_cells,
-        "metadata": {},
+        "metadata": {
+            "kernelspec": llmnb_kernelspec_metadata(),
+            "language_info": llmnb_language_info_metadata(),
+        },
         "nbformat": 4,
         "nbformat_minor": 5,
     }

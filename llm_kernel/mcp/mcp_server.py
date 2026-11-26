@@ -195,6 +195,9 @@ class OperatorBridgeServer:
         # ``user_ns`` per RFC-006 §6.
         self.metadata_writer: Optional[Any] = None
         self.kernel: Optional[Any] = None
+        self.stdin_responder: Optional[
+            Callable[[str, Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None
         self._handlers: Dict[str, ToolHandler] = {
             "ask": self._handle_ask,
             "clarify": self._handle_clarify,
@@ -460,14 +463,24 @@ class OperatorBridgeServer:
         extra.update(fields)
         logger.info(message_type, extra=extra)
 
-    async def _await_operator(self, timeout: float) -> Optional[Dict[str, Any]]:
-        """Await an inbound ``operator.action`` keyed by the active run_id.
-
-        Returns the operator-response ``parameters`` dict on success,
-        ``None`` if no dispatcher is wired (so the handler falls back
-        to its B1 stub), or raises :class:`asyncio.TimeoutError` per
-        RFC-001 §Failure modes -32002.
-        """
+    async def _await_operator(
+        self,
+        timeout: float,
+        *,
+        tool_name: str = "",
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        responder = self.stdin_responder
+        if callable(responder):
+            loop = asyncio.get_running_loop()
+            direct = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, responder, tool_name, dict(arguments or {}),
+                ),
+                timeout=timeout,
+            )
+            if direct is not None:
+                return direct
         if self.dispatcher is None:
             return None
         run_id = _active_run_id.get()
@@ -503,7 +516,7 @@ class OperatorBridgeServer:
         params = payload.get("parameters") or {}
 
         if action_type == "approval_response":
-            request_id = params.get("request_id")
+            request_id = params.get("request_id") or params.get("run_id")
             if not request_id:
                 return
             with self._pending_lock:
@@ -1068,6 +1081,156 @@ class OperatorBridgeServer:
             )
             return
 
+        if action_type == "zone_mutate":
+            writer = self._resolve_metadata_writer()
+            if writer is None:
+                logger.warning("zone_mutate received but no MetadataWriter is attached")
+                return
+            submit = getattr(writer, "submit_intent", None)
+            if not callable(submit):
+                logger.warning("zone_mutate: MetadataWriter lacks submit_intent")
+                return
+            intent_payload = {
+                "action_type": "zone_mutate",
+                "intent_kind": payload.get("intent_kind") or params.get("intent_kind"),
+                "parameters": (
+                    payload.get("parameters")
+                    if payload.get("intent_kind") is not None
+                    else params.get("parameters", {})
+                ),
+                "intent_id": (
+                    payload.get("intent_id")
+                    or params.get("intent_id")
+                    or envelope.get("correlation_id")
+                    or str(uuid.uuid4())
+                ),
+            }
+            expected_ver = (
+                payload.get("expected_snapshot_version")
+                if "expected_snapshot_version" in payload
+                else params.get("expected_snapshot_version")
+            )
+            if expected_ver is not None:
+                intent_payload["expected_snapshot_version"] = expected_ver
+            try:
+                result = submit({"type": "operator.action", "payload": intent_payload})
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("zone_mutate: submit_intent raised")
+                return
+            logger.info(
+                "operator.zone_mutate",
+                extra={
+                    "event.name": "operator.zone_mutate",
+                    "rfc": "RFC-006",
+                    "bsp": "BSP-003",
+                    "llmnb.intent_kind": str(intent_payload.get("intent_kind")),
+                    "llmnb.intent_id": str(intent_payload.get("intent_id")),
+                    "llmnb.intent_applied": bool(result.get("applied")),
+                    "llmnb.error_code": result.get("error_code"),
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
+        if action_type == "agent_branch":
+            source_agent = params.get("source_agent") or params.get("source_agent_id")
+            at_turn_id = params.get("at_turn_id")
+            new_agent_id = params.get("new_agent_id")
+            if not isinstance(source_agent, str) or not source_agent or not isinstance(new_agent_id, str) or not new_agent_id:
+                logger.warning(
+                    "agent_branch: K42 missing source_agent/new_agent_id; params=%r",
+                    params,
+                )
+                return
+            supervisor = self._resolve_agent_supervisor()
+            fork_method = getattr(supervisor, "fork", None) if supervisor is not None else None
+            if not callable(fork_method):
+                logger.warning("agent_branch: AgentSupervisor unavailable")
+                return
+            try:
+                fork_method(source_agent, at_turn_id, new_agent_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "agent_branch: fork raised; source=%s new=%s",
+                    source_agent, new_agent_id,
+                )
+                return
+            logger.info(
+                "operator.agent_branch",
+                extra={
+                    "event.name": "operator.agent_branch",
+                    "rfc": "RFC-006",
+                    "llmnb.source_agent_id": source_agent,
+                    "llmnb.new_agent_id": new_agent_id,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
+        if action_type == "agent_revert":
+            agent_id = params.get("agent_id")
+            target_turn_id = params.get("target_turn_id")
+            if not isinstance(agent_id, str) or not agent_id or not isinstance(target_turn_id, str) or not target_turn_id:
+                logger.warning(
+                    "agent_revert: K42 missing agent_id/target_turn_id; params=%r",
+                    params,
+                )
+                return
+            supervisor = self._resolve_agent_supervisor()
+            revert_method = getattr(supervisor, "revert", None) if supervisor is not None else None
+            if not callable(revert_method):
+                logger.warning("agent_revert: AgentSupervisor unavailable")
+                return
+            try:
+                revert_method(agent_id, target_turn_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "agent_revert: revert raised; agent_id=%s target=%s",
+                    agent_id, target_turn_id,
+                )
+                return
+            logger.info(
+                "operator.agent_revert",
+                extra={
+                    "event.name": "operator.agent_revert",
+                    "rfc": "RFC-006",
+                    "llmnb.reverted_agent_id": agent_id,
+                    "llmnb.target_turn_id": target_turn_id,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
+        if action_type == "agent_stop":
+            agent_id = params.get("agent_id")
+            if not isinstance(agent_id, str) or not agent_id:
+                logger.warning("agent_stop: K42 missing agent_id; params=%r", params)
+                return
+            supervisor = self._resolve_agent_supervisor()
+            stop_method = getattr(supervisor, "stop", None) if supervisor is not None else None
+            if not callable(stop_method):
+                logger.warning("agent_stop: AgentSupervisor unavailable")
+                return
+            try:
+                stop_method(agent_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("agent_stop: stop raised; agent_id=%s", agent_id)
+                return
+            logger.info(
+                "operator.agent_stop",
+                extra={
+                    "event.name": "operator.agent_stop",
+                    "rfc": "RFC-006",
+                    "llmnb.stopped_agent_id": agent_id,
+                    "llmnb.agent_id": self.agent_id,
+                    "llmnb.zone_id": self.zone_id,
+                },
+            )
+            return
+
         # Unknown action_type: forward-compat log (V1.5+ may add new
         # action types).  Per the brief: do not raise.
         logger.warning(
@@ -1347,14 +1510,22 @@ class OperatorBridgeServer:
         ``approval_response``; falls back to the B1 stub answer when
         no dispatcher is wired (B1 contract test path).
         """
-        response = await self._await_operator(timeout=DEFAULT_APPROVAL_TIMEOUT_SEC)
+        response = await self._await_operator(
+            timeout=DEFAULT_APPROVAL_TIMEOUT_SEC,
+            tool_name="ask",
+            arguments=arguments,
+        )
         if response is None:
             return {"answer": "[B1 stub] operator round-trip not yet wired"}
         return {"answer": str(response.get("answer", response.get("operator_note", "")))}
 
     async def _handle_clarify(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Round-trip ``clarify``; falls back to default-option echo."""
-        response = await self._await_operator(timeout=DEFAULT_APPROVAL_TIMEOUT_SEC)
+        response = await self._await_operator(
+            timeout=DEFAULT_APPROVAL_TIMEOUT_SEC,
+            tool_name="clarify",
+            arguments=arguments,
+        )
         if response is not None and "selected_id" in response:
             return {"selected_id": response["selected_id"]}
         options = arguments.get("options", [])
@@ -1364,7 +1535,11 @@ class OperatorBridgeServer:
 
     async def _handle_propose(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Round-trip ``propose``; falls back to ``decision="defer"``."""
-        response = await self._await_operator(timeout=DEFAULT_APPROVAL_TIMEOUT_SEC)
+        response = await self._await_operator(
+            timeout=DEFAULT_APPROVAL_TIMEOUT_SEC,
+            tool_name="propose",
+            arguments=arguments,
+        )
         if response is not None and "decision" in response:
             return {
                 "decision": response["decision"],
@@ -1384,7 +1559,11 @@ class OperatorBridgeServer:
         ``operator.action`` envelope, the dispatcher routes it to
         :meth:`_route_operator_action`, and the future resolves.
         """
-        response = await self._await_operator(timeout=DEFAULT_APPROVAL_TIMEOUT_SEC)
+        response = await self._await_operator(
+            timeout=DEFAULT_APPROVAL_TIMEOUT_SEC,
+            tool_name="request_approval",
+            arguments=arguments,
+        )
         if response is not None and "decision" in response:
             return {"decision": response["decision"]}
         return {"decision": "defer"}

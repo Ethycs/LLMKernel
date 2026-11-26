@@ -15,4 +15,12 @@ __author__ = "LLM Kernel Team"
 # docs/04 - Reference/kernel/_wiring-audit.md.
 from llm_kernel.kernel_facade import Kernel, KernelStartError
 
-__all__ = ["Kernel", "KernelStartError"]
+__all__ = ["Kernel", "KernelStartError", "LLMNBKernel", "LLMNBKernelApp"]
+
+
+def __getattr__(name: str):
+    if name in ("LLMNBKernel", "LLMNBKernelApp"):
+        from llm_kernel import jupyter_kernel
+
+        return getattr(jupyter_kernel, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

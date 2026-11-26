@@ -713,6 +713,9 @@ if __name__ == '__main__':
             flush=True,
         )
         sys.exit(_run_metadata_writer_smoke())
+    elif len(sys.argv) > 1 and sys.argv[1] in ("jupyter", "llmnb-kernel"):
+        from llm_kernel.jupyter_kernel import main as _jupyter_main
+        sys.exit(_jupyter_main(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "serve":
         # PLAN-S5.0.3d: TCP transport + bearer-token auth + handshake
         # envelope. Default bind 127.0.0.1; token is read from
